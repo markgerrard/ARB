@@ -1,0 +1,7 @@
+tunnel: arb-memory-mcp
+credentials-file: /etc/cloudflared/arb-memory-mcp.json
+
+ingress:
+  - hostname: memory.example.com
+    service: http://mcp:8000
+  - service: http_status:404

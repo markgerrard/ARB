@@ -1,0 +1,214 @@
+#!/usr/bin/env bash
+# Cross-agent inbox watcher — streams messages from the agent_scratch
+# namespace on the host-level Redis (DB 12) to stdout, one JSON envelope
+# per line. Each iteration refreshes a 60s heartbeat key so peers can
+# tell we're alive.
+#
+# Usage:
+#   AGENT_ID=claude-project-c-dev /srv/projects/example-bridge/scripts/agent-inbox-watcher
+# or with the env loaded from the worktree:
+#   set -a; source /path/to/worktree/.env; set +a; /srv/projects/example-bridge/scripts/agent-inbox-watcher
+#
+# Designed to be run inside Claude Code's Monitor tool — each line of
+# stdout becomes a notification to the controlling agent.
+#
+# TRANSPORT FAULTS ARE NOT MESSAGES. This script used to read BLPOP output
+# with `tail -n +2`, discard stderr, and swallow redis-cli's exit status. A
+# real BLPOP hit is two lines (key, then value), so ANY single-line stdout —
+# a connection error, say — produced an EMPTY body that the downstream
+# split-filter then spooled as a corrupt "UNPARSEABLE envelope". That
+# manufactured phantom peer messages out of transport hiccups: observed
+# 2026-08-11, and the sibling defect in scripts/codex-inbox-once was found
+# and fixed the same day. The fix is not a better heuristic — it is asking
+# redis-cli for an unambiguous encoding. With `--json -e`:
+#   * a timeout          -> JSON null
+#   * a command failure  -> non-zero exit status (stderr captured, not lost)
+#   * a genuine hit      -> a two-element [key, value] JSON array
+# Those three are now distinguishable, so a fault can never be rendered as
+# an envelope. Rejected bytes are PRESERVED rather than dropped, because a
+# receiver that discards what it rejects cannot tell a malformed message
+# from a transport artifact — which is what left a peer hunting a sender
+# that never existed.
+
+set -u
+
+HOST=${AGENT_REDIS_HOST:-127.0.0.1}
+PORT=${AGENT_REDIS_PORT:-6390}
+DB=${AGENT_REDIS_DB:-12}
+PREFIX=${AGENT_REDIS_PREFIX:-agent_scratch:}
+REDIS_USER=${AGENT_REDIS_USER:-}
+REDIS_TLS=${AGENT_REDIS_TLS:-0}
+REDIS_PASSWORD=${AGENT_REDIS_PASSWORD:-}
+AGENT=${AGENT_ID:?AGENT_ID env var required}
+HEARTBEAT_TTL=${AGENT_HEARTBEAT_TTL:-60}
+BLPOP_TIMEOUT=${AGENT_BLPOP_TIMEOUT:-30}  # so heartbeat refreshes even when inbox is quiet
+INBOX_DIR=${AGENT_BRIDGE_INBOX_DIR:-/tmp/agent-bridge-inbox}
+REJECT_DIR=${AGENT_INBOX_REJECT_DIR:-${INBOX_DIR}/rejects}
+# Normalise to an unambiguously non-option path. BSD chmod (macOS) does NOT
+# accept `--` as end-of-options, so `chmod 600 -- "$f"` fails there; guarding
+# the operand's shape instead of the option parser is the portable fix, and it
+# still removes the leading-dash hazard `--` was there for.
+case "${REJECT_DIR}" in /*) ;; *) REJECT_DIR="./${REJECT_DIR}" ;; esac
+MAX_BACKOFF=${AGENT_WATCHER_MAX_BACKOFF:-15}
+# Bounded runs. Unset/empty means loop forever, which is the operational
+# default; the tests set it so the loop terminates.
+MAX_LOOPS=${AGENT_WATCHER_MAX_LOOPS:-}
+
+INBOX="${PREFIX}agent:${AGENT}:inbox"
+STATUS="${PREFIX}agent:${AGENT}:status"
+
+REDIS_FLAGS=(-h "${HOST}" -p "${PORT}" -n "${DB}" --no-auth-warning)
+case "${REDIS_TLS}" in 1|true|True|yes) REDIS_FLAGS+=(--tls) ;; esac
+[ -n "${REDIS_USER}" ] && REDIS_FLAGS+=(--user "${REDIS_USER}")
+[ -n "${REDIS_PASSWORD}" ] && export REDISCLI_AUTH="${REDIS_PASSWORD}"
+
+# An array, not a string: "${REDIS_FLAGS[*]}" re-split by the shell is how
+# a flag containing whitespace would silently corrupt the command line.
+REDIS_CMD=(redis-cli "${REDIS_FLAGS[@]}")
+
+TMP_DIR=$(mktemp -d)
+trap 'rm -rf -- "${TMP_DIR}"' EXIT
+
+# Preserve rejected bytes under a content-derived name. Duplicate content
+# deliberately converges on ONE file instead of fabricating N artefacts —
+# that convergence is itself the signal for "one fault repeating" rather
+# than "several distinct messages".
+SPOOL_PATH=""
+SPOOL_SHA256=""
+SPOOL_BYTES=""
+preserve() {
+    local kind=$1 source=$2 suffix=$3
+    local digest bytes destination temporary
+    mkdir -p -- "${REJECT_DIR}" 2>/dev/null || true
+    chmod 700 "${REJECT_DIR}" 2>/dev/null || true
+    # sha256sum is NOT stock on macOS (it ships shasum), and this runs on the
+    # REJECT path — the one that only executes once something has already gone
+    # wrong, which is the worst place to discover a missing binary. Same
+    # three-way form as scripts/arb-pi-orch:46-52; shasum first because that is
+    # the one guaranteed present on the platform that lacks the other.
+    if command -v shasum >/dev/null 2>&1; then
+        digest=$(shasum -a 256 "${source}" | awk '{print $1}')
+    elif command -v sha256sum >/dev/null 2>&1; then
+        digest=$(sha256sum "${source}" | awk '{print $1}')
+    else
+        digest=$(openssl dgst -sha256 "${source}" | awk '{print $NF}')
+    fi
+    bytes=$(wc -c < "${source}" | tr -d '[:space:]')
+    destination="${REJECT_DIR}/${kind}-${digest}.${suffix}"
+    if [ ! -e "${destination}" ]; then
+        temporary=$(mktemp "${REJECT_DIR}/.${kind}.XXXXXX")
+        cat -- "${source}" > "${temporary}"
+        chmod 600 "${temporary}"
+        # Hard-link publication is atomic and refuses to clobber.
+        ln -- "${temporary}" "${destination}" 2>/dev/null || true
+        rm -f -- "${temporary}"
+    fi
+    SPOOL_PATH=${destination}
+    SPOOL_SHA256=${digest}
+    SPOOL_BYTES=${bytes}
+}
+
+# Linear backoff capped at MAX_BACKOFF, so a bus outage costs one slow poll
+# rather than a hot loop.
+backoff() {
+    local delay=$1
+    [ "${delay}" -gt "${MAX_BACKOFF}" ] && delay=${MAX_BACKOFF}
+    [ "${delay}" -gt 0 ] && sleep "${delay}"
+    return 0
+}
+
+# Self-announcement on startup — Monitor will surface this as the first event
+echo "[watcher] ${AGENT} online at $(date -Iseconds) (host=${HOST}:${PORT}/db=${DB}, inbox=${INBOX})"
+
+# Initial heartbeat so peers can see us immediately
+"${REDIS_CMD[@]}" SET "${STATUS}" "alive:$$" EX "${HEARTBEAT_TTL}" > /dev/null 2>&1 || true
+
+fail_streak=0
+loops=0
+
+# Main loop — refresh heartbeat then BLPOP with timeout so the loop
+# wakes up periodically even when no messages arrive.
+while true; do
+    if [ -n "${MAX_LOOPS}" ] && [ "${loops}" -ge "${MAX_LOOPS}" ]; then break; fi
+    loops=$((loops + 1))
+
+    "${REDIS_CMD[@]}" SET "${STATUS}" "alive:$$" EX "${HEARTBEAT_TTL}" > /dev/null 2>&1 || true
+
+    out="${TMP_DIR}/blpop.json"
+    err="${TMP_DIR}/blpop.err"
+    : > "${out}"
+    : > "${err}"
+    "${REDIS_CMD[@]}" --json -e BLPOP "${INBOX}" "${BLPOP_TIMEOUT}" > "${out}" 2> "${err}"
+    rc=$?
+
+    if [ "${rc}" -ne 0 ]; then
+        # A connection/command failure is NOT an inbox item. Preserve the
+        # diagnostic, back off, reconnect — and never wake the session with
+        # something shaped like a peer message.
+        fail_streak=$((fail_streak + 1))
+        if [ -s "${err}" ]; then
+            preserve transport "${err}" txt
+        else
+            SPOOL_PATH="(no diagnostic bytes)"; SPOOL_SHA256="-"; SPOOL_BYTES=0
+        fi
+        # Emit on the 1st fault then at powers of two, so a flapping bus
+        # reports that it is flapping without emitting once per second.
+        if [ $(( fail_streak & (fail_streak - 1) )) -eq 0 ]; then
+            printf '[watcher] reconnecting after transport fault rc=%s streak=%s preserved=%s sha256=%s bytes=%s\n' \
+                "${rc}" "${fail_streak}" "${SPOOL_PATH}" "${SPOOL_SHA256}" "${SPOOL_BYTES}" >&2
+        fi
+        backoff "${fail_streak}"
+        continue
+    fi
+
+    # RESP nil (the BLPOP timeout) encodes as JSON null. Quiet, expected,
+    # and emphatically not a message.
+    if jq -e '. == null' "${out}" > /dev/null 2>&1; then
+        fail_streak=0
+        continue
+    fi
+
+    # A successful BLPOP is unambiguously [key, value], both strings.
+    # A malformed response is a transport fault too, and is rate-limited
+    # the same way — a flapping bus should say so once, not once a second.
+    if ! jq -e 'type == "array" and length == 2 and (.[0] | type == "string") and (.[1] | type == "string")' \
+        "${out}" > /dev/null 2>&1; then
+        fail_streak=$((fail_streak + 1))
+        preserve transport-shape "${out}" json
+        if [ $(( fail_streak & (fail_streak - 1) )) -eq 0 ]; then
+            printf '[watcher] reconnecting: rejected invalid redis-cli response streak=%s preserved=%s sha256=%s bytes=%s\n' \
+                "${fail_streak}" "${SPOOL_PATH}" "${SPOOL_SHA256}" "${SPOOL_BYTES}" >&2
+        fi
+        backoff "${fail_streak}"
+        continue
+    fi
+    fail_streak=0
+
+    popped_key=$(jq -r '.[0]' "${out}")
+    body_file="${TMP_DIR}/body.json"
+    jq -j '.[1]' "${out}" > "${body_file}"
+
+    if [ "${popped_key}" != "${INBOX}" ]; then
+        preserve rejected-body "${body_file}" bin
+        body_path=${SPOOL_PATH}
+        preserve rejected-redis "${out}" json
+        printf '[watcher] rejected BLPOP key mismatch expected=%s actual=%s body=%s raw=%s\n' \
+            "${INBOX}" "${popped_key}" "${body_path}" "${SPOOL_PATH}" >&2
+        continue
+    fi
+
+    if [ ! -s "${body_file}" ]; then
+        # A genuinely empty list value. Real, but never a valid envelope —
+        # preserve it rather than emitting a blank [inbox] line, which is
+        # exactly what the old code did and what became a phantom.
+        preserve rejected-empty "${out}" json
+        printf '[watcher] rejected empty inbox item preserved=%s sha256=%s bytes=%s\n' \
+            "${SPOOL_PATH}" "${SPOOL_SHA256}" "${SPOOL_BYTES}" >&2
+        continue
+    fi
+
+    # Collapse to one line so downstream Monitor filters see the whole
+    # envelope on a single stdout line.
+    BODY=$(jq -c . "${body_file}" 2>/dev/null) || BODY=$(tr '\n' ' ' < "${body_file}")
+    printf '[inbox] %s\n' "${BODY}"
+done

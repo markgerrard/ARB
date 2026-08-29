@@ -1,0 +1,486 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shlex
+import signal
+import subprocess
+import sys
+import time
+import uuid
+from pathlib import Path
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_AGENT_ENV_FILE = os.environ.get(
+    "ARB_AGENT_ENV_FILE", str(_REPO_ROOT / "envs" / "agent-redis-bridge-dev.env")
+)
+DEFAULT_FROM_AGENT_ID = "claude-bridge-dev"
+DEFAULT_WRITER_TARGET = "codex-bridge-dev-example"
+DEFAULT_READER_TARGET = "agy-bridge-dev"
+
+
+def _single_quote(value):
+    return "'" + str(value).replace("'", "'\"'\"'") + "'"
+
+
+def dispatch_env(env_file, from_agent_id):
+    env = dict(os.environ)
+    env["AGENT_ENV_FILE"] = env_file
+    env["FROM_AGENT_ID"] = from_agent_id
+    return env
+
+
+def build_dispatch_command(
+    *,
+    target_id,
+    engine,
+    timeout_s,
+    env_file,
+    from_agent_id,
+    run_id,
+    artefact_id,
+    version,
+    receipt_path,
+    brief_path,
+):
+    """Build agent-dispatch argv. Slice 1d-iv: ordinary path is pre-minted only."""
+    return [
+        "scripts/agent-dispatch",
+        "--engine",
+        engine,
+        "--target-id",
+        target_id,
+        "--timeout",
+        str(timeout_s),
+        "--run-id",
+        run_id,
+        "--artefact-id",
+        str(artefact_id),
+        "--version",
+        str(version),
+        "--receipt",
+        str(receipt_path),
+        "--brief",
+        str(brief_path),
+    ]
+
+
+def publish_and_build_dispatch(
+    *,
+    target_id,
+    engine,
+    instructions,
+    timeout_s,
+    env_file,
+    from_agent_id,
+    run_id,
+    redis_url,
+    title,
+):
+    """Harness-publish a brief, then build the non-FABA authority dispatch command.
+
+    Returns (cmd, enqueue_env). The brief/receipt files live under a process-owned
+    temp dir that must outlive the dispatch; we keep them in /tmp with the run_id.
+    """
+    import tempfile
+
+    # Import from installed/repo src.
+    repo = Path(__file__).resolve().parents[1]
+    sys.path.insert(0, str(repo / "src"))
+    from agent_redis_bridge.dispatch_cli import wrap_instructions_as_brief  # noqa: WPS433
+
+    stage = Path(tempfile.mkdtemp(prefix=f"seat-e2e-{run_id}-"))
+    brief_file = stage / "brief.md"
+    brief_file.write_text(
+        wrap_instructions_as_brief(instructions, vantage="seat-e2e", title=title),
+        encoding="utf-8",
+    )
+    pub_env = dispatch_env(env_file, from_agent_id)
+    pub_env["ARB_MEMORY_REDIS_URL"] = redis_url
+    pub = subprocess.run(
+        [
+            str(repo / "scripts" / "arb-memory-harness-publish"),
+            "--target-agent-id",
+            target_id,
+            "--brief",
+            str(brief_file),
+            "--env-file",
+            env_file,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=pub_env,
+    )
+    receipt = json.loads(pub.stdout)
+    receipt_file = stage / "receipt.json"
+    receipt_file.write_text(json.dumps(receipt), encoding="utf-8")
+    cmd = build_dispatch_command(
+        target_id=target_id,
+        engine=engine,
+        timeout_s=timeout_s,
+        env_file=env_file,
+        from_agent_id=from_agent_id,
+        run_id=run_id,
+        artefact_id=receipt["artefact_id"],
+        version=receipt["version"],
+        receipt_path=receipt_file,
+        brief_path=brief_file,
+    )
+    from agent_redis_bridge.dispatch_authority import pop_publish_env
+
+    enq_env = dispatch_env(env_file, from_agent_id)
+    pop_publish_env(enq_env)
+    return cmd, enq_env
+
+
+def _seat_python(repo_root, python, redis_url, prefix, body):
+    return f"""Run this exact shell command from the repository checkout and return its stdout verbatim.
+If import or bus access fails, report the command failure exactly.
+
+cd {shlex.quote(repo_root)} && unset OPENAI_API_KEY && \\
+PYTHONPATH=src ARB_MEMORY_REDIS_URL={_single_quote(redis_url)} ARB_MEMORY_PREFIX={_single_quote(prefix)} \\
+{shlex.quote(python)} - <<'PY'
+{body}
+PY
+"""
+
+
+def seat_write_task(*, repo_root, python, redis_url, prefix, marker, artefact_id, run_tag):
+    body = f"""from arb_memory import client
+ulid = client.write(
+    {marker!r},
+    artefact_id={artefact_id!r},
+    artefact_content={('ARB Memory seat e2e artefact for ' + marker)!r},
+    repo_pointer='scripts/arb-memory-seat-e2e',
+    source={run_tag!r},
+    author={run_tag!r},
+)
+print('ARB_MEMORY_SEAT_WRITE_ULID=' + ulid)
+"""
+    return _seat_python(repo_root, python, redis_url, prefix, body)
+
+
+def seat_query_task(*, repo_root, python, redis_url, prefix, marker, run_tag):
+    body = f"""import json
+from arb_memory import client
+hits = client.query({marker!r}, k=8, timeout_s=20, transport_only=True)
+blob = json.dumps(hits, default=str)
+print(blob)
+if hits is None or {marker!r} not in blob:
+    raise SystemExit('transport reply did not contain marker')
+print('ARB_MEMORY_SEAT_QUERY_OK={marker}')
+"""
+    return _seat_python(repo_root, python, redis_url, prefix, body)
+
+
+def _connect(dsn):
+    import psycopg
+
+    return psycopg.connect(dsn, autocommit=True)
+
+
+def _count_rows(conn, run_tag):
+    row = conn.execute(
+        """
+        SELECT
+            (SELECT count(*) FROM hints WHERE source = %s OR author = %s)
+          + (SELECT count(*) FROM artefacts WHERE artefact_id LIKE %s)
+        """,
+        (run_tag, run_tag, f"{run_tag}%"),
+    ).fetchone()
+    return row[0]
+
+
+def cleanup_rows(conn, run_tag, ulids):
+    with conn.transaction():
+        conn.execute("DELETE FROM hints WHERE source = %s OR author = %s", (run_tag, run_tag))
+        conn.execute("DELETE FROM artefacts WHERE artefact_id LIKE %s", (f"{run_tag}%",))
+        if ulids:
+            conn.execute("DELETE FROM idempotency_keys WHERE key = ANY(%s)", (list(ulids),))
+
+
+def assert_absent(conn, run_tag, label):
+    count = _count_rows(conn, run_tag)
+    if count:
+        raise RuntimeError(f"{label}: found {count} existing e2e rows for {run_tag}")
+
+
+def wait_for_persisted(conn, marker, run_tag, timeout_s=60):
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        row = conn.execute(
+            "SELECT count(*) FROM hints WHERE text = %s AND source = %s AND author = %s",
+            (marker, run_tag, run_tag),
+        ).fetchone()
+        if row[0] > 0:
+            return
+        time.sleep(0.5)
+    raise TimeoutError(f"consumer did not persist marker for {run_tag}")
+
+
+CONSUMER_LOG = "/tmp/arb-memory-seat-e2e-consumer.log"
+
+
+def start_consumer(*, repo_root, python, env):
+    # Write consumer output to a logfile (not an un-drained PIPE, which can deadlock; and so a
+    # failure can surface WHY the consumer didn't persist).
+    log = open(CONSUMER_LOG, "w")
+    return subprocess.Popen(
+        [python, "-m", "arb_memory", "memory"],
+        cwd=repo_root,
+        env=env,
+        stdout=log,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+
+
+def stop_consumer(proc):
+    if proc.poll() is not None:
+        return
+    proc.send_signal(signal.SIGTERM)
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=10)
+
+
+def clean_redis_prefix(redis_url, prefix):
+    import redis
+
+    client = redis.from_url(redis_url, decode_responses=True)
+    try:
+        keys = []
+        cursor = 0
+        while True:
+            cursor, batch = client.scan(cursor=cursor, match=f"{prefix}*", count=1000)
+            keys.extend(batch)
+            if cursor == 0:
+                break
+        if keys:
+            client.delete(*keys)
+    finally:
+        client.close()
+
+
+def sentinel_ready(*, conn, redis_url, prefix, marker, artefact_id, run_tag):
+    old_url = os.environ.get("ARB_MEMORY_REDIS_URL")
+    old_prefix = os.environ.get("ARB_MEMORY_PREFIX")
+    os.environ["ARB_MEMORY_REDIS_URL"] = redis_url
+    os.environ["ARB_MEMORY_PREFIX"] = prefix
+    try:
+        from arb_memory import client, bus
+
+        # Fail loud if prefix isolation is broken: bus.PREFIX is bound at bus-import time from the
+        # env. We set ARB_MEMORY_PREFIX above before the first import — but if some future edit
+        # imports arb_memory.bus at the harness top-level (before this point), bus.PREFIX would be
+        # the stale/empty value and the in-process sentinel would silently write to the wrong stream
+        # while the consumer drains ours. Catch that latent foot-gun rather than hang. (cold-Opus nit.)
+        if bus.PREFIX != prefix:
+            raise RuntimeError(
+                f"prefix isolation broken: bus.PREFIX={bus.PREFIX!r} != {prefix!r} "
+                "(was arb_memory.bus imported before ARB_MEMORY_PREFIX was set?)"
+            )
+
+        # Readiness probe with RETRY. The consumer's group is created at id="$" (new-only) on first
+        # boot via xgroup_create(mkstream); a sentinel written BEFORE the group exists is never
+        # delivered. So re-write the sentinel until one lands AFTER the consumer group is up — a
+        # write-once probe races the consumer's boot and hangs. Returns every ulid written (for
+        # cleanup).
+        deadline = time.monotonic() + 60
+        ulids = []
+        while time.monotonic() < deadline:
+            ulids.append(
+                client.write(
+                    marker,
+                    artefact_id=artefact_id,
+                    artefact_content=f"sentinel artefact for {marker}",
+                    repo_pointer="scripts/arb-memory-seat-e2e",
+                    source=run_tag,
+                    author=run_tag,
+                )
+            )
+            sub_deadline = time.monotonic() + 3
+            while time.monotonic() < sub_deadline:
+                row = conn.execute(
+                    "SELECT count(*) FROM hints WHERE text = %s AND source = %s AND author = %s",
+                    (marker, run_tag, run_tag),
+                ).fetchone()
+                if row[0] > 0:
+                    return ulids
+                time.sleep(0.5)
+        raise TimeoutError(f"consumer did not persist sentinel for {run_tag} (readiness)")
+    finally:
+        if old_url is None:
+            os.environ.pop("ARB_MEMORY_REDIS_URL", None)
+        else:
+            os.environ["ARB_MEMORY_REDIS_URL"] = old_url
+        if old_prefix is None:
+            os.environ.pop("ARB_MEMORY_PREFIX", None)
+        else:
+            os.environ["ARB_MEMORY_PREFIX"] = old_prefix
+
+
+def run_dispatch(command, *, env):
+    proc = subprocess.run(command, text=True, capture_output=True, env=env)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"dispatch failed rc={proc.returncode}\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+        )
+    return proc.stdout
+
+
+def require_pattern(pattern, text, label):
+    match = re.search(pattern, text)
+    if not match:
+        raise RuntimeError(f"{label} missing from dispatch output:\n{text}")
+    return match.group(1)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--repo-root", default=str(Path(__file__).resolve().parents[1]))
+    parser.add_argument("--python", default=sys.executable)
+    # The python a dispatched SEAT runs (relative to repo_root it cd's into). The import-light
+    # client's one dependency is `redis`; a bare system python3 in a seat env may lack it (THE
+    # real-env finding from the first live run). Default to the repo venv, which has it. For a real
+    # deployment, each seat's env must provide `redis`.
+    parser.add_argument("--seat-python", default=".venv/bin/python3")
+    parser.add_argument("--dsn", default=os.environ.get("ARB_MEMORY_DSN"))
+    parser.add_argument("--redis-url", default=os.environ.get("ARB_MEMORY_REDIS_URL", "redis://127.0.0.1:6379/15"))
+    parser.add_argument("--agent-env-file", default=DEFAULT_AGENT_ENV_FILE)
+    parser.add_argument("--from-agent-id", default=DEFAULT_FROM_AGENT_ID)
+    parser.add_argument("--writer-target-id", default=DEFAULT_WRITER_TARGET)
+    parser.add_argument("--reader-target-id", default=DEFAULT_READER_TARGET)
+    parser.add_argument("--dispatch-timeout-s", type=int, default=900)
+    args = parser.parse_args(argv)
+
+    if not args.dsn:
+        raise SystemExit("ARB_MEMORY_DSN or --dsn is required")
+
+    repo_root = str(Path(args.repo_root).resolve())
+    run_tag = f"arb-memory-seat-e2e-{uuid.uuid4().hex}"
+    prefix = f"{run_tag}:"
+    marker = f"{run_tag}-marker"
+    sentinel_marker = f"{run_tag}-sentinel"
+    ulids = set()
+    consumer = None
+
+    conn = _connect(args.dsn)
+    try:
+        cleanup_rows(conn, run_tag, ulids)
+        assert_absent(conn, run_tag, "pre-test absence")
+        clean_redis_prefix(args.redis_url, prefix)
+
+        consumer_env = dict(os.environ)
+        consumer_env.update(
+            {
+                "ARB_MEMORY_DSN": args.dsn,
+                "ARB_MEMORY_REDIS_URL": args.redis_url,
+                "ARB_MEMORY_PREFIX": prefix,
+            }
+        )
+        consumer_env.pop("ARB_MEMORY_EMBED_MOCK", None)
+        consumer = start_consumer(repo_root=repo_root, python=args.python, env=consumer_env)
+
+        ulids.update(
+            sentinel_ready(
+                conn=conn,
+                redis_url=args.redis_url,
+                prefix=prefix,
+                marker=sentinel_marker,
+                artefact_id=f"{run_tag}-sentinel",
+                run_tag=run_tag,
+            )
+        )
+        cleanup_rows(conn, run_tag, ulids)
+        assert_absent(conn, run_tag, "post-sentinel cleanup")
+
+        write_task = seat_write_task(
+            repo_root=repo_root,
+            python=args.seat_python,
+            redis_url=args.redis_url,
+            prefix=prefix,
+            marker=marker,
+            artefact_id=f"{run_tag}-writer",
+            run_tag=run_tag,
+        )
+        write_cmd, write_enq_env = publish_and_build_dispatch(
+            target_id=args.writer_target_id,
+            engine="codex",
+            instructions=write_task,
+            timeout_s=args.dispatch_timeout_s,
+            env_file=args.agent_env_file,
+            from_agent_id=args.from_agent_id,
+            run_id=run_tag,
+            redis_url=args.redis_url,
+            title=f"seat-e2e-write-{run_tag}",
+        )
+        write_out = run_dispatch(write_cmd, env=write_enq_env)
+        ulids.add(require_pattern(r"ARB_MEMORY_SEAT_WRITE_ULID=([0-9a-fA-F]+)", write_out, "write ulid"))
+        wait_for_persisted(conn, marker, run_tag, timeout_s=60)
+
+        query_task = seat_query_task(
+            repo_root=repo_root,
+            python=args.seat_python,
+            redis_url=args.redis_url,
+            prefix=prefix,
+            marker=marker,
+            run_tag=run_tag,
+        )
+        query_cmd, query_enq_env = publish_and_build_dispatch(
+            target_id=args.reader_target_id,
+            engine="agy-print",
+            instructions=query_task,
+            timeout_s=args.dispatch_timeout_s,
+            env_file=args.agent_env_file,
+            from_agent_id=args.from_agent_id,
+            run_id=run_tag,
+            redis_url=args.redis_url,
+            title=f"seat-e2e-query-{run_tag}",
+        )
+        query_out = run_dispatch(query_cmd, env=query_enq_env)
+        require_pattern(rf"ARB_MEMORY_SEAT_QUERY_OK=({re.escape(marker)})", query_out, "query marker")
+        print(json.dumps({"ok": True, "run_tag": run_tag, "prefix": prefix}))
+        return 0
+    finally:
+        # DRAIN BARRIER: prove the consumer (a separate writer process) quiesced before we tore it down.
+        # A consumer that commits AFTER its stop-signal is, in production, a node writing past its drain
+        # point — a failover/consistency violation, not a tooling nit. Capture the stop-signal instant on
+        # the DB clock (NOT the harness host clock — they're different machines; created_at is DB-clock),
+        # stop the consumer, then assert this run's latest row commit (max created_at, read from the
+        # harness conn — never a query on the consumer's connection) precedes it. Done before cleanup,
+        # which deletes the rows. (Pattern note: systems with a separate writer/consumer process.)
+        stop_signal_db_ts = conn.execute("SELECT now()").fetchone()[0]
+        if consumer is not None:
+            stop_consumer(consumer)
+        try:
+            last_commit = conn.execute(
+                "SELECT max(created_at) FROM ("
+                "  SELECT created_at FROM artefacts WHERE artefact_id LIKE %s"
+                "  UNION ALL SELECT created_at FROM hints WHERE source = %s OR author = %s"
+                ") q",
+                (f"{run_tag}%", run_tag, run_tag),
+            ).fetchone()[0]
+            if last_commit is not None and last_commit > stop_signal_db_ts:
+                raise RuntimeError(
+                    f"drain-barrier violation: consumer committed at {last_commit} "
+                    f"AFTER stop-signal {stop_signal_db_ts} "
+                    f"({(last_commit - stop_signal_db_ts).total_seconds():.2f}s past) — "
+                    "the writer wrote past its drain point"
+                )
+            cleanup_rows(conn, run_tag, ulids)
+            assert_absent(conn, run_tag, "post-test absence")
+            clean_redis_prefix(args.redis_url, prefix)
+        finally:
+            conn.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

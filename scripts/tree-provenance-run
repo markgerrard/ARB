@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+"""tree-provenance-run — suite-runner wrapper that voids results from a changed tree (ARB-B1).
+
+Records `git rev-parse HEAD` plus a tree digest at start, runs the wrapped command with
+stdio passed through, re-checks both at finish, and:
+
+  * snapshots equal   -> emits `tree-provenance: OK head=... tree_sha256=... dirty=D
+    cmd_exit=N` on stderr and exits with the command's own exit code. The OK stamp is
+    the provenance mark the close-discipline bullet keys on: a suite result WITHOUT it
+    is [U] regardless of outcome.
+  * snapshots differ  -> emits `tree-provenance: VOID` naming both before/after values
+    and exits 97. The command's exit code is deliberately NOT reported — a green from a
+    mutated tree is exactly the result this tool exists to refuse to report
+    (docs/defect-classes/workdir-mutated-while-run-in-flight.md; the 2026-07-24
+    benchmark contamination and the 2026-07-29 voided shr-s2 run).
+  * finish unverifiable -> also VOID (fail closed): if the finish snapshot cannot be
+    taken (repo vanished, git broken mid-run), stability cannot be established and the
+    result is discarded. REFUSE is never emitted after the command has run.
+  * unusable env at start -> `tree-provenance: REFUSE <reason>` and exit 98, BEFORE the
+    command runs (not-a-git-repo, no-commit-at-HEAD, git unavailable/failed). Refusal
+    is distinct from VOID on purpose: assert the specific code, never a bare nonzero.
+
+The tree digest is sha256 over the bytes of `git status --porcelain -uall`, a NUL, and
+`git diff HEAD --binary`. `-uall` lists every untracked FILE (an addition under an
+already-untracked directory changes the digest, and the explicit flag overrides any
+`status.showUntrackedFiles` config); the diff term captures the CONTENT of tracked
+changes, staged or not, so a dirty file re-mutated behind a stable ` M` status line
+still voids. A `start` line with the same fields plus the argv is emitted BEFORE the
+command runs, so a crashed or killed run still leaves its start-state evidence.
+
+Policy (the other half of ARB-B1): a BACKGROUND run gets its own disposable worktree
+pinned to the commit under test — one worktree, one writer. This wrapper detects the
+violation at the endpoints; the worktree policy is the operational control that avoids
+it. Use both.
+
+Honest limits:
+  * The check is ENDPOINT EQUALITY, not continuous observation: a mutation fully
+    reverted before the finish snapshot is invisible (pinned by
+    test_mutate_then_restore_is_the_documented_endpoint_limit). Continuous certainty
+    would need filesystem watching, deliberately out of scope.
+  * Untracked files contribute their PATHS to the digest, not their content — an edit
+    to an already-untracked file's content is invisible; creating/deleting/renaming
+    untracked files is caught.
+  * Exit 97/98 could in principle collide with a wrapped command's own exit code; the
+    stderr stamp line is the authoritative signal, the code is a convenience.
+  * The stamp certifies that the start and finish snapshots matched; it does not
+    certify what the command did between them (in-process test code is trusted, as in
+    every gate in this family).
+
+Usage: tree-provenance-run <command> [args...]
+Exit codes: command's own exit (snapshots equal); 97 VOID; 98 REFUSE; 2 usage.
+"""
+from __future__ import annotations
+
+import hashlib
+import re
+import shlex
+import subprocess
+import sys
+
+VOID_EXIT = 97
+REFUSE_EXIT = 98
+USAGE_EXIT = 2
+
+
+class SnapshotError(Exception):
+    """A snapshot could not be taken; .reason is a stable machine-readable token."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _git_bytes(*args: str) -> bytes:
+    """Run git, return stdout bytes; raise SnapshotError with a named reason."""
+    try:
+        proc = subprocess.run(["git", *args], capture_output=True, check=False)
+    except FileNotFoundError:
+        raise SnapshotError("git-unavailable") from None
+    if proc.returncode != 0:
+        raise SnapshotError(f"git-failed:{args[0]}")
+    return proc.stdout
+
+
+def snapshot() -> tuple[str, str, int]:
+    """Return (head, tree_sha256, dirty) for the cwd's repo, or raise SnapshotError."""
+    try:
+        _git_bytes("rev-parse", "--show-toplevel")
+    except SnapshotError as exc:
+        if exc.reason == "git-failed:rev-parse":
+            raise SnapshotError("not-a-git-repo") from None
+        raise
+    try:
+        head = _git_bytes("rev-parse", "HEAD").decode().strip()
+    except SnapshotError as exc:
+        if exc.reason == "git-failed:rev-parse":
+            raise SnapshotError("no-commit-at-HEAD") from None
+        raise
+    status = _git_bytes("status", "--porcelain", "-uall")
+    # --no-ext-diff --no-textconv: snapshotting must hash repository BYTES and must
+    # never execute repo-configured diff commands — a nondeterministic textconv
+    # driver otherwise false-VOIDs an unchanged tree (r2 finding N1).
+    diff = _git_bytes("diff", "--no-ext-diff", "--no-textconv", "HEAD", "--binary")
+    digest = hashlib.sha256(status + b"\0" + diff).hexdigest()
+    return head, digest, 1 if status else 0
+
+
+def main(argv: list[str]) -> int:
+    if not argv:
+        print(
+            "usage: tree-provenance-run <command> [args...]",
+            file=sys.stderr,
+        )
+        return USAGE_EXIT
+
+    try:
+        head0, hash0, dirty0 = snapshot()
+    except SnapshotError as exc:
+        print(f"tree-provenance: REFUSE {exc.reason}", file=sys.stderr)
+        return REFUSE_EXIT
+    # Control characters in argv are escaped so the stamp stays one line — a raw
+    # newline would split the line-oriented grammar and let argv text open its own
+    # stderr record (r2 finding N2).
+    cmd_repr = re.sub(
+        r"[\x00-\x1f]", lambda m: f"\\x{ord(m.group()):02x}", shlex.join(argv)
+    )
+    print(
+        f"tree-provenance: start head={head0} tree_sha256={hash0} dirty={dirty0} "
+        f"cmd={cmd_repr}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+    proc = subprocess.run(argv, check=False)
+    cmd_exit = proc.returncode
+    if cmd_exit < 0:  # killed by signal N -> conventional 128+N
+        cmd_exit = 128 - cmd_exit
+
+    try:
+        head1, hash1, dirty1 = snapshot()
+    except SnapshotError as exc:
+        print(
+            "tree-provenance: VOID — tree cannot be re-verified after the run "
+            f"({exc.reason}), result discarded (cmd_exit={cmd_exit} not reported) "
+            f"start head={head0} tree_sha256={hash0}",
+            file=sys.stderr,
+        )
+        return VOID_EXIT
+    if (head0, hash0) != (head1, hash1):
+        print(
+            "tree-provenance: VOID — tree changed mid-run, result discarded "
+            f"(cmd_exit={cmd_exit} not reported) "
+            f"head={head0}->{head1} tree_sha256={hash0}->{hash1}",
+            file=sys.stderr,
+        )
+        return VOID_EXIT
+
+    print(
+        f"tree-provenance: OK head={head1} tree_sha256={hash1} "
+        f"dirty={dirty1} cmd_exit={cmd_exit}",
+        file=sys.stderr,
+    )
+    return cmd_exit
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

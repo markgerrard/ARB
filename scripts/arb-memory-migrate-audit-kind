@@ -1,0 +1,38 @@
+#!/usr/bin/env python3
+"""Backfill audit_events.kind on an already-populated table, then tighten to NOT NULL.
+
+Order (idempotent): add nullable -> backfill from raw_entry->>'kind' -> quarantine the
+unbackfillable to 'unknown' (never silent NULL) -> SET NOT NULL. Run once per live DB.
+"""
+import os
+import sys
+
+import psycopg
+
+
+def migrate_audit_kind(conn):
+    conn.execute("ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS kind text")
+    conn.execute(
+        "UPDATE audit_events SET kind = raw_entry->>'kind' "
+        "WHERE kind IS NULL AND raw_entry->>'kind' IS NOT NULL AND raw_entry->>'kind' <> ''"
+    )
+    conn.execute("UPDATE audit_events SET kind = 'unknown' WHERE kind IS NULL")
+    conn.execute("ALTER TABLE audit_events ALTER COLUMN kind SET NOT NULL")
+
+
+def main(argv=None):
+    dsn = os.environ.get("ARB_MEMORY_DSN")
+    if not dsn:
+        print("ARB_MEMORY_DSN required", file=sys.stderr)
+        return 2
+    conn = psycopg.connect(dsn, autocommit=True)
+    try:
+        migrate_audit_kind(conn)
+        print("audit_events.kind migration complete")
+        return 0
+    finally:
+        conn.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

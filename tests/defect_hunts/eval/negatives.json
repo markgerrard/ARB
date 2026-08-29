@@ -1,0 +1,186 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "id": "arb-memory-prefix-post-fix",
+      "kind": "H1",
+      "expected_decision": "CLEAR",
+      "classification": "clean-negative",
+      "reason": "bus and audit both derive PREFIX from ARB_MEMORY_PREFIX, so the readers co-move.",
+      "anchors": {
+        "filenames": ["bus.py", "audit.py"]
+      },
+      "files": {
+        "src/arb_memory/bus.py": "import os\n\nPREFIX = os.environ.get(\"ARB_MEMORY_PREFIX\", \"\")\n\ndef reads_stream(prefix=PREFIX):\n    return f\"{prefix}arbmem:reads\"\n",
+        "src/arb_memory/audit.py": "import os\n\nPREFIX = os.environ.get(\"ARB_MEMORY_PREFIX\", \"\")\n\ndef audit_stream(prefix=PREFIX):\n    return f\"{prefix}arbmem:audit\"\n"
+      },
+      "diff": "diff --git a/src/arb_memory/bus.py b/src/arb_memory/bus.py\n--- a/src/arb_memory/bus.py\n+++ b/src/arb_memory/bus.py\n@@\n-PREFIX = \"\"\n+PREFIX = os.environ.get(\"ARB_MEMORY_PREFIX\", \"\")\n"
+    },
+    {
+      "id": "bridge-notify-inbox",
+      "kind": "H1",
+      "expected_decision": "CLEAR",
+      "classification": "clean-negative",
+      "reason": "BRIDGE_NOTIFY_INBOX is parsed through one option path; H1 has no module-level direct-env/literal sibling drift to flag.",
+      "anchors": {
+        "filenames": ["bridge.py"]
+      },
+      "files": {
+        "src/agent_redis_bridge/bridge.py": "import os\n\ndef _env_bool(name, default):\n    raw = os.environ.get(name)\n    if raw is None:\n        return default\n    return raw not in {\"0\", \"false\", \"False\"}\n\ndef parse_notify_inbox():\n    return _env_bool(\"BRIDGE_NOTIFY_INBOX\", True)\n"
+      },
+      "diff": "diff --git a/src/agent_redis_bridge/bridge.py b/src/agent_redis_bridge/bridge.py\n--- a/src/agent_redis_bridge/bridge.py\n+++ b/src/agent_redis_bridge/bridge.py\n@@\n+def parse_notify_inbox():\n+    return _env_bool(\"BRIDGE_NOTIFY_INBOX\", True)\n"
+    },
+    {
+      "id": "bridge-pi-thinking-level",
+      "kind": "H1",
+      "expected_decision": "CLEAR",
+      "classification": "clean-negative",
+      "reason": "pi_rpc.py and pi_sdk.py both resolve thinking_level with os.environ.get(\"BRIDGE_PI_THINKING_LEVEL\") or None.",
+      "anchors": {
+        "filenames": ["pi_rpc.py", "pi_sdk.py"]
+      },
+      "files": {
+        "src/agent_redis_bridge/engines/pi_rpc.py": "import os\n\nclass PiRpcEngine:\n    def __init__(self, thinking_level=None):\n        if thinking_level is None:\n            thinking_level = os.environ.get(\"BRIDGE_PI_THINKING_LEVEL\") or None\n        self.thinking_level = thinking_level\n",
+        "src/agent_redis_bridge/engines/pi_sdk.py": "import os\n\nclass PiSdkEngine:\n    def __init__(self, thinking_level=None):\n        if thinking_level is None:\n            thinking_level = os.environ.get(\"BRIDGE_PI_THINKING_LEVEL\") or None\n        self.thinking_level = thinking_level\n"
+      },
+      "diff": "diff --git a/src/agent_redis_bridge/engines/pi_rpc.py b/src/agent_redis_bridge/engines/pi_rpc.py\n--- a/src/agent_redis_bridge/engines/pi_rpc.py\n+++ b/src/agent_redis_bridge/engines/pi_rpc.py\n@@\n+        if thinking_level is None:\n+            thinking_level = os.environ.get(\"BRIDGE_PI_THINKING_LEVEL\") or None\n"
+    },
+    {
+      "id": "h1-alias-trap",
+      "kind": "H1",
+      "expected_decision": "CLEAR",
+      "classification": "baited-trap",
+      "baits": "same-name substring or flag",
+      "reason": "Name-mismatch trap: the visible literal is MODE_DEFAULT, not an independent same-named MODE reader.",
+      "anchors": {
+        "filenames": ["bus.py", "audit.py"]
+      },
+      "files": {
+        "pkg/bus.py": "import os\n\nMODE = os.environ.get(\"TRAP_MODE\", \"on\")\n",
+        "pkg/audit.py": "from .bus import MODE as MODE_ALIAS\n\nMODE_DEFAULT = \"on\"\nMODE_VIEW = MODE_ALIAS\n"
+      },
+      "diff": "diff --git a/pkg/bus.py b/pkg/bus.py\n--- a/pkg/bus.py\n+++ b/pkg/bus.py\n@@\n-MODE = \"on\"\n+MODE = os.environ.get(\"TRAP_MODE\", \"on\")\n"
+    },
+    {
+      "id": "h1-diverging-literal-clean",
+      "kind": "H1",
+      "expected_decision": "CLEAR",
+      "classification": "clean-negative",
+      "reason": "MAXLEN is env-derived with default 64 in one module while the same-named sibling literal is 128, so the literal diverges from the default and is not a stale default clone.",
+      "anchors": {
+        "filenames": ["producer.py", "consumer.py"]
+      },
+      "files": {
+        "pkg/producer.py": "import os\n\nMAXLEN = os.environ.get(\"TRAP_MAXLEN\", 64)\n",
+        "pkg/consumer.py": "MAXLEN = 128\n"
+      },
+      "diff": "diff --git a/pkg/producer.py b/pkg/producer.py\n--- a/pkg/producer.py\n+++ b/pkg/producer.py\n@@\n-MAXLEN = 64\n+MAXLEN = os.environ.get(\"TRAP_MAXLEN\", 64)\n"
+    },
+    {
+      "id": "h1-divergence-trap",
+      "kind": "H1",
+      "expected_decision": "FLAG",
+      "classification": "baited-trap",
+      "baits": "literal value equals env default so it looks intentional",
+      "reason": "A constructed direct env reader and same-named literal sibling remain divergent even though the literal equals the default.",
+      "anchors": {
+        "filenames": ["bus.py", "audit.py"]
+      },
+      "files": {
+        "pkg/bus.py": "import os\n\nPREFIX = os.environ.get(\"TRAP_PREFIX\", \"\")\n",
+        "pkg/audit.py": "PREFIX = \"\"\n"
+      },
+      "diff": "diff --git a/pkg/bus.py b/pkg/bus.py\n--- a/pkg/bus.py\n+++ b/pkg/bus.py\n@@\n-PREFIX = \"\"\n+PREFIX = os.environ.get(\"TRAP_PREFIX\", \"\")\n"
+    },
+    {
+      "id": "h1-defaultless-env-trap",
+      "kind": "H1",
+      "expected_decision": "CLEAR",
+      "classification": "baited-trap",
+      "baits": "defaultless env read plus nearby literal",
+      "reason": "A required env read has no default, so a nearby literal is not proof of a missed defaulted sibling.",
+      "anchors": {
+        "filenames": ["publisher.py", "consumer.py"]
+      },
+      "files": {
+        "pkg/publisher.py": "import os\n\nTOKEN = os.environ[\"TRAP_TOKEN\"]\n",
+        "pkg/consumer.py": "TOKEN = \"\"\n"
+      },
+      "diff": "diff --git a/pkg/publisher.py b/pkg/publisher.py\n--- a/pkg/publisher.py\n+++ b/pkg/publisher.py\n@@\n+TOKEN = os.environ[\"TRAP_TOKEN\"]\n"
+    },
+    {
+      "id": "h1-env-literal-outside-diff",
+      "kind": "H1",
+      "expected_decision": "CLEAR",
+      "classification": "clean-negative",
+      "reason": "A same-named env/literal default asymmetry exists in the files, but the diff only changes an unrelated literal; H1 should scope direct env readers to added diff lines.",
+      "anchors": {
+        "filenames": ["live.py", "defaults.py"]
+      },
+      "files": {
+        "pkg/live.py": "import os\n\nENDPOINT = os.environ.get(\"TRAP_ENDPOINT\", \"http://localhost\")\n\ndef endpoint():\n    return ENDPOINT\n",
+        "pkg/defaults.py": "ENDPOINT = \"http://localhost\"\nRETRY_ENABLED = True\n"
+      },
+      "diff": "diff --git a/pkg/defaults.py b/pkg/defaults.py\n--- a/pkg/defaults.py\n+++ b/pkg/defaults.py\n@@\n-RETRY_ENABLED = False\n+RETRY_ENABLED = True\n"
+    },
+    {
+      "id": "h2-safe-pinned-assumption",
+      "kind": "H2",
+      "expected_decision": "CLEAR",
+      "classification": "baited-trap",
+      "baits": "environmental assumption looks unverified but is pinned by a concrete test",
+      "reason": "The complete H2 row cites a real test anchor and names no violating run, so the H2 gate should pass without a FLAG.",
+      "anchors": {
+        "filenames": ["test_mcp_config.py"]
+      },
+      "files": {
+        "tests/arb_memory/test_mcp_config.py": "def test_default_mcp_dsn_uses_arb_memory_dsn():\n    assert True\n"
+      },
+      "diff": "diff --git a/tests/arb_memory/test_mcp_config.py b/tests/arb_memory/test_mcp_config.py\n--- a/tests/arb_memory/test_mcp_config.py\n+++ b/tests/arb_memory/test_mcp_config.py\n@@\n+def test_default_mcp_dsn_uses_arb_memory_dsn():\n+    assert True\n",
+      "h2_section": {
+        "coverage_acknowledgment": {
+          "acknowledged": true,
+          "additional_assumptions": []
+        },
+        "rows": [
+          {
+            "candidate_id": "postgres:src/arb_memory/run.py:psycopg.connect#1",
+            "disposition": "answered",
+            "violating_run": "No violating run: tests vary ARB_MEMORY_DSN and assert the derived MCP DSN.",
+            "evidence": "tests/arb_memory/test_mcp_config.py"
+          }
+        ]
+      }
+    },
+    {
+      "id": "arb-memory-dsn",
+      "kind": "H1",
+      "expected_decision": "CLEAR",
+      "classification": "clean-negative",
+      "reason": "Suspect closed by execution: tests vary ARB_MEMORY_DSN and assert every src reader observes the change.",
+      "anchors": {
+        "filenames": ["run.py", "config.py"]
+      },
+      "files": {
+        "src/arb_memory/run.py": "import os\n\ndef _memory_conn():\n    import psycopg\n    return psycopg.connect(os.environ[\"ARB_MEMORY_DSN\"])\n",
+        "src/arb_memory/mcp/config.py": "import os\n\ndef _default_mcp_dsn():\n    dsn = os.environ.get(\"ARB_MEMORY_MCP_DSN\")\n    if dsn:\n        return dsn\n    base = os.environ.get(\"ARB_MEMORY_DSN\", \"\")\n    return base.replace(\"arb_memory:\", \"arbmem_mcp:\", 1)\n"
+      },
+      "diff": "diff --git a/src/arb_memory/run.py b/src/arb_memory/run.py\n--- a/src/arb_memory/run.py\n+++ b/src/arb_memory/run.py\n@@\n+    return psycopg.connect(os.environ[\"ARB_MEMORY_DSN\"])\n"
+    },
+    {
+      "id": "arb-memory-redis-url",
+      "kind": "H1",
+      "expected_decision": "CLEAR",
+      "classification": "clean-negative",
+      "reason": "Suspect closed by execution: tests vary ARB_MEMORY_REDIS_URL and assert every src reader observes the change.",
+      "anchors": {
+        "filenames": ["client.py", "run.py"]
+      },
+      "files": {
+        "src/arb_memory/client.py": "import os\n\ndef _redis_client():\n    import redis\n    return redis.from_url(os.environ[\"ARB_MEMORY_REDIS_URL\"], decode_responses=True)\n",
+        "src/arb_memory/run.py": "import os\n\ndef _redis_client():\n    import redis\n    return redis.from_url(os.environ[\"ARB_MEMORY_REDIS_URL\"], decode_responses=True)\n"
+      },
+      "diff": "diff --git a/src/arb_memory/client.py b/src/arb_memory/client.py\n--- a/src/arb_memory/client.py\n+++ b/src/arb_memory/client.py\n@@\n+    return redis.from_url(os.environ[\"ARB_MEMORY_REDIS_URL\"], decode_responses=True)\n"
+    }
+  ]
+}

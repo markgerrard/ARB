@@ -1,0 +1,16 @@
+{
+ "schema": 1,
+ "mutations": [
+  {
+   "id": "M1",
+   "kind": "defect",
+   "label": "bus.memory_write stops refusing expected_version with no result channel",
+   "file": "src/arb_memory/bus.py",
+   "find": "        and artefact.get(\"expected_version\") is not None\n        and request_id is None\n    ):\n        raise ValueError(\"expected_version requires a result channel\")\n",
+   "replace": "        and False\n        and request_id is None\n    ):\n        raise ValueError(\"expected_version requires a result channel\")\n",
+   "expect_failed": [
+    "tests/arb_memory/test_write_result.py::test_memory_write_refuses_expected_version_without_result_channel"
+   ]
+  }
+ ]
+}

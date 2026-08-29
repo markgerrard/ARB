@@ -1,0 +1,184 @@
+#!/usr/bin/env bash
+# arb-bg-wake-selftest — NON-BLOCKING inbox fires for interactive orch CLI wakes.
+#
+# Wakes target the **interactive pi orch session** (idle prompt), NOT seats.
+#
+#   scripts/arb-bg-wake-selftest              # schedule 30/45/60s inbox wakes, return NOW
+#   OFFSETS="8 12 16" scripts/arb-bg-wake-selftest
+#   scripts/arb-bg-wake-selftest --verify RUN_DIR
+#
+# Interactive pi must have arb-bg-wake loaded (/reload) and be IDLE to get turns.
+#
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BASE=${ARB_BG_WAKE_DIR:-/tmp/arb-orch/bg-wake}
+OFFSETS=${OFFSETS:-"30 45 60"}
+NOTIFY=${ARB_BG_WAKE_NOTIFY:-"$SCRIPT_DIR/arb-bg-wake-notify"}
+SCHEDULER_PY=${ARB_BG_WAKE_SCHEDULER_PY:-"$SCRIPT_DIR/arb-bg-wake-selftest-scheduler.py"}
+
+MODE=start
+VERIFY_DIR=
+case "${1:-}" in
+  --verify) MODE=verify; VERIFY_DIR=${2:?need RUN_DIR} ;;
+  -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
+  "") MODE=start ;;
+  *) echo "unknown arg: $1" >&2; exit 2 ;;
+esac
+
+chmod +x "$NOTIFY" 2>/dev/null || true
+
+if [[ "$MODE" == "verify" ]]; then
+  python3 - "$VERIFY_DIR" <<'PY'
+import json, sys
+from pathlib import Path
+run = Path(sys.argv[1])
+meta = json.loads((run/"meta.json").read_text()) if (run/"meta.json").is_file() else {}
+offsets = [int(x) for x in str(meta.get("offsets", "30 45 60")).split()]
+fail = 0
+rows = []
+for o in offsets:
+    m = run / f"fire-{o}s.marker"
+    ok = m.is_file()
+    if not ok:
+        fail += 1
+    rows.append({"offset_s": o, "marker": ok})
+base = Path(meta.get("wake_dir", "/tmp/arb-orch/bg-wake"))
+processed = list((base/"inbox-processed").glob("*.md")) if (base/"inbox-processed").is_dir() else []
+pending = not (run/"scheduler.done").is_file()
+summary = {
+    "pass": fail == 0 and not pending,
+    "pending": pending,
+    "fail_count": fail,
+    "offsets": offsets,
+    "markers": rows,
+    "inbox_processed_total": len(processed),
+    "run_dir": str(run),
+    "note": "Markers = schedule fired. Interactive turn proof = you saw new orch turns.",
+}
+print(json.dumps(summary, indent=2))
+for r in rows:
+    print(("PASS" if r["marker"] else "FAIL"), f"t+{r['offset_s']}s")
+if pending:
+    print("PENDING scheduler still running")
+    sys.exit(3)
+sys.exit(0 if fail == 0 else 1)
+PY
+  exit $?
+fi
+
+# write scheduler helper once
+cat > "$SCHEDULER_PY" <<'PY'
+#!/usr/bin/env python3
+"""Detached: sleep to each offset, write marker + inbox notify for interactive pi."""
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+def main() -> int:
+    run_dir = Path(sys.argv[1])
+    base = Path(sys.argv[2])
+    notify = Path(sys.argv[3])
+    offsets = [int(x) for x in sys.argv[4:]]
+    run_dir.mkdir(parents=True, exist_ok=True)
+    log = open(run_dir / "scheduler.log", "a", buffering=1)
+    (run_dir / "scheduler.pid").write_text(str(os.getpid()) + "\n")
+    log.write(f"scheduler pid={os.getpid()} offsets={offsets}\n")
+    t0 = time.time()
+    for o in sorted(offsets):
+        delay = o - (time.time() - t0)
+        if delay > 0:
+            time.sleep(delay)
+        at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        msg = (
+            f"# Selftest interactive orch wake t+{o}s\n\n"
+            f"- run_dir: `{run_dir}`\n"
+            f"- offset_s: {o}\n"
+            f"- at: {at}\n\n"
+            f"You are the **interactive orch CLI**. A new turn should open now.\n"
+            f"Reply with exactly: `SAW_WAKE t+{o}s`\n"
+        )
+        (run_dir / f"fire-{o}s.marker").write_text(msg)
+        env = os.environ.copy()
+        env["ARB_BG_WAKE_DIR"] = str(base)
+        p = subprocess.run(
+            [str(notify), "--stdin"],
+            input=msg.encode(),
+            env=env,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+        )
+        log.write(f"t+{o}s notify_exit={p.returncode}\n")
+    log.write("scheduler done\n")
+    (run_dir / "scheduler.done").write_text("ok\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+PY
+chmod +x "$SCHEDULER_PY"
+
+STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+RUN_DIR="$BASE/selftest-$STAMP"
+mkdir -p "$RUN_DIR" "$BASE/inbox" "$BASE/inbox-processed"
+echo "$OFFSETS" >"$RUN_DIR/offsets.txt"
+read -r -a OFF_ARR <<<"$OFFSETS"
+
+# spawn scheduler detached
+python3 - <<PY
+import os, subprocess, sys
+from pathlib import Path
+run_dir = Path("$RUN_DIR")
+base = Path("$BASE")
+notify = Path("$NOTIFY")
+sched = Path("$SCHEDULER_PY")
+offsets = "${OFFSETS}".split()
+logf = open(run_dir / "spawn.log", "ab", buffering=0)
+cmd = [sys.executable, str(sched), str(run_dir), str(base), str(notify), *offsets]
+subprocess.Popen(
+    cmd,
+    stdin=subprocess.DEVNULL,
+    stdout=logf,
+    stderr=subprocess.STDOUT,
+    start_new_session=True,
+    env=os.environ.copy(),
+)
+print("spawned")
+PY
+
+cat >"$RUN_DIR/meta.json" <<EOF
+{
+  "stamp": "$STAMP",
+  "run_dir": "$RUN_DIR",
+  "wake_dir": "$BASE",
+  "offsets": "$OFFSETS",
+  "inbox": "$BASE/inbox",
+  "verify": "$0 --verify $RUN_DIR"
+}
+EOF
+
+echo "STARTED (non-blocking) — inbox wakes for **interactive orch CLI**"
+echo "  run_dir: $RUN_DIR"
+echo "  offsets: $OFFSETS"
+echo "  inbox:   $BASE/inbox"
+echo ""
+echo "Interactive pi: /reload, stay IDLE at the prompt."
+echo "You should get a new turn at each offset."
+echo ""
+echo "Manual bg_run proof (best):"
+echo "  bg_run command='sleep 15; echo HI' label='manual-15'"
+echo "  → END YOUR TURN (no bash sleep)"
+echo "  → ~15s later this interactive CLI wakes"
+echo ""
+echo "Verify later: $0 --verify $RUN_DIR"
+now=$(date +%s)
+for o in "${OFF_ARR[@]}"; do
+  echo "  t+${o}s  ~ $(date -r $((now + o)) +%H:%M:%S 2>/dev/null || echo +${o}s)"
+done
+exit 0

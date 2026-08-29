@@ -1,0 +1,27 @@
+{
+  "schema": 1,
+  "mutations": [
+    {
+      "id": "M1",
+      "kind": "defect",
+      "label": "break the fixture command",
+      "file": "scripts/mutation_sweep.py",
+      "find": "if not baseline.passed:",
+      "replace": "if baseline.passed:",
+      "expect_failed": [
+        "tests/test_mutation_sweep.py::test_caught_mutation_reports_the_failure_and_leaves_the_tree_clean"
+      ]
+    },
+    {
+      "id": "M2",
+      "kind": "defect",
+      "label": "erase junit result selection",
+      "file": "scripts/mutation_sweep.py",
+      "find": "root = ET.parse(junit_path).getroot()",
+      "replace": "root = ET.Element(\"testsuite\")",
+      "expect_failed": [
+        "tests/test_mutation_sweep.py::TestParse::test_junit_class_node_id_uses_pytest_class_separator"
+      ]
+    }
+  ]
+}

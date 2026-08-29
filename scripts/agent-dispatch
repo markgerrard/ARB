@@ -1,0 +1,714 @@
+#!/usr/bin/env bash
+# Engine-neutral dispatcher for the agent_redis_bridge. Use --engine to
+# choose codex (default), grok-acp, devin-acp, pi-rpc, pi-sdk, agent-sdk, openinterpreter, agy-print, or agy-tmux. The protocol
+# (gemini-acp is DEPRECATED 2026-07-03 — Google killed the gemini CLI — and is rejected below.)
+# is identical for all — the bridge translates Redis envelopes to/from
+# each engine's native protocol.
+#
+# `codex-dispatch` is a thin deprecation wrapper kept for back-compat;
+# new callers should target `agent-dispatch` directly.
+#
+# SOFT-DEPRECATED for interactive/orchestrator dispatch (2026-07-01): prefer
+# `scripts/dispatch-dev`, which wraps this same protocol over the Go client edge and
+# AUTO-DEFAULTS a meaningful --run-id (from the task's brief filename or
+# <target>-<branch>-<HHMMSS>) when none is given, instead of requiring the caller to
+# remember --run-id/--adhoc. This script remains the underlying primitive — it's still
+# used directly by programmatic callers (scripts/arb-memory-seat-e2e,
+# skills/diagnose/panel.py, tools/eval/arb_eval/pipeline.py) that already thread their
+# own run ids through, and as dispatch-dev's USE_BASH_DISPATCH=1 escape hatch. It is
+# not going away; this is a "which one should a human/orchestrator reach for" note,
+# not a removal notice. See memory dispatch-run-id-discipline for why this note exists.
+set -euo pipefail
+
+ENGINE=codex
+ROLE=
+TARGET_ID=
+TIMEOUT=3600
+TURN_TIMEOUT=
+WORKTREE=
+WT_BASE=
+WT_CLEANUP=keep
+CHECK=
+DRYRUN_ENV=
+# --expected-artifact / --allowed-path / --commit-message: mirror the same
+# semantics as `agent_redis_bridge.ctl send` (see ctl.py:97-118 + send_task
+# payload assembly at ctl.py:151-156). Populating these lets the bridge's
+# orchestrator-commit gate adopt a worker's uncommitted-but-allowed changes
+# instead of bouncing with "incomplete: uncommitted changes, no commit".
+EXPECTED_ARTIFACTS=()
+ALLOWED_PATHS=()
+COMMIT_MESSAGE=
+EXPECT_STRUCTURED=
+CELL_ID=
+ATTEMPT_ID=
+FIXTURE_ROOT_OID=
+TOOL_GID=
+CELL_ROOT=
+TOOL_ENDPOINT=
+FRESH_CONTEXT=
+REASONING_EFFORT=
+THREAD_ID=
+FORK_THREAD_ID=
+RUN_ID=
+OPERATION=
+WORKTREE_LEASE=
+LEASE_TTL=
+AUDIT_PANEL=
+PANEL_INPUT_LOCKED=
+ADHOC=
+# Slice 1d-iv: ordinary request/worktree_run go through dispatch_authority.
+# Non-FABA callers supply a pre-minted ref + target-bound receipt + brief bytes.
+ARTEFACT_ID=
+ARTEFACT_VERSION=
+RECEIPT_PATH=
+BRIEF_PATH=
+# All defaults are env-driven so a fresh clone only needs a populated
+# .env (see example-bridge/.env.example). Resolution order for each value:
+#   1. CLI flag (--workspace, --target-id, ...)
+#   2. Shell env (FROM_AGENT_ID, BRANCH, AGENT_ENV_FILE, ...)
+#   3. Keys read from $ENV_FILE (AGENT_DISPATCH_FROM, AGENT_PROJECT, ...)
+#   4. Hardcoded project-c fallback (legacy — gets the existing host
+#      bridges working without an .env update; new clones should set
+#      everything via .env).
+ENV_FILE=${AGENT_ENV_FILE:-${AGENT_WORKDIR:+$AGENT_WORKDIR/.env}}
+ENV_FILE=${ENV_FILE:-/srv/projects/project-c-dev/.env}
+# Repo root for PYTHONPATH / authority module (this script lives in scripts/).
+DISPATCH_REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Interpreter for the authority check: ARB_PYTHON, else the repo venv, else python3.
+if [ -z "${ARB_PYTHON:-}" ]; then
+  if [ -x "$DISPATCH_REPO/.venv/bin/python" ]; then ARB_PYTHON="$DISPATCH_REPO/.venv/bin/python"; else ARB_PYTHON=python3; fi
+fi
+
+usage() {
+  echo "usage: agent-dispatch ... [--artefact-id ID --version N --receipt PATH --brief PATH] [lifecycle flags]" >&2
+  echo "  Ordinary request/worktree_run (Slice 1d-iv): require pre-minted ref+receipt+brief;" >&2
+  echo "  enqueue goes through dispatch_authority.publish_and_enqueue (no independent rpush)." >&2
+  echo "  worktree_arm/worktree_release remain taskless lifecycle ops on the narrow path." >&2
+  echo "  --artefact-id / --version / --receipt / --brief  pre-minted source (required for ordinary request/run)" >&2
+  echo "  --check               validate resolved config (env file, bus, branch, trusted-sender, target heartbeat) and exit WITHOUT dispatching (no --run-id/--adhoc needed)" >&2
+  echo "  --dry-run-envelope    print the exact JSON envelope that would be enqueued, then exit WITHOUT sending (no --run-id/--adhoc needed)" >&2
+  echo "  --expected-artifact   relative path the task must produce (repeatable). Lets orchestrator-commit adopt worker's uncommitted edits instead of bouncing dirty_uncommitted." >&2
+  echo "  --allowed-path        ordinary path prefix, or the original task glob on scored dispatches (repeatable)." >&2
+  echo "  --cell-id / --attempt-id / --fixture-root-oid / --tool-gid  controller provenance for scored cell dispatches." >&2
+  echo "  --cell-root          controller-provisioned disposable scored cell root." >&2
+  echo "  --commit-message      exact commit message the orchestrator-commit uses (overrides the task-derived default)." >&2
+  echo "  --expect-structured   ask the bridge to request and parse a structured status block in the reply." >&2
+  echo "  --fresh-context       ask the bridge to reset engine conversation context before this request." >&2
+  echo "  --effort LEVEL        per-dispatch reasoning effort (low|medium|high|xhigh|max|ultra); codex only, overrides the seat default." >&2
+  echo "  --thread-id           ask a supporting bridge engine to resume this existing conversation thread." >&2
+  echo "  --operation           isolated worktree_arm|worktree_run|worktree_release request mode." >&2
+  echo "  --worktree-lease      bridge-minted lease id for worktree_run/release." >&2
+  echo "  --lease-ttl           requested worktree_arm lease lifetime in seconds." >&2
+  echo "  --fork-thread-id      ask a supporting bridge engine to fork this existing conversation thread." >&2
+  echo "  --run-id              set the top-level run_id on the request envelope. REQUIRED unless --adhoc: mint one" >&2
+  echo "                        per panel/multi-round workflow (RID=panel-<slug>-\$(date -u +%Y%m%dT%H%M%SZ)-\$(openssl rand -hex 3))" >&2
+  echo "                        and reuse it on every dispatch in that round, or arb-watch shows a raw task-id instead" >&2
+  echo "                        of a run label and no audit/vote evidence is recorded." >&2
+  echo "  --adhoc               explicitly declare this a one-off dispatch that needs no run_id label." >&2
+  echo "  --audit-panel         with --run-id, emit panel vote audit rows from replies/timeouts." >&2
+  echo "  --timeout             seconds to wait for reply (default 3600, to cover queued waits)." >&2
+  echo "  --turn-timeout        ceiling for one task engine turn; total dispatch duration may span multiple turns." >&2
+}
+
+get_env() {
+  # Tolerant under `set -euo pipefail`: a missing/unreadable env file must NOT
+  # abort the script. Callers (esp. `--check`) rely on reaching the preflight to
+  # *report* a missing env file, not crash during default resolution.
+  [ -r "$ENV_FILE" ] || return 0
+  awk -F= -v key="$1" '$1 == key { sub(/^[^=]*=/, ""); gsub(/^"|"$/, ""); print; exit }' "$ENV_FILE" 2>/dev/null || true
+}
+
+WORKSPACE=${AGENT_WORKSPACE:-$(get_env AGENT_WORKSPACE)}
+WORKSPACE=${WORKSPACE:-dev}
+PROJECT=${AGENT_PROJECT:-$(get_env AGENT_PROJECT)}
+PROJECT=${PROJECT:-project-c}  # legacy default; new clones should set AGENT_PROJECT in .env
+FROM=${FROM_AGENT_ID:-${AGENT_DISPATCH_FROM:-$(get_env AGENT_DISPATCH_FROM)}}
+FROM=${FROM:-claude-${PROJECT}-${WORKSPACE}}
+BRANCH=${BRANCH:-${AGENT_DISPATCH_BRANCH:-$(get_env AGENT_DISPATCH_BRANCH)}}
+BRANCH=${BRANCH:-manual}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --workspace)
+      WORKSPACE=${2:?--workspace requires a value}
+      shift 2
+      ;;
+    --engine)
+      ENGINE=${2:?--engine requires a value}
+      shift 2
+      ;;
+    --role)
+      ROLE=${2:?--role requires a value}
+      shift 2
+      ;;
+    --target-id)
+      TARGET_ID=${2:?--target-id requires a value}
+      shift 2
+      ;;
+    --timeout)
+      TIMEOUT=${2:?--timeout requires a value}
+      shift 2
+      ;;
+    --turn-timeout)
+      TURN_TIMEOUT=${2:?--turn-timeout requires a value}
+      shift 2
+      ;;
+    --worktree)
+      WORKTREE=${2:?--worktree requires a name}
+      shift 2
+      ;;
+    --worktree-base)
+      WT_BASE=${2:?--worktree-base requires a ref}
+      shift 2
+      ;;
+    --worktree-cleanup)
+      WT_CLEANUP=${2:?--worktree-cleanup requires keep|auto}
+      shift 2
+      ;;
+    --expected-artifact)
+      EXPECTED_ARTIFACTS+=("${2:?--expected-artifact requires a relative path}")
+      shift 2
+      ;;
+    --allowed-path)
+      ALLOWED_PATHS+=("${2:?--allowed-path requires a path prefix}")
+      shift 2
+      ;;
+    --cell-id)
+      CELL_ID=${2:?--cell-id requires a value}
+      shift 2
+      ;;
+    --attempt-id)
+      ATTEMPT_ID=${2:?--attempt-id requires a value}
+      shift 2
+      ;;
+    --fixture-root-oid)
+      FIXTURE_ROOT_OID=${2:?--fixture-root-oid requires a value}
+      shift 2
+      ;;
+    --tool-gid)
+      TOOL_GID=${2:?--tool-gid requires a value}
+      case "$TOOL_GID" in
+        ''|*[!0-9]*) echo "error: --tool-gid must be a positive integer" >&2; exit 2 ;;
+      esac
+      shift 2
+      ;;
+    --cell-root)
+      CELL_ROOT=${2:?--cell-root requires an absolute path}
+      shift 2
+      ;;
+    --tool-endpoint)
+      TOOL_ENDPOINT=${2:?--tool-endpoint requires an absolute socket path}
+      shift 2
+      ;;
+    --commit-message)
+      COMMIT_MESSAGE=${2:?--commit-message requires a message}
+      shift 2
+      ;;
+    --expect-structured)
+      EXPECT_STRUCTURED=1
+      shift
+      ;;
+    --fresh-context)
+      FRESH_CONTEXT=1
+      shift
+      ;;
+    --effort)
+      REASONING_EFFORT=${2:?--effort requires a level (low|medium|high|xhigh|max|ultra)}
+      shift 2
+      ;;
+    --thread-id)
+      THREAD_ID=${2:?--thread-id requires an id}
+      shift 2
+      ;;
+    --operation)
+      OPERATION=${2:?--operation requires a value}
+      shift 2
+      ;;
+    --worktree-lease)
+      WORKTREE_LEASE=${2:?--worktree-lease requires an id}
+      shift 2
+      ;;
+    --lease-ttl)
+      LEASE_TTL=${2:?--lease-ttl requires seconds}
+      shift 2
+      ;;
+    --fork-thread-id)
+      FORK_THREAD_ID=${2:?--fork-thread-id requires an id}
+      shift 2
+      ;;
+    --run-id)
+      RUN_ID=${2:?--run-id requires an id}
+      shift 2
+      ;;
+    --audit-panel)
+      AUDIT_PANEL=1
+      shift
+      ;;
+    --panel-input-locked)
+      PANEL_INPUT_LOCKED=1
+      shift
+      ;;
+    --adhoc)
+      ADHOC=1
+      shift
+      ;;
+    --check)
+      CHECK=1
+      shift
+      ;;
+    --dry-run-envelope)
+      DRYRUN_ENV=1
+      shift
+      ;;
+    --artefact-id)
+      ARTEFACT_ID=${2:?--artefact-id requires a value}
+      shift 2
+      ;;
+    --version)
+      ARTEFACT_VERSION=${2:?--version requires a positive integer}
+      shift 2
+      ;;
+    --receipt)
+      RECEIPT_PATH=${2:?--receipt requires a path}
+      shift 2
+      ;;
+    --brief)
+      BRIEF_PATH=${2:?--brief requires a path}
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --*)
+      echo "error: unknown option: $1" >&2
+      exit 2
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+if [ -n "$TURN_TIMEOUT" ]; then
+  if ! [[ "$TURN_TIMEOUT" =~ ^-?[0-9]+$ ]]; then
+    echo "error: --turn-timeout requires an integer" >&2
+    exit 2
+  fi
+  if [ "$TURN_TIMEOUT" -ge "$TIMEOUT" ]; then
+    echo "warning: --timeout $TIMEOUT gives up before one requested --turn-timeout $TURN_TIMEOUT can complete" >&2
+  fi
+fi
+
+if [ -n "$AUDIT_PANEL" ] && [ -z "$RUN_ID" ]; then
+  echo "error: --audit-panel requires --run-id (a panel dispatch with no run_id gets zero audit AND zero eval, silently)" >&2
+  exit 1
+fi
+
+# A dispatch must declare either a run_id (panel/multi-round workflow, so arb-watch's Run
+# column shows a label and audit/vote evidence can be recorded) or --adhoc (an explicit,
+# conscious "this one-off needs no label"). Omitting both used to silently fall back to a raw
+# task-id GUID with zero audit trail — see memory dispatch-run-id-discipline. --check and
+# --dry-run-envelope never touch the bus, so neither needs one.
+if [ -z "$CHECK" ] && [ -z "$DRYRUN_ENV" ] && [ -z "$RUN_ID" ] && [ -z "$ADHOC" ]; then
+  echo "error: pass --run-id ID (panel/multi-round dispatch — mint one before the first dispatch and reuse it) or --adhoc (explicit one-off, no label needed)" >&2
+  echo "       (or use scripts/dispatch-dev instead, which auto-defaults --run-id for you)" >&2
+  exit 1
+fi
+
+# --check validates config only; it needs no task body / pre-minted source.
+# Ordinary request and worktree_run require pre-minted ref+receipt+brief (Slice 1d-iv).
+# Free-form positional task strings are no longer an independent enqueue path.
+if [ -z "$CHECK" ] && [ "$OPERATION" != "worktree_arm" ] && [ "$OPERATION" != "worktree_release" ]; then
+  if [ -z "$ARTEFACT_ID" ] || [ -z "$ARTEFACT_VERSION" ] || [ -z "$RECEIPT_PATH" ] || [ -z "$BRIEF_PATH" ]; then
+    echo "error: ordinary request/worktree_run requires --artefact-id --version --receipt --brief" >&2
+    echo "       (Slice 1d-iv: enqueue only via dispatch_authority; free-form task strings removed)" >&2
+    echo "       publish first with scripts/arb-memory-harness-publish (FABA driver), then pass the receipt." >&2
+    exit 2
+  fi
+  if [ ! -f "$RECEIPT_PATH" ]; then
+    echo "error: --receipt not readable: $RECEIPT_PATH" >&2
+    exit 2
+  fi
+  if [ ! -f "$BRIEF_PATH" ]; then
+    echo "error: --brief not readable: $BRIEF_PATH" >&2
+    exit 2
+  fi
+fi
+
+TASK="$*"
+
+if [ -n "$OPERATION" ] && { [ ${#EXPECTED_ARTIFACTS[@]} -gt 0 ] || [ ${#ALLOWED_PATHS[@]} -gt 0 ] ||
+  [ -n "$COMMIT_MESSAGE$EXPECT_STRUCTURED$FRESH_CONTEXT$REASONING_EFFORT$FORK_THREAD_ID$AUDIT_PANEL$PANEL_INPUT_LOCKED$CELL_ID$ATTEMPT_ID$FIXTURE_ROOT_OID$TOOL_GID$CELL_ROOT$TOOL_ENDPOINT" ]; }; then
+  echo "error: worktree operation mode rejects ordinary turn-dispatch fields" >&2
+  exit 2
+fi
+
+case "$OPERATION" in
+  "") ;;
+  worktree_arm)
+    [ -n "$WORKTREE" ] || { echo "error: worktree_arm requires --worktree" >&2; exit 2; }
+    [ -z "$TASK$WORKTREE_LEASE$THREAD_ID" ] || { echo "error: worktree_arm does not accept a task, --worktree-lease, or --thread-id" >&2; exit 2; }
+    [ "$WT_CLEANUP" = "keep" ] || { echo "error: worktree_arm requires --worktree-cleanup keep" >&2; exit 2; }
+    [ -z "$TURN_TIMEOUT" ] || { echo "error: worktree_arm does not accept --turn-timeout" >&2; exit 2; }
+    ;;
+  worktree_run)
+    [ -n "$WORKTREE_LEASE" ] || { echo "error: worktree_run requires --worktree-lease" >&2; exit 2; }
+    [ -n "$ARTEFACT_ID" ] && [ -n "$ARTEFACT_VERSION" ] && [ -n "$RECEIPT_PATH" ] && [ -n "$BRIEF_PATH" ] || {
+      echo "error: worktree_run requires --artefact-id --version --receipt --brief (authority path)" >&2; exit 2; }
+    [ -z "$WORKTREE$WT_BASE$LEASE_TTL" ] || { echo "error: worktree_run does not accept --worktree, --worktree-base, or --lease-ttl" >&2; exit 2; }
+    ;;
+  worktree_release)
+    [ -n "$WORKTREE_LEASE" ] || { echo "error: worktree_release requires --worktree-lease" >&2; exit 2; }
+    [ -z "$TASK$WORKTREE$WT_BASE$THREAD_ID$LEASE_TTL$TURN_TIMEOUT" ] || { echo "error: worktree_release accepts only --worktree-lease and --run-id" >&2; exit 2; }
+    ;;
+  *) echo "error: --operation must be worktree_arm, worktree_run, or worktree_release" >&2; exit 2 ;;
+esac
+case "$ENGINE" in
+  codex) TOOL=codex ;;
+  gemini-acp) echo "[agent-dispatch] gemini-acp is DEPRECATED (2026-07-03): Google deprecated the gemini CLI; the engine no longer runs. Use codex/agy-print/grok-acp/pi-sdk." >&2; exit 2 ;;
+  agy-print) TOOL=agy ;;
+  agy-tmux) TOOL=agy-tmux ;;
+  grok-acp) TOOL=grok ;;
+  cursor-acp) TOOL=cursor ;;
+  # cline-acp shipped in bridge.py (ENGINE_TO_TOOL, engine registry, CLI branch)
+  # on 2026-08-01 but never here, so the seat could RUN and could not be
+  # DISPATCHED TO: `unknown engine: cline-acp`, at the point of use, with the
+  # daemon healthy and heartbeating. tests/test_dispatch_engine_parity.py now
+  # pins the two lists together.
+  cline-acp) TOOL=cline ;;
+  kimi-code-acp) TOOL=kimi ;;
+  mini-agent-acp) TOOL=minimax ;;
+  devin-acp) TOOL=devin ;;
+  # oh-my-pi (a pi fork) gets its own tool prefix so omp seats don't collide
+  # with pi-rpc/pi-sdk seats on derived agent-ids — see ENGINE_TO_TOOL.
+  omp-acp) TOOL=omp ;;
+  opencode-acp) TOOL=opencode ;;
+  # DeepSeek Harness over ACP. "dsh", not "deepseek": the seat is the harness,
+  # and its model is a per-seat property (DSH_ACP_MODEL) — see ENGINE_TO_TOOL.
+  dsh-acp) TOOL=dsh ;;
+  pi-rpc) TOOL=pi ;;
+  # pi-sdk = "pi-sdk" tool prefix (NOT "pi") so derived agent-ids don't
+  # collide with pi-rpc seats — see ENGINE_TO_TOOL in bridge.py.
+  pi-sdk) TOOL=pi-sdk ;;
+  # agent-sdk = claude-agent-sdk mutation seat (M3/Kimi/GLM). ENGINE_TO_TOOL maps
+  # it to the SHORT prefix "asdk" (bridge.py:175) and the seats register as
+  # asdk-<project>-<workspace>-<role> — see the asdk-bridge-dev-* launch agents.
+  # This said TOOL=agent-sdk, with a comment claiming it matched bridge.py; it
+  # did not, so omitting --target-id derived agent-sdk-<project>-<workspace>, an
+  # id no seat registers. "asdk" is also a --engine alias the daemon normalizes.
+  agent-sdk|asdk) TOOL=asdk ;;
+  openinterpreter) TOOL=interpreter ;;
+  *)
+    echo "unknown engine: $ENGINE" >&2
+    exit 2
+    ;;
+esac
+TO=${TARGET_ID:-${TOOL}-${PROJECT}-${WORKSPACE}}
+if [ -z "$TARGET_ID" ] && [ -n "$ROLE" ]; then
+  TO="${TO}-${ROLE}"
+fi
+
+HOST=${AGENT_REDIS_HOST:-$(get_env AGENT_REDIS_HOST)}
+PORT=${AGENT_REDIS_PORT:-$(get_env AGENT_REDIS_PORT)}
+DB=${AGENT_REDIS_DB:-$(get_env AGENT_REDIS_DB)}
+PREFIX=${AGENT_REDIS_PREFIX:-$(get_env AGENT_REDIS_PREFIX)}
+REDIS_USER=${AGENT_REDIS_USER:-$(get_env AGENT_REDIS_USER)}
+REDIS_TLS=${AGENT_REDIS_TLS:-$(get_env AGENT_REDIS_TLS)}
+REDIS_PASSWORD=${AGENT_REDIS_PASSWORD:-$(get_env AGENT_REDIS_PASSWORD)}
+
+REDIS_FLAGS=(-h "$HOST" -p "$PORT" -n "$DB" --no-auth-warning)
+case "${REDIS_TLS:-0}" in 1|true|True|yes) REDIS_FLAGS+=(--tls) ;; esac
+[ -n "$REDIS_USER" ] && REDIS_FLAGS+=(--user "$REDIS_USER")
+[ -n "$REDIS_PASSWORD" ] && export REDISCLI_AUTH="$REDIS_PASSWORD"
+
+# Preflight: validate the RESOLVED config before the round-trip, so a forgotten
+# override (FROM_AGENT_ID, BRANCH, AGENT_ENV_FILE, --target-id) is refused with a
+# specific message here instead of surfacing as sender-rejected / invalid-branch /
+# silent-wrong-bus after the enqueue. Returns 0 if all checks pass, 1 otherwise.
+preflight() {
+  local ok=1
+  if [ -r "$ENV_FILE" ]; then
+    echo "  [ok]   env file   $ENV_FILE"
+  else
+    echo "  [FAIL] env file   not readable: $ENV_FILE (set AGENT_ENV_FILE)"; ok=0
+  fi
+  if [ -n "$HOST" ] && [ -n "$PORT" ]; then
+    local tls=; case "${REDIS_TLS:-0}" in 1|true|True|yes) tls=" tls" ;; esac
+    echo "  [ok]   bus        $HOST:$PORT db=${DB:-0}${tls}"
+  else
+    echo "  [FAIL] bus        unresolved (HOST/PORT empty) — check AGENT_REDIS_HOST/PORT"; ok=0
+  fi
+  if [ -n "$BRANCH" ]; then
+    echo "  [ok]   branch     $BRANCH"
+  else
+    echo "  [FAIL] branch     empty — would be rejected envelope-invalid invalid-branch (set BRANCH)"; ok=0
+  fi
+  local senders; senders=$(get_env AGENT_TRUSTED_SENDERS)
+  if [ -z "$senders" ]; then
+    echo "  [warn] sender     cannot verify '$FROM' (no AGENT_TRUSTED_SENDERS in env file; the target's policy is authoritative)"
+  elif printf '%s' "$senders" | tr ',' '\n' | grep -q "^[[:space:]]*${FROM}[[:space:]]*="; then
+    echo "  [ok]   sender     '$FROM' is trusted"
+  else
+    echo "  [FAIL] sender     '$FROM' NOT in AGENT_TRUSTED_SENDERS — would be sender-rejected. Trusted: $senders"; ok=0
+  fi
+  if [ -z "$HOST" ] || [ -z "$PORT" ]; then
+    echo "  [skip] target     heartbeat (no bus)"
+  else
+    local reg ttl
+    reg=$(redis-cli "${REDIS_FLAGS[@]}" HGET "${PREFIX}registry:${TO}" registered_at 2>/dev/null || true)
+    if [ -z "$reg" ]; then
+      echo "  [FAIL] target     '$TO' not registered (bridge down / wrong --target-id / wrong bus)"; ok=0
+    else
+      ttl=$(redis-cli "${REDIS_FLAGS[@]}" TTL "${PREFIX}agent:${TO}:status" 2>/dev/null || echo -2)
+      case "$ttl" in
+        ''|*[!0-9-]*) echo "  [FAIL] target     '$TO' heartbeat unreadable (ttl=$ttl)"; ok=0 ;;
+        *) if [ "$ttl" -gt 0 ]; then
+             echo "  [ok]   target     '$TO' alive (registered $reg, ttl=${ttl}s)"
+           else
+             echo "  [FAIL] target     '$TO' heartbeat dead (ttl=$ttl) — registered but not alive"; ok=0
+           fi ;;
+      esac
+    fi
+  fi
+  [ "$ok" = 1 ]
+}
+
+if [ -n "$CHECK" ]; then
+  echo "preflight: engine=$ENGINE  from=$FROM  ->  to=$TO  branch=$BRANCH" >&2
+  if preflight; then
+    echo "preflight: OK — config would dispatch cleanly" >&2
+    exit 0
+  else
+    echo "preflight: FAILED — refusing (this config would fail after the round-trip)" >&2
+    exit 3
+  fi
+fi
+
+if [ -r /proc/sys/kernel/random/uuid ]; then
+  ID=$(cat /proc/sys/kernel/random/uuid)
+elif command -v uuidgen >/dev/null 2>&1; then
+  ID=$(uuidgen | tr 'A-Z' 'a-z')
+else
+  ID=$(python3 -c 'import uuid; print(uuid.uuid4())')
+fi
+# ---------------------------------------------------------------------------
+# Lifecycle ops (worktree_arm / worktree_release) keep the narrow taskless path.
+# Ordinary request / worktree_run go through dispatch_authority only.
+# ---------------------------------------------------------------------------
+if [ "$OPERATION" = "worktree_arm" ] || [ "$OPERATION" = "worktree_release" ]; then
+  if [ "$OPERATION" = "worktree_arm" ]; then
+    WT_JSON=$(jq -nc --arg name "$WORKTREE" --arg base "$WT_BASE" --arg cleanup "$WT_CLEANUP" '{name:$name,cleanup:$cleanup} + (if $base=="" then {} else {base_ref:$base} end)')
+    PAYLOAD=$(jq -nc --arg operation "$OPERATION" --argjson wt "$WT_JSON" --arg rid "$RUN_ID" '{operation:$operation,worktree:$wt} + (if $rid=="" then {} else {run_id:$rid} end)')
+    if [ -n "$LEASE_TTL" ]; then
+      [[ "$LEASE_TTL" =~ ^[0-9]+$ ]] && [ "$LEASE_TTL" -gt 0 ] || { echo "error: --lease-ttl must be a positive integer" >&2; exit 2; }
+      PAYLOAD=$(jq -nc --argjson p "$PAYLOAD" --argjson ttl "$LEASE_TTL" '$p + {lease_ttl:$ttl}')
+    fi
+  else
+    PAYLOAD=$(jq -nc --arg operation "$OPERATION" --arg lease "$WORKTREE_LEASE" --arg rid "$RUN_ID" '{operation:$operation,worktree_lease:$lease} + (if $rid=="" then {} else {run_id:$rid} end)')
+  fi
+  MSG=$(jq -nc \
+    --arg id "$ID" \
+    --arg from "$FROM" \
+    --arg branch "$BRANCH" \
+    --arg to "$TO" \
+    --arg sent_at "$(date -Iseconds)" \
+    --argjson payload "$PAYLOAD" \
+    '{id:$id,from:$from,branch:$branch,to:$to,kind:"request",sent_at:$sent_at,payload:$payload}')
+  if [ -n "$RUN_ID" ]; then
+    MSG=$(printf '%s' "$MSG" | jq -c --arg rid "$RUN_ID" '. + {run_id: $rid}')
+  fi
+  if [ -n "$DRYRUN_ENV" ]; then
+    printf '%s\n' "$MSG"
+    echo "dry-run: NOT sent — would RPUSH to ${PREFIX}agent:${TO}:inbox on ${HOST}:${PORT} db=${DB:-0}" >&2
+    exit 0
+  fi
+  echo "task-id: $ID" >&2
+  QDEPTH=$(redis-cli "${REDIS_FLAGS[@]}" LLEN "${PREFIX}agent:${TO}:inbox" 2>/dev/null || echo 0)
+  redis-cli "${REDIS_FLAGS[@]}" HSET "${PREFIX}task:${ID}:status" \
+    task_id "$ID" state queued queue_depth "$QDEPTH" enqueued_at "$(date -Iseconds)" >/dev/null 2>&1 || true
+  redis-cli "${REDIS_FLAGS[@]}" EXPIRE "${PREFIX}task:${ID}:status" 604800 >/dev/null 2>&1 || true
+  # Lifecycle enqueue (taskless) — not ordinary-request; authority is request/worktree_run only.
+  redis-cli "${REDIS_FLAGS[@]}" RPUSH "${PREFIX}agent:${TO}:inbox" "$MSG" >/dev/null
+else
+  # ---- Ordinary request / worktree_run: single authority path ----
+  # Build extra_payload for non-task fields the bridge still consumes.
+  # Worktree is a typed payload key — route via --worktree-json, not EXTRA
+  # (extra_payload-injected typed keys are dropped by the authority guard).
+  EXTRA='{}'
+  if [ -z "$OPERATION" ] && [ ${#EXPECTED_ARTIFACTS[@]} -gt 0 ]; then
+    arts_json=$(printf '%s\n' "${EXPECTED_ARTIFACTS[@]}" | jq -R . | jq -sc .)
+    EXTRA=$(jq -nc --argjson e "$EXTRA" --argjson a "$arts_json" '$e + {expected_artifacts:$a}')
+  fi
+  if [ -z "$OPERATION" ] && [ ${#ALLOWED_PATHS[@]} -gt 0 ]; then
+    allows_json=$(printf '%s\n' "${ALLOWED_PATHS[@]}" | jq -R . | jq -sc .)
+    EXTRA=$(jq -nc --argjson e "$EXTRA" --argjson a "$allows_json" '$e + {allowed_paths:$a}')
+  fi
+  if [ -z "$OPERATION" ] && [ -n "$CELL_ID" ]; then
+    EXTRA=$(jq -nc --argjson e "$EXTRA" --arg v "$CELL_ID" '$e + {cell_id:$v}')
+  fi
+  if [ -z "$OPERATION" ] && [ -n "$ATTEMPT_ID" ]; then
+    EXTRA=$(jq -nc --argjson e "$EXTRA" --arg v "$ATTEMPT_ID" '$e + {attempt_id:$v}')
+  fi
+  if [ -z "$OPERATION" ] && [ -n "$FIXTURE_ROOT_OID" ]; then
+    EXTRA=$(jq -nc --argjson e "$EXTRA" --arg v "$FIXTURE_ROOT_OID" '$e + {fixture_root_oid:$v}')
+  fi
+  if [ -z "$OPERATION" ] && [ -n "$TOOL_GID" ]; then
+    EXTRA=$(jq -nc --argjson e "$EXTRA" --argjson v "$TOOL_GID" '$e + {tool_gid:$v}')
+  fi
+  if [ -z "$OPERATION" ] && [ -n "$CELL_ROOT" ]; then
+    EXTRA=$(jq -nc --argjson e "$EXTRA" --arg v "$CELL_ROOT" '$e + {cell_root:$v}')
+  fi
+  if [ -z "$OPERATION" ] && [ -n "$TOOL_ENDPOINT" ]; then
+    EXTRA=$(jq -nc --argjson e "$EXTRA" --arg v "$TOOL_ENDPOINT" '$e + {tool_endpoint:$v}')
+  fi
+  if [ -z "$OPERATION" ] && [ -n "$COMMIT_MESSAGE" ]; then
+    EXTRA=$(jq -nc --argjson e "$EXTRA" --arg m "$COMMIT_MESSAGE" '$e + {commit_message:$m}')
+  fi
+  if [ -z "$OPERATION" ] && [ -n "$EXPECT_STRUCTURED" ]; then
+    EXTRA=$(jq -nc --argjson e "$EXTRA" '$e + {expect_structured:true}')
+  fi
+  if [ -z "$OPERATION" ] && [ -n "$FRESH_CONTEXT" ]; then
+    EXTRA=$(jq -nc --argjson e "$EXTRA" '$e + {fresh_context:true}')
+  fi
+  if [ -z "$OPERATION" ] && [ -n "$REASONING_EFFORT" ]; then
+    case "$REASONING_EFFORT" in
+      low|medium|high|xhigh|max|ultra) ;;
+      *) echo "[agent-dispatch] --effort must be one of low|medium|high|xhigh|max|ultra (got '$REASONING_EFFORT')" >&2; exit 2 ;;
+    esac
+    EXTRA=$(jq -nc --argjson e "$EXTRA" --arg e2 "$REASONING_EFFORT" '$e + {reasoning_effort:$e2}')
+  fi
+  if { [ -z "$OPERATION" ] || [ "$OPERATION" = "worktree_run" ]; } && [ -n "$THREAD_ID" ]; then
+    EXTRA=$(jq -nc --argjson e "$EXTRA" --arg thread_id "$THREAD_ID" '$e + {thread_id:$thread_id}')
+  fi
+  if [ -z "$OPERATION" ] && [ -n "$FORK_THREAD_ID" ]; then
+    EXTRA=$(jq -nc --argjson e "$EXTRA" --arg thread_id "$FORK_THREAD_ID" '$e + {fork_from_thread_id:$thread_id}')
+  fi
+  if [ -z "$OPERATION" ] && [ -n "$AUDIT_PANEL" ]; then
+    EXTRA=$(jq -nc --argjson e "$EXTRA" '$e + {audit_vote_expected:true}')
+  fi
+  if [ -z "$OPERATION" ] && [ -n "$PANEL_INPUT_LOCKED" ]; then
+    EXTRA=$(jq -nc --argjson e "$EXTRA" '$e + {panel_input_locked:true}')
+  fi
+  if { [ -z "$OPERATION" ] || [ "$OPERATION" = "worktree_run" ]; } && [ -n "$TURN_TIMEOUT" ]; then
+    EXTRA=$(jq -nc --argjson e "$EXTRA" --argjson timeout "$TURN_TIMEOUT" '$e + {turn_timeout:$timeout}')
+  fi
+  if [ -n "$OPERATION" ] && [ -n "$RUN_ID" ]; then
+    EXTRA=$(jq -nc --argjson e "$EXTRA" --arg rid "$RUN_ID" '$e + {run_id:$rid}')
+  fi
+
+  AUTH_ARGS=(
+    -m agent_redis_bridge.dispatch_cli
+    --caller-identity bash
+    --target-agent-id "$TO"
+    --sender "$FROM"
+    --branch "$BRANCH"
+    --run-id "$RUN_ID"
+    --artefact-id "$ARTEFACT_ID"
+    --version "$ARTEFACT_VERSION"
+    --receipt "$RECEIPT_PATH"
+    --brief "$BRIEF_PATH"
+    --request-id "$ID"
+    --env-file "$ENV_FILE"
+  )
+  if [ "$OPERATION" = "worktree_run" ]; then
+    AUTH_ARGS+=(--operation worktree_run --worktree-lease "$WORKTREE_LEASE")
+  fi
+  if [ -z "$OPERATION" ] && [ -n "$WORKTREE" ]; then
+    WT_JSON=$(jq -nc \
+      --arg name "$WORKTREE" \
+      --arg base "$WT_BASE" \
+      --arg cleanup "$WT_CLEANUP" \
+      '{name:$name,cleanup:$cleanup} + (if $base=="" then {} else {base_ref:$base} end)')
+    AUTH_ARGS+=(--worktree-json "$WT_JSON")
+  fi
+  if [ "$EXTRA" != "{}" ]; then
+    AUTH_ARGS+=(--extra-payload-json "$EXTRA")
+  fi
+  if [ -n "$DRYRUN_ENV" ]; then
+    AUTH_ARGS+=(--dry-run)
+  fi
+
+  export PYTHONPATH="$DISPATCH_REPO/src${PYTHONPATH:+:$PYTHONPATH}"
+  # Strip publish credential for non-FABA identity (bash) via env -u below.
+  if [ -n "$DRYRUN_ENV" ]; then
+    set +e
+    AUTH_OUT=$(env -u ARB_MEMORY_REDIS_URL -u ARB_AUDIT_REDIS_URL PYTHONPATH="$PYTHONPATH" "$ARB_PYTHON" "${AUTH_ARGS[@]}" 2>/tmp/agent-dispatch-auth.err)
+    AUTH_RC=$?
+    set -e
+    if [ "$AUTH_RC" -ne 0 ]; then
+      cat /tmp/agent-dispatch-auth.err >&2
+      echo "error: dispatch_authority refused ordinary enqueue (rc=$AUTH_RC)" >&2
+      exit "$AUTH_RC"
+    fi
+    printf '%s\n' "$AUTH_OUT"
+    echo "dry-run: NOT sent — authority dry-run for ${TO} on ${HOST}:${PORT} db=${DB:-0}" >&2
+    exit 0
+  fi
+  # Ordinary path: write queued status BEFORE authority enqueue (ID is
+  # pre-minted via --request-id). Matches lifecycle branch ordering so a fast
+  # terminal transition cannot be clobbered back to queued. On authority
+  # refusal, set state=failed so the hash does not claim queued.
+  echo "task-id: $ID" >&2
+  QDEPTH=$(redis-cli "${REDIS_FLAGS[@]}" LLEN "${PREFIX}agent:${TO}:inbox" 2>/dev/null || echo 0)
+  redis-cli "${REDIS_FLAGS[@]}" HSET "${PREFIX}task:${ID}:status" \
+    task_id "$ID" state queued queue_depth "$QDEPTH" enqueued_at "$(date -Iseconds)" >/dev/null 2>&1 || true
+  redis-cli "${REDIS_FLAGS[@]}" EXPIRE "${PREFIX}task:${ID}:status" 604800 >/dev/null 2>&1 || true
+  set +e
+  AUTH_OUT=$(env -u ARB_MEMORY_REDIS_URL -u ARB_AUDIT_REDIS_URL PYTHONPATH="$PYTHONPATH" "$ARB_PYTHON" "${AUTH_ARGS[@]}" 2>/tmp/agent-dispatch-auth.err)
+  AUTH_RC=$?
+  set -e
+  if [ "$AUTH_RC" -ne 0 ]; then
+    cat /tmp/agent-dispatch-auth.err >&2
+    redis-cli "${REDIS_FLAGS[@]}" HSET "${PREFIX}task:${ID}:status" \
+      task_id "$ID" state failed failed_at "$(date -Iseconds)" \
+      error "dispatch_authority_refused" >/dev/null 2>&1 || true
+    echo "error: dispatch_authority refused ordinary enqueue (rc=$AUTH_RC)" >&2
+    exit "$AUTH_RC"
+  fi
+  AUTH_ID=$(printf '%s' "$AUTH_OUT" | jq -r '.request_id // empty')
+  if [ -z "$AUTH_ID" ]; then
+    redis-cli "${REDIS_FLAGS[@]}" HSET "${PREFIX}task:${ID}:status" \
+      task_id "$ID" state failed failed_at "$(date -Iseconds)" \
+      error "authority_no_request_id" >/dev/null 2>&1 || true
+    echo "error: authority returned no request_id: $AUTH_OUT" >&2
+    exit 1
+  fi
+  # Authority uses the pre-minted request-id; keep ID aligned.
+  ID="$AUTH_ID"
+  if [ -n "$AUDIT_PANEL" ] && [ -n "$RUN_ID" ]; then
+    echo "panel: bridge will record vote as seat:$TO for run $RUN_ID" >&2
+  fi
+fi
+
+deadline=$((SECONDS + TIMEOUT))
+while [ "$SECONDS" -lt "$deadline" ]; do
+  raw=$(redis-cli "${REDIS_FLAGS[@]}" BLPOP "${PREFIX}agent:${FROM}:inbox" 5 | tail -n1)
+  [ -z "$raw" ] && continue
+  kind=$(jq -r '.kind // ""' <<<"$raw")
+  in_reply_to=$(jq -r '.in_reply_to // ""' <<<"$raw")
+  if [ "$kind" = "reply" ] && [ "$in_reply_to" = "$ID" ]; then
+    jq '.payload' <<<"$raw"
+    ok=$(jq -r '.payload.ok // false' <<<"$raw")
+    [ "$ok" = "true" ] && exit 0 || exit 1
+  fi
+  # Notifies are activity-stream chatter, addressed to no specific waiter;
+  # drop them outright instead of RPUSH-back. RPUSH-back livelocks if any
+  # bridge runs with notify_inbox=1 (the back-compat default) — a single
+  # codex run can produce hundreds of notifies, and the dispatcher would
+  # shuffle them indefinitely while the real reply gets buried under
+  # incoming traffic. The bridge's task:<id>:events stream is the proper
+  # notify channel (consumed by `ctl watch` / `ctl status`); the inbox
+  # should be reply-only.
+  if [ "$kind" = "notify" ]; then
+    continue
+  fi
+  # Replies addressed to a different in_reply_to belong to a sibling
+  # dispatcher sharing this FROM. Keep RPUSH-back for these — but the
+  # rotation is bounded by the number of concurrent dispatchers, not by
+  # background activity-stream volume.
+  redis-cli "${REDIS_FLAGS[@]}" RPUSH "${PREFIX}agent:${FROM}:inbox" "$raw" >/dev/null
+done
+
+echo "timed out waiting for reply to $ID" >&2
+exit 124

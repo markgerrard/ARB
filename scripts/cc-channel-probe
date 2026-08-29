@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+#
+# cc-channel-probe — Claude Code tool-result channel regression canary.
+#
+# Why this exists: Claude Code 2.1.154+ (streaming-tool-exec always-on) shipped a
+# regression where the tool-result delivery channel corrupts — fabricated output,
+# duplicated lines, cancelled parallel-batch calls misread as denials. The fix is to
+# pin the CLI to 2.1.153. This script gives a green/red in under a minute so that if
+# channel-corruption symptoms reappear later you confirm fast instead of bisecting.
+#
+# What it proves: the deterministic, SEQUENTIAL channel paths agree with on-disk
+# ground truth — sequential ordering, file-vs-stdout, and cat read-back.
+#
+# What it CANNOT prove (by design, and this matters):
+#   - The bug's PRIMARY signature is corruption on the TAIL OF PARALLEL TOOL
+#     BATCHES, and it is INTERMITTENT. This script runs in a single sequential
+#     bash subshell and runs each check ONCE — it never issues parallel Claude
+#     Code tool batches (a subshell structurally cannot), so it exercises exactly
+#     the conditions under which the bug does NOT manifest. A GREEN here has been
+#     observed on a known-bad version. Treat GREEN as "sequential round-trips
+#     work", NOT as "channel healthy".
+#   - The Claude Code *Read tool* path (only exists inside the agent loop).
+# The real diagnostic is the repeated parallel-batch trial run FROM INSIDE Claude
+# Code — see "Parallel-batch trial" in docs/runbooks/cc-channel-corruption.md.
+#
+# Exit 0 = sequential checks passed. Exit 1 = at least one failed (definitive RED).
+
+set -u
+
+WORKDIR="$(mktemp -d "/tmp/cc-channel-probe.XXXXXX")"
+trap 'rm -rf "$WORKDIR"' EXIT
+
+fail=0
+pass() { printf 'PASS  %s\n' "$1"; }
+bad()  { printf 'FAIL  %s\n' "$1"; fail=1; }
+
+echo "=== cc-channel-probe ==="
+echo "workdir: $WORKDIR"
+echo
+
+# --- 0. Version report (informational + known-bad-band warning) ---
+ver="$(claude --version 2>/dev/null | awk '{print $1}')"
+echo "Claude Code version: ${ver:-UNKNOWN}"
+case "$ver" in
+  2.1.154|2.1.155|2.1.156|2.1.157|2.1.158)
+    echo "WARN  version is in the known-bad streaming-tool-exec band (2.1.154-2.1.158)."
+    echo "WARN  pin to 2.1.153 — see docs/runbooks/cc-channel-corruption.md"
+    ;;
+  2.1.153)
+    echo "note: 2.1.153 is the prescribed pin (below the regression)."
+    ;;
+  *)
+    echo "note: version is outside the known-bad band; channel tests below are authoritative."
+    ;;
+esac
+echo
+
+# --- 1. Sequential stdout ordering ---
+got="$(for i in $(seq 1 20); do echo "SEQ-$i"; done)"
+want="$(for i in $(seq 1 20); do echo "SEQ-$i"; done)"
+if [ "$got" = "$want" ]; then
+  pass "1. sequential ordering (SEQ-1..20 once each, in order)"
+else
+  bad  "1. sequential ordering — output diverged from expected"
+fi
+
+# --- 2/3. File-backed ground truth vs stdout ---
+log="$WORKDIR/probe.log"
+: > "$log"
+out_count=0
+for i in $(seq 1 50); do
+  echo "LOG-$i" >> "$log"
+  echo "OUT-$i" >/dev/null
+  out_count=$((out_count + 1))
+done
+file_lines="$(wc -l < "$log" | tr -d ' ')"
+last5="$(tail -5 "$log" | tr '\n' ' ' | sed 's/ $//')"
+if [ "$file_lines" = "50" ] && [ "$out_count" = "50" ] && [ "$last5" = "LOG-46 LOG-47 LOG-48 LOG-49 LOG-50" ]; then
+  pass "2. file-vs-stdout (50 lines on disk, 50 emitted, tail LOG-46..50)"
+else
+  bad  "2. file-vs-stdout — file_lines=$file_lines out_count=$out_count tail='$last5'"
+fi
+
+# --- 4. Read integrity via cat (no-dupe / first / last) ---
+intg="$WORKDIR/read-integrity.txt"
+i=1; : > "$intg"
+while [ "$i" -le 100 ]; do printf 'LINE-%04d\n' "$i" >> "$intg"; i=$((i + 1)); done
+cat_out="$(cat "$intg")"
+total="$(printf '%s\n' "$cat_out" | wc -l | tr -d ' ')"
+uniq_total="$(printf '%s\n' "$cat_out" | sort -u | wc -l | tr -d ' ')"
+first="$(printf '%s\n' "$cat_out" | head -1)"
+last="$(printf '%s\n' "$cat_out" | tail -1)"
+if [ "$total" = "100" ] && [ "$uniq_total" = "100" ] && [ "$first" = "LINE-0001" ] && [ "$last" = "LINE-0100" ]; then
+  pass "3. cat read-back (100 lines, no dupes, LINE-0001 first, LINE-0100 last)"
+else
+  bad  "3. cat read-back — total=$total uniq=$uniq_total first='$first' last='$last'"
+fi
+
+echo
+if [ "$fail" = "0" ]; then
+  echo "RESULT: SEQUENTIAL PATHS OK — round-trips agree with ground truth."
+  echo "NOT a parallel-tail test. GREEN here does NOT mean the channel is healthy:"
+  echo "the bug is intermittent and clusters on the tail of parallel tool batches,"
+  echo "which a sequential subshell cannot exercise. Before resuming autonomous work,"
+  echo "run the 'Parallel-batch trial' from docs/runbooks/cc-channel-corruption.md"
+  echo "(repeated parallel batches, from inside Claude Code) and confirm a clean rate."
+  exit 0
+else
+  echo "RESULT: RED — channel corruption confirmed on a SEQUENTIAL path."
+  echo "This is definitive (sequential failure = clearly broken). Do NOT resume."
+  echo "See docs/runbooks/cc-channel-corruption.md (pin to 2.1.153, verify via git/disk)."
+  exit 1
+fi

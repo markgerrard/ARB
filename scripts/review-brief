@@ -1,0 +1,180 @@
+#!/usr/bin/env bash
+# review-brief — emit a Workflow-B review brief with the evidence-first findings
+# contract baked in as a NON-OPTIONAL section.
+#
+# Why this exists: the evidence-first rule (docs/evidence-first-remediation.md)
+# says every finding must carry its evidence, and the disagreement rule says a
+# single reviewer with contradictory evidence pauses remediation. Both were
+# discipline-enforced — the orchestrator had to remember to ask for evidence
+# when hand-writing a brief. This generator makes that structural: it cannot
+# emit a brief without the required-output contract, and it refuses to emit a
+# brief with no evidence basis (no diff and no spec).
+#
+# Usage:
+#   review-brief --title T (--diff RANGE | --diff-file F | --spec F) [options] > brief.md
+# Options:
+#   --title TEXT        (required) short brief title
+#   --spec PATH         embed a spec / acceptance-criteria file (repeatable)
+#   --diff RANGE        embed `git -C <repo> diff RANGE` (e.g. 1c043b3..60e9f1b)
+#   --diff-file PATH    embed a pre-made diff/patch file instead of running git
+#   --repo PATH         repo for --diff (default: $PWD)
+#   --oracle TEXT       a source-of-truth / legacy-oracle pointer (repeatable)
+#   --question TEXT     a reviewer question (repeatable)
+#   --verify CMD        the command a reviewer runs to verify (repeatable)
+#   --context PATH|-    free-form context prose (file, or - for stdin)
+#   --gotchas PATH      a gotcha registry (.gotchas.json) — briefing-stage entries
+#                       are appended as an explicit "watch for these" section
+#                       (Pattern D, the discipline half made structural)
+#
+# Output goes to stdout; pipe it to agent-dispatch or save it under
+# docs/superpowers/reviews/.
+set -euo pipefail
+
+TITLE=
+REPO=$PWD
+DIFF_RANGE=
+DIFF_FILE=
+CONTEXT=
+GOTCHAS=
+declare -a SPECS=() ORACLES=() QUESTIONS=() VERIFY=()
+
+die() { echo "review-brief: $*" >&2; exit 2; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --title)     TITLE=${2:?--title requires a value}; shift 2 ;;
+    --spec)      SPECS+=("${2:?--spec requires a path}"); shift 2 ;;
+    --diff)      DIFF_RANGE=${2:?--diff requires a range}; shift 2 ;;
+    --diff-file) DIFF_FILE=${2:?--diff-file requires a path}; shift 2 ;;
+    --repo)      REPO=${2:?--repo requires a path}; shift 2 ;;
+    --oracle)    ORACLES+=("${2:?--oracle requires text}"); shift 2 ;;
+    --question)  QUESTIONS+=("${2:?--question requires text}"); shift 2 ;;
+    --verify)    VERIFY+=("${2:?--verify requires a command}"); shift 2 ;;
+    --context)   CONTEXT=${2:?--context requires a path or -}; shift 2 ;;
+    --gotchas)   GOTCHAS=${2:?--gotchas requires a path}; shift 2 ;;
+    -h|--help)   sed -n '2,33p' "$0"; exit 0 ;;
+    *)           die "unknown argument: $1" ;;
+  esac
+done
+
+[ -n "$TITLE" ] || die "--title is required"
+# Evidence basis is mandatory: a brief with neither a diff nor a spec asks
+# reviewers to reason from prose, which is exactly what evidence-first forbids.
+if [ -z "$DIFF_RANGE" ] && [ -z "$DIFF_FILE" ] && [ ${#SPECS[@]} -eq 0 ]; then
+  die "a brief needs an evidence basis: pass at least one of --diff, --diff-file, or --spec"
+fi
+# Don't let a range like '--output=...' be parsed as an option by `git diff`.
+case "$DIFF_RANGE" in -*) die "--diff range must not start with '-': $DIFF_RANGE" ;; esac
+
+emit() { printf '%s\n' "$*"; }
+
+emit "# Review brief — $TITLE"
+emit ""
+emit "Working dir \`$REPO\`. **Review only; do not commit.** Workflow-B"
+emit "behaviour-preservation review."
+emit ""
+
+if [ -n "$CONTEXT" ]; then
+  emit "## Context"
+  if [ "$CONTEXT" = "-" ]; then cat; else cat "$CONTEXT"; fi
+  emit ""
+fi
+
+if [ ${#SPECS[@]} -gt 0 ]; then
+  emit "## Spec / acceptance criteria"
+  for s in "${SPECS[@]}"; do
+    [ -r "$s" ] || die "spec not readable: $s"
+    emit "<!-- $s -->"
+    cat "$s"
+    emit ""
+  done
+fi
+
+if [ ${#ORACLES[@]} -gt 0 ]; then
+  emit "## Source-of-truth / legacy oracle (confirm the change against this)"
+  for o in "${ORACLES[@]}"; do emit "- $o"; done
+  emit ""
+fi
+
+if [ -n "$DIFF_RANGE" ] || [ -n "$DIFF_FILE" ]; then
+  emit "## The change under review"
+  emit '```diff'
+  if [ -n "$DIFF_FILE" ]; then
+    [ -r "$DIFF_FILE" ] || die "diff file not readable: $DIFF_FILE"
+    cat "$DIFF_FILE"
+  else
+    git -C "$REPO" diff "$DIFF_RANGE"
+  fi
+  emit '```'
+  emit ""
+fi
+
+if [ ${#QUESTIONS[@]} -gt 0 ]; then
+  emit "## Questions"
+  i=1
+  for q in "${QUESTIONS[@]}"; do emit "$i. $q"; i=$((i+1)); done
+  emit ""
+fi
+
+if [ ${#VERIFY[@]} -gt 0 ]; then
+  emit "## How to verify"
+  for v in "${VERIFY[@]}"; do emit "    $v"; done
+  emit ""
+fi
+
+if [ -n "$GOTCHAS" ]; then
+  [ -r "$GOTCHAS" ] || die "gotcha registry not readable: $GOTCHAS"
+  # Only briefing-stage (not yet enforced) gotchas need a reviewer's eye; the
+  # graduated ones are caught mechanically by gotcha-lint.
+  brief_gotchas=$(jq -r '.gotchas[] | select(.enforce != true) | "- **\(.id)**: \(.description)" + (if (.hint // "") != "" then " — _\(.hint)_" else "" end)' "$GOTCHAS")
+  if [ -n "$brief_gotchas" ]; then
+    emit "## Watch for these recurring gotchas (Pattern D, briefing-stage)"
+    emit "These bug-classes have bitten before but are not yet enforced by gotcha-lint. Check the change for them specifically."
+    emit ""
+    printf '%s\n\n' "$brief_gotchas"
+  fi
+fi
+
+# ---- MANDATORY, always emitted: the evidence-first output contract. ----
+cat <<'CONTRACT'
+## Required output (evidence-first — do not skip)
+
+Return a single verdict: **APPROVE / APPROVE WITH NOTES / REQUEST CHANGES**.
+
+Then, for EACH finding, attach evidence — per docs/evidence-first-remediation.md,
+no remediation is scoped from an observation alone. A finding without evidence is
+not actionable. For each, give:
+
+- **Observed behaviour** — what is wrong / right.
+- **Evidence** — the actual artifact: a source excerpt (the bytes, not a memory
+  of them), a diff hunk, a test/command output, a stack trace, a query result.
+  Test: could someone reach your conclusion from this artifact without trusting
+  your narration?
+- **Proposed mechanism** — why it happens.
+- **Confidence** — and any alternative explanations you could not rule out.
+
+Disagreement rule: a SINGLE reviewer presenting contradictory evidence is enough
+to pause remediation — evidence outweighs reviewer count. If you cannot attach
+evidence for a finding, say so explicitly and mark it unverified rather than
+asserting it.
+
+## Machine-readable vote (MANDATORY — last thing in your reply)
+
+End your reply with a single fenced `vote` block so your stance is recorded in the
+panel-audit trail. It MUST be the last fenced block, labelled `vote`, valid JSON:
+
+```vote
+{"stance": "approve", "severity": "none", "refs": [], "note": "one-line summary"}
+```
+
+- `stance`: one of `approve` | `needs-changes` | `block` | `abstain`. Map your verdict:
+  APPROVE→`approve`, APPROVE WITH NOTES→`needs-changes`, REQUEST CHANGES→`block`,
+  cannot-assess→`abstain`.
+- `severity`: the HIGHEST severity among your findings — `P0` | `P1` | `P2` | `none`
+  (`none` only when there are no findings, i.e. a clean approve).
+- `refs`: optional list of `file:line` strings for the load-bearing findings.
+- `note`: one-line summary (≤ ~120 chars).
+
+Emit exactly one such block. Do not fabricate a stance you don't hold — a clean
+review is `approve`/`none`, not an invented finding.
+CONTRACT

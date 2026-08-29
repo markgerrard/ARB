@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# Drive buzz's own compose with our DO overlay, refusing to run against an
+# upstream clone that has moved off the pin.
+#
+# The pin check is the point. Without it a `git pull` in the buzz clone
+# silently changes what we deploy, and the failure shows up in production
+# rather than here.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BUZZ_SRC="${BUZZ_SRC:-/Volumes/<workspace>/repos/buzz-upstream}"
+
+# shellcheck disable=SC1091
+REF="$(grep -E '^REF=' "$HERE/UPSTREAM_REF" | cut -d= -f2)"
+[[ -n "$REF" ]] || { echo "error: no REF in UPSTREAM_REF" >&2; exit 2; }
+
+[[ -d "$BUZZ_SRC/.git" ]] || {
+  echo "error: BUZZ_SRC=$BUZZ_SRC is not a git checkout of buzz" >&2; exit 2; }
+
+ACTUAL="$(git -C "$BUZZ_SRC" rev-parse HEAD)"
+if [[ "$ACTUAL" != "$REF" ]]; then
+  echo "error: upstream clone is not on the pin" >&2
+  echo "  pinned: $REF" >&2
+  echo "  actual: $ACTUAL" >&2
+  echo "  fix:    git -C $BUZZ_SRC checkout $REF   (or bump UPSTREAM_REF in a reviewed diff)" >&2
+  exit 3
+fi
+
+# A dirty upstream clone means the bytes being deployed are not the pinned
+# bytes, which makes the pin decorative.
+if [[ -n "$(git -C "$BUZZ_SRC" status --porcelain --untracked-files=no)" ]]; then
+  echo "error: upstream clone has uncommitted changes — the pin no longer describes what would deploy" >&2
+  git -C "$BUZZ_SRC" status --short --untracked-files=no >&2
+  exit 3
+fi
+
+[[ -f "$HERE/.env" ]] || { echo "error: $HERE/.env missing (copy .env.example)" >&2; exit 2; }
+
+# Order matters: upstream's file first, our overlay second.
+exec docker compose \
+  --project-name buzz \
+  --env-file "$HERE/.env" \
+  -f "$BUZZ_SRC/deploy/compose/compose.yml" \
+  -f "$HERE/compose.do.yml" \
+  "$@"

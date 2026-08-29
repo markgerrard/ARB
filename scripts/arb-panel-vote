@@ -1,0 +1,45 @@
+#!/usr/bin/env python3
+"""Emit one panel `vote` audit event, derived from a seat's raw reply text (fail-loud on no stance)."""
+import argparse, json, os, sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+from arb_memory.audit import AuditRun, resolve_audit_env       # noqa: E402
+from arb_memory.stance import parse_stance, StanceError  # noqa: E402
+
+
+def main(argv=None, *, stdin=None, redis_factory=None):
+    p = argparse.ArgumentParser(prog="arb-panel-vote")
+    p.add_argument("--run-id", required=True)
+    p.add_argument("--actor", required=True)
+    p.add_argument("--timed-out", action="store_true")
+    a = p.parse_args(argv)
+    stdin = stdin if stdin is not None else sys.stdin
+
+    if a.timed_out:
+        stance = {"stance": "timed-out", "severity": "none", "refs": [], "note": "no reply"}
+    else:
+        try:
+            stance = parse_stance(stdin.read())
+        except StanceError as exc:
+            print(f"arb-panel-vote: no valid stance for {a.actor}: {exc}", file=sys.stderr)
+            return 3
+
+    payload = {"kind": "vote", "actor": a.actor, **stance}
+    # ARB_AUDIT_* wins over ARB_MEMORY_*, matching bridge.resolve_audit_redis — otherwise a
+    # host with the two pointed at different buses splits its audit plane between daemon and
+    # CLI votes, and only finds out at verdict close.
+    url, prefix = resolve_audit_env()
+    if redis_factory is not None:
+        r = redis_factory()
+    else:
+        import redis as _redis
+        if not url:
+            print("ARB_AUDIT_REDIS_URL or ARB_MEMORY_REDIS_URL required", file=sys.stderr); return 2
+        r = _redis.from_url(url, decode_responses=True)
+    AuditRun(r, a.run_id, prefix=prefix).emit("orchestrator", "vote", payload)
+    print(f"voted {a.actor} stance={payload['stance']} run_id={a.run_id}", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

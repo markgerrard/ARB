@@ -1,0 +1,28 @@
+# Claude-tail sidecar: tails host Claude Code transcripts read-only and publishes
+# bridge-symmetric visibility events. Offset state is Redis-backed; no writable host
+# mount is required.
+services:
+  claude-tail:
+    image: arb-claude-tail:dev
+    build:
+      context: ../..
+      dockerfile: deploy/claude-tail/Dockerfile
+    restart: unless-stopped
+    user: "${AGENT_UID:?set AGENT_UID with $(id -u)}"
+    volumes:
+      # Same-path read-only mount: SessionStart records host-absolute transcript paths.
+      - "${CLAUDE_HOME:?set CLAUDE_HOME, e.g. /Users/<user>/.claude}:${CLAUDE_HOME}:ro"
+      # Same-path read-only mount for cold .output symlink targets outside CLAUDE_HOME.
+      - "${ARB_CLAUDE_COLD_SRC:?set ARB_CLAUDE_COLD_SRC, e.g. /private/tmp/claude-501}:${ARB_CLAUDE_COLD_SRC}:ro"
+    environment:
+      # Registry + offsets use the agent Redis bus.
+      AGENT_REDIS_URL: "${AGENT_REDIS_URL:-redis://host.docker.internal:6379/0}"
+      AGENT_REDIS_PREFIX: "${AGENT_REDIS_PREFIX:-agent_scratch:}"
+      # Live and trace may be separate Redis DBs/instances; keep them independently configurable.
+      ARB_LIVE_REDIS_URL: "${ARB_LIVE_REDIS_URL:-redis://host.docker.internal:6379/0}"
+      ARB_TRACE_REDIS_URL: "${ARB_TRACE_REDIS_URL:-redis://host.docker.internal:6379/0}"
+      # Same host-absolute path namespace as the hook-recorded transcript paths.
+      ARB_CLAUDE_TAIL_COLD_DIR: "${ARB_CLAUDE_TAIL_COLD_DIR:-${CLAUDE_HOME}/tasks}"
+      ARB_CLAUDE_TAIL_INTERVAL_SECS: "${ARB_CLAUDE_TAIL_INTERVAL_SECS:-1.0}"
+      ARB_CLAUDE_TAIL_MAX_AGE_SECS: "${ARB_CLAUDE_TAIL_MAX_AGE_SECS:-21600}"
+      ARB_CLAUDE_TAIL_IDLE_FINISH_SECS: "${ARB_CLAUDE_TAIL_IDLE_FINISH_SECS:-300}"

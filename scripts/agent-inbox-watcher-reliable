@@ -1,0 +1,406 @@
+#!/usr/bin/env python3
+"""
+agent-inbox-watcher-reliable: BLMOVE + :processing + LREM-ack pattern.
+
+Structural improvement over the canonical BLPOP agent-inbox-watcher (the
+single failure mode that bit pi-project-b-a on 2026-06-08 — the BLPOP popped the
+message, the canonical watcher printed it, but the agent-side handoff never
+fired, so the message was effectively lost from the bus. The on-disk JSON
+saved it for forensics, but the bus had nothing left to ack).
+
+Three guarantees over BLPOP:
+
+  1. Atomic BLMOVE :inbox -> :processing. The element exists in :processing
+     the instant it leaves :inbox — no in-flight message loss on SIGKILL /
+     wedge / network drop mid-handler. (See docs/claude-peer-coordination.md
+     §"Reliable inbox daemon" for the full rationale and the incident that
+     motivated it.)
+
+  2. LREM-ack after the full envelope is durably written to disk. The
+     on-disk JSON at $AGENT_BRIDGE_INBOX_DIR/<id>.json is the durable
+     artifact; the :processing list is the in-flight transport. The
+     watcher acks ONLY after the file is on disk, so a crash before that
+     point leaves the message re-handleable on the next startup.
+
+  3. Startup re-drain of :processing, deduped by id. A crashed-then-restarted
+     watcher re-emits meta lines for any elements left in :processing from
+     the previous run. Idempotency: if the JSON file already exists for an
+     id, we skip the disk write (the file is intact from the previous
+     successful write). We always LREM-ack at the end so :processing does
+     not grow without bound.
+
+  4. Rejected bytes are PRESERVED before the LREM that removes them. Every
+     rejection path deletes the last copy of an element this script could not
+     name a file for, so without preservation the bytes leave disk and bus at
+     once and a malformed envelope becomes indistinguishable from a transport
+     artifact. Retained under a content-derived name at
+     $AGENT_INBOX_REJECT_DIR (default <inbox dir>/rejects), mode 600 in a 700
+     directory, and reported on a line the documented Monitor filter surfaces.
+
+The handoff to the agent (the next pi/Claude session) is the harness's
+notification surface, not this script's responsibility. In Claude Code,
+each stdout line surfaces via the Monitor tool. In pi, each stdout line
+surfaces via the bash tool's `run_in_background=true` task-notification
+mechanism. This script only writes the file and emits the line — it does
+NOT invoke an LLM. (See AGENTS.md base "Action discipline — Scope": doing
+exactly what was asked, surfacing expansions.)
+
+Usage:
+  set -a; source .env; set +a
+  AGENT_ID=pi-example-a \\
+  AGENT_REDIS_HOST=... AGENT_REDIS_PORT=... AGENT_REDIS_USER=... \\
+  AGENT_REDIS_PASSWORD=... AGENT_REDIS_DB=... AGENT_REDIS_TLS=1 \\
+  AGENT_REDIS_PREFIX=agent_scratch: \\
+  AGENT_BRIDGE_INBOX_DIR=/tmp/agent-bridge-inbox \\
+  ./scripts/agent-inbox-watcher-reliable
+
+Provenance: written in response to a diagnosis that the BLPOP-based
+agent-inbox-watcher cannot be trusted to "not drop a message" until the
+BLMOVE pattern is in. Promotes the pattern from a sibling repo's reference
+implementation to this repo's scripts/.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+
+# ---- Config (env-driven, no defaults that would silently misbehave) ----
+
+def _required(name: str) -> str:
+    val = os.environ.get(name)
+    if not val:
+        print(f"[watcher-error] {name} must be set", file=sys.stderr, flush=True)
+        sys.exit(2)
+    return val
+
+
+AGENT_ID = _required("AGENT_ID")
+REDIS_HOST = _required("AGENT_REDIS_HOST")
+REDIS_PORT = _required("AGENT_REDIS_PORT")
+REDIS_USER = os.environ.get("AGENT_REDIS_USER", "default")
+REDIS_DB = _required("AGENT_REDIS_DB")
+REDIS_PASSWORD = os.environ.get("AGENT_REDIS_PASSWORD", "")
+REDIS_TLS = os.environ.get("AGENT_REDIS_TLS", "0") == "1"
+REDIS_PREFIX = os.environ.get("AGENT_REDIS_PREFIX", "agent_scratch:")
+
+INBOX_KEY = f"{REDIS_PREFIX}agent:{AGENT_ID}:inbox"
+PROCESSING_KEY = f"{INBOX_KEY}:processing"
+STATUS_KEY = f"{REDIS_PREFIX}agent:{AGENT_ID}:status"
+
+INBOX_DIR = Path(os.environ.get("AGENT_BRIDGE_INBOX_DIR", "/tmp/agent-bridge-inbox"))
+REJECT_DIR = Path(os.environ.get("AGENT_INBOX_REJECT_DIR", str(INBOX_DIR / "rejects")))
+# Bounded runs. Unset/empty means loop forever, the operational default; the
+# tests set it so consume_loop terminates.
+MAX_ITERATIONS = os.environ.get("WATCHER_MAX_ITERATIONS", "")
+
+BLMOVE_TIMEOUT = int(os.environ.get("WATCHER_BLMOVE_TIMEOUT", "30"))
+STATUS_TTL = int(os.environ.get("WATCHER_STATUS_TTL", "60"))
+HEARTBEAT_INTERVAL = int(os.environ.get("WATCHER_HEARTBEAT_INTERVAL", str(min(25, BLMOVE_TIMEOUT - 5))))
+
+if AGENT_ID == "pi-project-b-a" and os.environ.get("ALLOW_PI_PROJECT_B_A_STOPGAP_WATCHER") != "1":
+    print(
+        "[watcher-error] refusing to run stopgap watcher for pi-project-b-a; "
+        "agent-bus-seat extension is the sole supported consumer "
+        "(set ALLOW_PI_PROJECT_B_A_STOPGAP_WATCHER=1 only for deliberate recovery)",
+        file=sys.stderr,
+        flush=True,
+    )
+    sys.exit(78)
+
+
+# ---- Bus I/O ----
+
+def _redis_cli(*args: str) -> subprocess.CompletedProcess[str]:
+    """Wrap redis-cli with the bus auth pattern (REDISCLI_AUTH env, never -a)."""
+    cmd = [
+        "redis-cli",
+        "-h", REDIS_HOST,
+        "-p", str(REDIS_PORT),
+        "-n", str(REDIS_DB),
+        "--no-auth-warning",
+    ]
+    if REDIS_TLS:
+        cmd.append("--tls")
+    if REDIS_USER:
+        cmd.extend(["--user", REDIS_USER])
+    cmd.extend(args)
+    env = os.environ.copy()
+    if REDIS_PASSWORD:
+        env["REDISCLI_AUTH"] = REDIS_PASSWORD
+    return subprocess.run(cmd, capture_output=True, text=True, check=False, env=env)
+
+
+def emit(line: str) -> None:
+    """Single write per line. The 3baa522 fix — print() does two writes
+    (string + newline) and can straddle pipe boundaries on long streams.
+    Lines here are << PIPE_BUF so the single-write guarantee is cheap and
+    removes the entire class of mid-stream surfacing bugs."""
+    sys.stdout.write(line + "\n")
+    sys.stdout.flush()
+
+
+def parse_envelope(raw: str) -> dict[str, Any] | None:
+    """Tolerant envelope parse. Returns None on failure (caller drops)."""
+    # redis-cli BLPOP/BLMOVE return "<key> <element>" (one space). For
+    # BLMOVE with one source + one dest, redis-cli may also return just the
+    # element on some versions. Handle both.
+    s = raw.strip()
+    if not s or s == "(nil)":
+        return None
+    # If it looks like "<word> <json>", peel the word off
+    if s[0] in '{[':
+        body = s
+    else:
+        parts = s.split(maxsplit=1)
+        body = parts[1] if len(parts) == 2 else parts[0]
+    try:
+        value = json.loads(body)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(value, dict):
+        return None
+    return value
+
+
+def write_envelope_to_disk(envelope_id: str, raw: str) -> tuple[Path, bool]:
+    """Write the full envelope JSON to disk. Returns (path, was_new).
+    Idempotent: re-draining an id we already wrote is a no-op on disk."""
+    INBOX_DIR.mkdir(parents=True, exist_ok=True)
+    path = INBOX_DIR / f"{envelope_id}.json"
+    if path.exists():
+        return path, False
+    path.write_text(raw, encoding="utf-8")
+    return path, True
+
+
+def preserve_rejected(kind: str, raw: str) -> dict[str, Any]:
+    """Retain rejected bytes BEFORE they are LREM-ed off the bus.
+
+    Every rejection path here deletes the element from :processing, which is
+    the last copy — this script never wrote it to the inbox dir, because it
+    could not parse an id to name the file with. So without this the bytes are
+    gone from disk AND bus simultaneously, and the operator is left unable to
+    tell a genuinely malformed envelope from a transport artifact. That is
+    exactly what left a peer hunting a sender that never existed on
+    2026-08-11 (see scripts/agent-inbox-watcher and scripts/codex-inbox-once,
+    fixed the same day).
+
+    Content-derived filename, so N repeats of one fault converge on ONE file
+    rather than looking like N distinct messages. Mode 600 in a 700 directory,
+    because a rejected envelope can still contain a sealed payload.
+    """
+    data = raw.encode("utf-8", errors="surrogateescape")
+    digest = hashlib.sha256(data).hexdigest()
+    REJECT_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(REJECT_DIR, 0o700)
+    except OSError:
+        pass
+    destination = REJECT_DIR / f"{kind}-{digest}.bin"
+    if not destination.exists():
+        temporary = REJECT_DIR / f".{kind}-{digest}.tmp"
+        handle = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(handle, "wb") as stream:
+            stream.write(data)
+        os.replace(temporary, destination)   # atomic publication at 0600
+    return {"path": str(destination), "sha256": digest, "bytes": len(data)}
+
+
+def rejected_line(kind: str, kept: dict[str, Any], detail: str = "") -> str:
+    r"""Emit so the DOCUMENTED Monitor filter actually surfaces it.
+
+    The previous `[watcher-error] envelope-malformed ...` lines matched none of
+    the recommended grep alternatives: `^\[watcher\]` needs that exact
+    literal, and `ERROR` is case-sensitive. So a dropped message was invisible
+    as well as unrecoverable. `[watcher]` + the word "rejected" match twice
+    over, on purpose.
+    """
+    suffix = f" {detail}" if detail else ""
+    return (
+        f"[watcher] rejected {kind}{suffix} preserved={kept['path']} "
+        f"sha256={kept['sha256']} bytes={kept['bytes']}"
+    )
+
+
+def meta_line(envelope: dict[str, Any]) -> str:
+    eid = str(envelope.get("id", "?"))
+    frm = str(envelope.get("from", "?"))
+    kind = str(envelope.get("kind", "?"))
+    payload = envelope.get("payload") or {}
+    event = payload.get("event", kind) if isinstance(payload, dict) else kind
+    sent_at = str(envelope.get("sent_at", envelope.get("ts", "?")))
+    return f"[inbox-meta] id={eid} from={frm} kind={kind} event={event} sent_at={sent_at}"
+
+
+# ---- Watcher lifecycle ----
+
+def heartbeat() -> bool:
+    res = _redis_cli("SET", STATUS_KEY, f"alive:{os.getpid()}", "EX", str(STATUS_TTL))
+    if res.returncode != 0:
+        emit(f"[watcher-error] heartbeat-fail {res.stderr.strip()}")
+        return False
+    return True
+
+
+def startup_redrain() -> int:
+    """Drain :processing, re-emit meta lines, LREM-ack each. Dedup against
+    on-disk JSON: if the file already exists for an id, skip the write
+    (the file from the previous successful write is intact) but still ack
+    the :processing entry so the list does not grow without bound."""
+    res = _redis_cli("LRANGE", PROCESSING_KEY, "0", "-1")
+    if res.returncode != 0 or not res.stdout.strip():
+        return 0
+    rehandled = 0
+    skipped = 0
+    for raw in res.stdout.splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
+        envelope = parse_envelope(raw)
+        if envelope is None or not envelope.get("id"):
+            # Unparseable or no id. This path used to drop SILENTLY — no
+            # emit at all — so a message left in :processing by a crashed
+            # predecessor vanished on the next startup with no trace.
+            kept = preserve_rejected("redrain-undeliverable", raw)
+            emit(rejected_line("undeliverable :processing element", kept, "during startup re-drain"))
+            _redis_cli("LREM", PROCESSING_KEY, "1", raw)
+            continue
+        eid = str(envelope["id"])
+        _, was_new = write_envelope_to_disk(eid, raw)
+        if was_new:
+            rehandled += 1
+        else:
+            skipped += 1
+        emit(meta_line(envelope))
+        _redis_cli("LREM", PROCESSING_KEY, "1", raw)
+    if rehandled or skipped:
+        emit(f"[watcher] startup-redrain re-handled={rehandled} skipped-duplicate={skipped}")
+    return rehandled + skipped
+
+
+def consume_loop() -> None:
+    last_hb = 0.0
+    iterations = 0
+    while True:
+        if MAX_ITERATIONS and iterations >= int(MAX_ITERATIONS):
+            return
+        iterations += 1
+        # Heartbeat on a separate cadence from the bus cycle. Independent
+        # of consume — a wedged BLMOVE will let the heartbeat lapse,
+        # which is the load-bearing liveness signal.
+        now = time.monotonic()
+        if now - last_hb >= HEARTBEAT_INTERVAL:
+            heartbeat()
+            last_hb = now
+
+        # Atomic move from RIGHT of :inbox (oldest) to LEFT of :processing
+        # (newest). The positions are arbitrary for correctness (we LREM
+        # by exact element), but consistent for human-readability during a
+        # crash: :processing is "what I most recently picked up".
+        # `--json -e` makes the three outcomes distinguishable instead of
+        # pattern-matched. `--json` ALONE is not enough: redis-cli renders a
+        # command error as `error:"NOPERM ..."` on STDOUT and still exits 0,
+        # so an ACL failure would be parsed as a message. `-e` is what turns
+        # it into a non-zero status. (Verified live 2026-08-12.)
+        #   * timeout        -> JSON null
+        #   * command error  -> non-zero status, message on stderr
+        #   * a real element -> a JSON string
+        res = _redis_cli(
+            "--json", "-e",
+            "BLMOVE", INBOX_KEY, PROCESSING_KEY, "RIGHT", "LEFT", str(BLMOVE_TIMEOUT),
+        )
+        if res.returncode != 0:
+            # Surfaced as `[watcher] ... reconnecting` because the documented
+            # Monitor filter matches neither `[watcher-error]` nor a lowercase
+            # "error" -- and this branch now carries command errors too, so its
+            # visibility is load-bearing rather than cosmetic.
+            emit(
+                f"[watcher] reconnecting after blmove fault rc={res.returncode} "
+                f"err={res.stderr.strip()[:200]}"
+            )
+            time.sleep(1)
+            continue
+
+        out = res.stdout.strip()
+        if not out:
+            continue
+        try:
+            moved = json.loads(out)
+        except json.JSONDecodeError:
+            kept = preserve_rejected("blmove-unparseable-response", out)
+            emit(rejected_line("unparseable redis-cli response", kept))
+            time.sleep(1)
+            continue
+
+        # RESP nil. This is the ONLY thing that means "timeout" -- previously a
+        # SUBSTRING test, `"(nil)" in out`, so an envelope whose payload merely
+        # MENTIONED (nil) was silently misread as a timeout. It was not lost
+        # (already in :processing, recovered by the next startup re-drain) but
+        # it never surfaced in real time.
+        if moved is None:
+            continue
+        if not isinstance(moved, str):
+            kept = preserve_rejected("blmove-unexpected-shape", out)
+            emit(rejected_line("unexpected redis-cli response shape", kept))
+            time.sleep(1)
+            continue
+
+        # The exact element, decoded. Used verbatim for the disk write and the
+        # LREM-ack, so it must not be re-split or re-quoted.
+        raw_element = moved
+
+        envelope = parse_envelope(raw_element)
+        if envelope is None:
+            # Malformed element — preserve, then drop so we don't loop forever.
+            kept = preserve_rejected("malformed-element", raw_element)
+            emit(rejected_line("malformed element", kept))
+            _redis_cli("LREM", PROCESSING_KEY, "1", raw_element)
+            continue
+
+        eid = envelope.get("id")
+        if not eid:
+            kept = preserve_rejected("element-without-id", raw_element)
+            emit(rejected_line("element with no id", kept))
+            _redis_cli("LREM", PROCESSING_KEY, "1", raw_element)
+            continue
+
+        # Write to disk FIRST, then ack. If we crash between write and
+        # ack, the next startup re-drain re-emits the meta line and
+        # the agent (successor session) reads the intact file. If we
+        # ack before writing, a crash between ack and write loses the
+        # message from the bus entirely.
+        write_envelope_to_disk(str(eid), raw_element)
+        emit(meta_line(envelope))
+        # Ack: LREM the exact element from :processing.
+        ack = _redis_cli("LREM", PROCESSING_KEY, "1", raw_element)
+        if ack.returncode != 0 or ack.stdout.strip() != "1":
+            emit(f"[watcher-error] lrem-ack-failed id={eid} rc={ack.returncode} stdout={ack.stdout.strip()!r} stderr={ack.stderr.strip()!r}")
+
+
+def main() -> int:
+    emit(
+        f"[watcher] {AGENT_ID} (reliable) online at "
+        f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')} "
+        f"(inbox={INBOX_KEY}, processing={PROCESSING_KEY}, "
+        f"blmove-timeout={BLMOVE_TIMEOUT}s, heartbeat-ttl={STATUS_TTL}s)"
+    )
+    INBOX_DIR.mkdir(parents=True, exist_ok=True)
+    heartbeat()
+    startup_redrain()
+    consume_loop()
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        emit("[watcher] shutting down")

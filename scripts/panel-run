@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+# scripts/panel-run
+"""Drive one panel-audit run end to end, assembling the existing pieces.
+
+  panel-run start  --roster seat:codex-id,seat:agy-id,seat:cold-opus [--run-id ID] [--note ...]
+  panel-run vote   --run-id ID --actor seat:cold-opus [--timed-out] [--report FILE | -]  # non-bridge vote
+
+Normal close path:
+  scripts/arb-audit-close-request --run-id ID --payload-file verdict.json --requested-by ORCHESTRATOR_ID
+
+Bridge seats self-emit their vote when dispatched with `agent-dispatch --run-id ID --audit-panel`
+(their reply carries the fenced ```vote``` block scripts/review-brief now mandates). `vote` is for
+the in-session cold-Opus reviewer (and any non-bridge seat). Roster entries must be exact
+`seat:<target-id>` actor IDs. The legacy `verdict` subcommand is a local/break-glass
+compatibility surface; orchestrator hosts use `arb-audit-close-request` instead.
+
+Env: ARB_MEMORY_REDIS_URL (audit bus), ARB_MEMORY_PREFIX. The break-glass `verdict`
+subcommand additionally requires a privileged ARB_MEMORY_DSN.
+"""
+import argparse
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+from arb_memory import panel_run  # noqa: E402
+from arb_memory.stance import StanceError  # noqa: E402
+
+
+def _redis(redis_factory):
+    if redis_factory is not None:
+        return redis_factory()
+    import redis as _r
+    url = os.environ.get("ARB_MEMORY_REDIS_URL")
+    if not url:
+        print("ARB_MEMORY_REDIS_URL required", file=sys.stderr)
+        raise SystemExit(2)
+    return _r.from_url(url, decode_responses=True)
+
+
+def _conn(conn_factory):
+    if conn_factory is not None:
+        return conn_factory()
+    import psycopg
+    dsn = os.environ.get("ARB_MEMORY_DSN")
+    if not dsn:
+        print("ARB_MEMORY_DSN required for verdict reconcile", file=sys.stderr)
+        raise SystemExit(2)
+    return psycopg.connect(dsn, autocommit=True)
+
+
+def _roster(s):
+    return [x.strip() for x in s.split(",") if x.strip()]
+
+
+def main(argv=None, *, redis_factory=None, conn_factory=None, stdin=None):
+    prefix = os.environ.get("ARB_MEMORY_PREFIX", "")
+    p = argparse.ArgumentParser(prog="panel-run")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    ps = sub.add_parser("start")
+    ps.add_argument("--roster", required=True)
+    ps.add_argument("--run-id")
+    ps.add_argument("--note", default="")
+    ps.add_argument("--source", default="orchestrator")
+
+    pv = sub.add_parser("vote")
+    pv.add_argument("--run-id", required=True)
+    pv.add_argument("--actor", required=True)
+    pv.add_argument("--timed-out", action="store_true")
+    pv.add_argument("--report", default="-")
+
+    pe = sub.add_parser("verdict", help="BREAK-GLASS/local-only direct reconcile; use arb-audit-close-request normally")
+    pe.add_argument("--run-id", required=True)
+    pe.add_argument("--roster", required=True)
+    pe.add_argument("--stances", required=True)
+    pe.add_argument("--overall")
+    pe.add_argument("--source", default="orchestrator")
+
+    a = p.parse_args(argv)
+
+    if a.cmd == "start":
+        r = _redis(redis_factory)
+        run_id = panel_run.start_run(r, _roster(a.roster), run_id=a.run_id,
+                                     source=a.source, prefix=prefix, note=a.note)
+        print(run_id)  # stdout: capture with $(panel-run start ...)
+        print(f"dispatch manifest emitted run_id={run_id} roster={_roster(a.roster)}", file=sys.stderr)
+        return 0
+
+    if a.cmd == "vote":
+        r = _redis(redis_factory)
+        text = None
+        if not a.timed_out:
+            fh = (stdin or sys.stdin) if a.report == "-" else open(a.report, encoding="utf-8")
+            text = fh.read()
+            if a.report != "-":
+                fh.close()
+        try:
+            stance = panel_run.record_vote(r, a.run_id, a.actor, reply_text=text,
+                                           timed_out=a.timed_out, prefix=prefix)
+        except StanceError as exc:
+            print(f"panel-run: no valid fenced vote for {a.actor}: {exc}", file=sys.stderr)
+            return 3
+        print(f"voted {a.actor} stance={stance['stance']} severity={stance['severity']} run_id={a.run_id}",
+              file=sys.stderr)
+        return 0
+
+    if a.cmd == "verdict":
+        print(
+            "panel-run: WARNING: verdict is a privileged break-glass/local-only path; "
+            "orchestrators must use scripts/arb-audit-close-request",
+            file=sys.stderr,
+        )
+        try:
+            stances = json.loads(a.stances)
+        except json.JSONDecodeError as exc:
+            print(f"panel-run: --stances is not valid JSON: {exc}", file=sys.stderr)
+            return 2
+        r = _redis(redis_factory)
+        conn = _conn(conn_factory)
+        result = panel_run.finalize(conn, r, a.run_id, roster=_roster(a.roster),
+                                    stances=stances, source=a.source,
+                                    prefix=prefix, overall=a.overall)
+        if not result["ok"]:
+            print("panel-run: verdict REFUSED — did not reconcile against recorded votes:", file=sys.stderr)
+            for gap in result["gaps"]:
+                print(f"  - {gap}", file=sys.stderr)
+            return 4
+        print(f"verdict emitted + reconciled run_id={a.run_id}", file=sys.stderr)
+        return 0
+
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

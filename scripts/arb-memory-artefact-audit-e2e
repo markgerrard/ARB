@@ -1,0 +1,237 @@
+#!/usr/bin/env python3
+"""Real-process e2e for ARB Memory ARTEFACT full-content fidelity + AUDIT store/retrieval.
+
+Uses a real document (default: the seat-e2e slice log) as the payload — a much stronger fidelity
+test than the unit tests' one-char strings. Both consumers run as real subprocesses
+(`python -m arb_memory memory` and `... audit`) on an isolated prefix. Fail-loud; cleans up.
+
+Proves:
+  ARTEFACT — store the document as an artefact (full content) + a hint via the bus write-intent;
+             the memory consumer embeds + persists; retrieve via the bus reply (two-step
+             hint->artefact) and assert the returned artefact content == the original BYTE-FOR-BYTE
+             (and the stored content_hash matches). The "full content for interactive review" path.
+  AUDIT   — emit a mini-panel's events (dispatch + votes + verdict) via AuditRun; the audit consumer
+            drains them into audit_events; query by run_id ORDER BY seq and assert the run
+            reconstructs (the disagreement-corpus superset).
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import os
+import signal
+import subprocess
+import sys
+import time
+import uuid
+from pathlib import Path
+
+DEFAULT_PAYLOAD = "/tmp/arb-memory-seat-e2e-slice-log.md"
+MEM_LOG = "/tmp/arb-memory-artefact-audit-e2e-memory.log"
+AUDIT_LOG = "/tmp/arb-memory-artefact-audit-e2e-audit.log"
+
+
+def _connect(dsn):
+    import psycopg
+
+    return psycopg.connect(dsn, autocommit=True)
+
+
+def start_proc(role, *, repo_root, python, env, logpath):
+    log = open(logpath, "w")
+    return subprocess.Popen(
+        [python, "-m", "arb_memory", role],
+        cwd=repo_root, env=env, stdout=log, stderr=subprocess.STDOUT, text=True,
+    )
+
+
+def stop(proc):
+    if proc is None or proc.poll() is not None:
+        return
+    proc.send_signal(signal.SIGTERM)
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=10)
+
+
+def clean_redis_prefix(redis_url, prefix):
+    import redis
+
+    r = redis.from_url(redis_url, decode_responses=True)
+    try:
+        cursor = 0
+        keys = []
+        while True:
+            cursor, batch = r.scan(cursor=cursor, match=f"{prefix}*", count=1000)
+            keys.extend(batch)
+            if cursor == 0:
+                break
+        if keys:
+            r.delete(*keys)
+    finally:
+        r.close()
+
+
+def cleanup_rows(conn, run_tag):
+    conn.execute("DELETE FROM hints WHERE source = %s OR author = %s", (run_tag, run_tag))
+    conn.execute("DELETE FROM artefacts WHERE artefact_id LIKE %s", (f"{run_tag}%",))
+    conn.execute("DELETE FROM audit_events WHERE run_id = %s", (run_tag,))
+
+
+def _run_row_count(conn, run_tag):
+    return conn.execute(
+        "SELECT (SELECT count(*) FROM hints WHERE source=%s) "
+        "+ (SELECT count(*) FROM artefacts WHERE artefact_id LIKE %s) "
+        "+ (SELECT count(*) FROM audit_events WHERE run_id=%s)",
+        (run_tag, f"{run_tag}%", run_tag),
+    ).fetchone()[0]
+
+
+def assert_absent(conn, run_tag, label):
+    n = _run_row_count(conn, run_tag)
+    if n:
+        raise RuntimeError(f"{label}: {n} pre-existing rows for {run_tag}")
+
+
+def wait_until(fn, timeout_s, what):
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if fn():
+            return
+        time.sleep(0.5)
+    raise TimeoutError(f"timed out waiting for {what}")
+
+
+def memory_ready(conn, run_tag, marker, artefact_id):
+    # Retry the sentinel write until one lands after the consumer group exists (boot-race).
+    from arb_memory import client, bus
+
+    if bus.PREFIX != os.environ["ARB_MEMORY_PREFIX"]:
+        raise RuntimeError(f"prefix isolation broken: bus.PREFIX={bus.PREFIX!r}")
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        client.write(marker, artefact_id=artefact_id, artefact_content="sentinel", source=run_tag, author=run_tag)
+        sub = time.monotonic() + 3
+        while time.monotonic() < sub:
+            if conn.execute("SELECT count(*) FROM hints WHERE text=%s AND source=%s", (marker, run_tag)).fetchone()[0]:
+                return
+            time.sleep(0.5)
+    raise TimeoutError("memory consumer never persisted sentinel")
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser()
+    p.add_argument("--repo-root", default=str(Path(__file__).resolve().parents[1]))
+    p.add_argument("--python", default=sys.executable)
+    p.add_argument("--dsn", default=os.environ.get("ARB_MEMORY_DSN"))
+    p.add_argument("--redis-url", default=os.environ.get("ARB_MEMORY_REDIS_URL", "redis://127.0.0.1:6379/15"))
+    p.add_argument("--payload", default=DEFAULT_PAYLOAD)
+    args = p.parse_args(argv)
+    if not args.dsn:
+        raise SystemExit("ARB_MEMORY_DSN or --dsn required")
+
+    document = Path(args.payload).read_text(encoding="utf-8")
+    doc_sha = hashlib.sha256(document.encode("utf-8")).hexdigest()
+    repo_root = str(Path(args.repo_root).resolve())
+    run_tag = f"arb-memory-aa-e2e-{uuid.uuid4().hex}"
+    prefix = f"{run_tag}:"
+    os.environ["ARB_MEMORY_PREFIX"] = prefix
+    os.environ["ARB_MEMORY_REDIS_URL"] = args.redis_url
+
+    env = dict(os.environ)
+    env.update({"ARB_MEMORY_DSN": args.dsn, "ARB_MEMORY_REDIS_URL": args.redis_url, "ARB_MEMORY_PREFIX": prefix})
+
+    conn = _connect(args.dsn)
+    mem = aud = None
+    try:
+        cleanup_rows(conn, run_tag)
+        assert_absent(conn, run_tag, "pre-test")
+        clean_redis_prefix(args.redis_url, prefix)
+
+        mem = start_proc("memory", repo_root=repo_root, python=args.python, env=env, logpath=MEM_LOG)
+        aud = start_proc("audit", repo_root=repo_root, python=args.python, env=env, logpath=AUDIT_LOG)
+        memory_ready(conn, run_tag, f"{run_tag}-sentinel", f"{run_tag}-sentinel-art")
+        cleanup_rows(conn, run_tag)  # drop the sentinel; keep the run clean for the assertions
+
+        # ---- ARTEFACT full-content fidelity ----
+        from arb_memory import client
+
+        art_id = f"{run_tag}-doc"
+        hint_phrase = f"{run_tag} cross-seat slice full log artefact"
+        client.write(hint_phrase, artefact_id=art_id, artefact_content=document, source=run_tag, author=run_tag)
+        wait_until(
+            lambda: conn.execute("SELECT count(*) FROM artefacts WHERE artefact_id=%s", (art_id,)).fetchone()[0] > 0,
+            60, "artefact persisted",
+        )
+        hits = client.query(hint_phrase, k=5, timeout_s=20)  # two-step: hint -> artefact (NOT transport_only)
+        if not hits:
+            raise RuntimeError("ARTEFACT: query returned no hits")
+        matched = [h for h in hits if (h.get("artefact") or {}).get("artefact_id") == art_id]
+        if not matched:
+            raise RuntimeError(f"ARTEFACT: stored artefact not in retrieval; got {hits!r:.300}")
+        got = matched[0]["artefact"]["content"]
+        if got != document:
+            raise RuntimeError(
+                f"ARTEFACT FIDELITY FAILED: retrieved content differs (len got={len(got)} want={len(document)})"
+            )
+        # also confirm the stored content_hash is over the real bytes
+        stored_hash = conn.execute("SELECT content_hash FROM artefacts WHERE artefact_id=%s", (art_id,)).fetchone()[0]
+        artefact_full = {"ok_full_content_byte_identical": True, "bytes": len(document), "sha256": doc_sha}
+
+        # ---- AUDIT store + retrieval ----
+        from arb_memory.audit import AuditRun
+
+        r = client._redis_client()
+        run = AuditRun(r, run_tag, prefix=prefix)
+        run.emit("orchestrator", "dispatch", {"target": "seat-a"})
+        run.emit("seat-a", "vote", {"verdict": "approve"})
+        run.emit("seat-b", "vote", {"verdict": "block"})
+        run.emit("orchestrator", "verdict", {"result": "blocked", "votes": ["approve", "block"]})
+        wait_until(
+            lambda: conn.execute("SELECT count(*) FROM audit_events WHERE run_id=%s", (run_tag,)).fetchone()[0] >= 4,
+            60, "audit events drained",
+        )
+        rows = conn.execute(
+            "SELECT seq, source, raw_entry->>'kind' FROM audit_events WHERE run_id=%s ORDER BY seq", (run_tag,)
+        ).fetchall()
+        expected = [(1, "orchestrator", "dispatch"), (2, "seat-a", "vote"), (3, "seat-b", "vote"), (4, "orchestrator", "verdict")]
+        if rows != expected:
+            raise RuntimeError(f"AUDIT reconstruction failed: {rows!r} != {expected!r}")
+
+        import json
+        print(json.dumps({
+            "ok": True, "run_tag": run_tag,
+            "artefact": artefact_full,
+            "audit": {"events_reconstructed": len(rows), "ordered_by_seq": True},
+        }))
+        return 0
+    finally:
+        # DRAIN BARRIER: prove BOTH writer processes (mem + aud) quiesced before teardown — a consumer
+        # that commits after its stop-signal is, in production, a node writing past its drain point
+        # (failover/consistency violation). audit_events has no created_at and its `ts` is the emitter's
+        # clock (not the DB commit clock), so the seat-e2e's max(created_at)<stop approach doesn't apply
+        # here; use count-stability across the stop boundary instead. Snapshot this run's rows, stop both
+        # consumers, settle, re-count: any post-stop commit grows the count. Reads only the harness conn,
+        # never a consumer's. (Pattern note: systems with a separate writer/consumer process.)
+        n_before = _run_row_count(conn, run_tag)
+        stop(mem)
+        stop(aud)
+        time.sleep(2.0)  # settle: a commit landing past the stop-signal shows up here
+        n_after = _run_row_count(conn, run_tag)
+        try:
+            if n_after != n_before:
+                raise RuntimeError(
+                    f"drain-barrier violation: {n_after - n_before} row(s) committed AFTER stop-signal "
+                    f"(before={n_before} after={n_after}) — a writer wrote past its drain point"
+                )
+            cleanup_rows(conn, run_tag)
+            assert_absent(conn, run_tag, "post-test")
+            clean_redis_prefix(args.redis_url, prefix)
+        finally:
+            conn.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

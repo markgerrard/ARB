@@ -1,0 +1,190 @@
+#!/usr/bin/env python3
+"""suite-gate — whole-suite gate generalizing graph-sql-gate's three assertions (ARB-B10).
+
+The two existing gates (graph-sql-gate, arb-messages-gate) guard 6 files; the other
+~3700 tests have no pinned count and ~650 unexamined skips. This gate applies the same
+contract at suite level:
+
+  1. REFUSE an unusable environment rather than skipping: the suite only runs
+     correctly under <checkout>/.venv (scripts/arb-orch-panel re-execs any other
+     interpreter out from under pytest — env-trap B4(g)), so a missing venv is a
+     refusal, not a fallback.
+  2. REFUSE unexamined skips: every skipped test must appear in the checked-in
+     allowlist (scripts/suite-gate-skip-allowlist.txt). The allowlist is asserted as
+     a SET, not a count — a newly-skipping test cannot offset a newly-running one.
+     An allowlisted test that RUNS is fine; assertion 3 guards wholesale deselection.
+  3. PIN the passed count: a silently missing/deselected test fails the same as a
+     skip. EXPECTED_MIN_PASSED is a hardcoded constant on purpose — an env override
+     would be an evasion channel; update it in a reviewed diff when tests are added.
+
+Any test failure or collection error fails the gate outright. The junit report is
+written OUTSIDE the repo in a fresh mkdtemp, which prevents a PRE-PLACED result file
+from being read as pytest output. Honest limit (same class as the Slice 3 junit
+finding): a test RUNNING under the gate can read the junit path from its own argv and
+overwrite the report — in-process test code is trusted here, as in every gate in this
+family. The gate defends against stale/foreign result files, not hostile in-tree code.
+
+Exit codes: 0 gate PASS; 1 any refusal or failure (same as the sibling gates).
+"""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+VENV_PY = REPO / ".venv" / "bin" / "python"
+VENV_PREFIX = (REPO / ".venv").resolve()
+ALLOWLIST = REPO / "scripts" / "suite-gate-skip-allowlist.txt"
+
+
+def fail(msg: str) -> None:
+    print(f"suite-gate: FAIL — {msg}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+# Interpreter pivot: the gate itself must run under <checkout>/.venv — its own
+# defusedxml import lives there, and its pytest child must be venv-run anyway.
+# Compare sys.prefix, NOT the resolved executable: the venv python is a symlink
+# into Homebrew's framework binary, so Path.resolve() falsely looks "already in
+# venv" (same trap scripts/arb-orch-panel documents). Under the venv python,
+# sys.prefix == VENV_PREFIX, so the exec cannot loop.
+if Path(sys.prefix).resolve() != VENV_PREFIX:
+    if not VENV_PY.is_file():
+        fail(
+            f"{VENV_PY} does not exist — refusing to run under any other interpreter "
+            "(scripts/arb-orch-panel execs non-.venv interpreters out from under "
+            "pytest at collection; see src/agent_redis_bridge/README.md § Tests). "
+            "Create the checkout venv first."
+        )
+    os.execv(str(VENV_PY), [str(VENV_PY), str(Path(__file__).resolve()), *sys.argv[1:]])
+
+try:
+    # Hardened parser (XXE / entity-expansion safe). A junit file is same-host tool
+    # output, but the gate must not be the one XML consumer that trusts its input.
+    import defusedxml.ElementTree as ET
+except ImportError:  # fail closed with an actionable message, never fall back
+    fail(
+        "defusedxml is not installed in the checkout venv "
+        "(install the dev dependency group; see pyproject.toml); refusing to "
+        "parse XML with the stdlib parser"
+    )
+
+# Pinned to the observed 2026-07-31 baseline run @ c5df7fd1 (no DSNs exported):
+# 3146 passed + the two compose-pin fixes landed with this gate = 3148, + 54
+# probe-package validator tests landed with Slice 1e-i = 3202. More passes are
+# fine (e.g. a DSN turns allowlisted skips into runs); fewer means tests went
+# missing. Update in a reviewed diff when tests are added or removed.
+# + 55 warm-orch test-drive/live-dispatch tests = 3257 (the two slices merged at
+# b4c095c7 and 1efd8f8c), + 60 codex app-server runner tests = 3317, + 21 panel
+# remediation tests (gate command-parse 9, approvals fail-closed 7, runner
+# guards 5) = 3338. Each addend is the count of tests that landed with the
+# commit named, so the trail can be re-derived rather than taken on trust.
+#
+# RE-BASED 2026-08-02 to the observed count. The addend trail above sums to
+# 3338 while a provenance-stamped run of the same tree reported 3432 — so ~94
+# tests had landed without a floor bump, and the gate could not have detected
+# them disappearing. The floor is only a missing-tests detector if it tracks
+# the actual count, so it is re-based here rather than extended by this
+# slice's addend alone: + 26 ACP-server tests (turn-event stream 5, ACP
+# protocol 18, CLI --acp 3) on top of an observed 3406 = 3432. Keep bumping it
+# with each landing; a floor that lags is a gate that cannot fail.
+# + 11 grok warm-runtime tests (runner warmth+gate 8, CLI wiring 2, generic
+# stdio spawn 1) = 3443, + 17 pi warm-runtime tests (runner warmth/turns/gate
+# 15, CLI wiring 2) = 3460. The pi HOST tests are node, not pytest, so they do
+# not appear in this count — see tools/pi-sdk-host (`node --test <file>`).
+# + 20 panel-remediation tests (runtime contract 14, gate bypasses 3, grok
+# error-raise 2, pi null tool-call-id 1) = 3480. Panel
+# panel-warmorch-4slices-20260802T100544Z-222b63 found a P0 that every existing
+# server test missed by driving a conforming FAKE; the contract file asserts
+# the interface against the REAL runtime classes so that class cannot recur.
+# + 41 second-panel remediation tests (gate corpus of merge-shaped and
+# ordinary command forms 34, behavioural interrupt-on-real-runtime 4, ACP
+# error path 3) = 3521. The first remediation was itself paneled and BLOCKED:
+# its contract file asserted that `interrupt` EXISTS rather than that it
+# WORKS, which a non-functional codex implementation satisfied. Tests added
+# here assert the wire, not the shape.
+#
+# RE-BASED 2026-08-17 to the observed count, for the second time and for the
+# same reason: the floor had drifted to 3521 against an observed no-DSN run of
+# 4345 on this tree (@ 683eac5b, DSNs unexported, 653 skipped). 824 tests of
+# slack means the gate could have lost an entire subsystem without noticing —
+# "a floor that lags is a gate that cannot fail", three lines up, describing
+# itself. Re-based rather than extended by an addend, because the addend trail
+# has demonstrably not kept pace twice now.
+#
+# Still pinned to a NO-DSN run, deliberately: that is what keeps the gate
+# runnable on hosts with no database (dispatched seats), and the same property
+# is why it cannot itself detect a missing one. The push path gets that check
+# from .githooks/pre-push instead, which requires the DSNs before it will run.
+EXPECTED_MIN_PASSED = 4345
+
+
+def main() -> None:
+    if not ALLOWLIST.is_file():
+        fail(f"skip allowlist {ALLOWLIST} is missing — the skip-set assertion cannot run")
+    allowed = {
+        line.strip()
+        for line in ALLOWLIST.read_text().splitlines()
+        if line.strip() and not line.startswith("#")
+    }
+
+    junit = Path(tempfile.mkdtemp(prefix="suite-gate-")) / "junit.xml"
+    proc = subprocess.run(
+        [str(VENV_PY), "-m", "pytest", "-q", f"--junit-xml={junit}"],
+        cwd=REPO,
+    )
+    if not junit.is_file():
+        fail(f"pytest exited {proc.returncode} without writing {junit} — no result to trust")
+
+    root = ET.parse(junit).getroot()
+    suites = root.iter("testsuite")
+    passed = failed = errors = 0
+    skipped_ids: list[str] = []
+    problem_ids: list[str] = []
+    for suite in suites:
+        for case in suite.iter("testcase"):
+            nodeid = f"{case.get('classname', '')}::{case.get('name', '')}"
+            if case.find("failure") is not None:
+                failed += 1
+                problem_ids.append(nodeid)
+            elif case.find("error") is not None:
+                errors += 1
+                problem_ids.append(nodeid)
+            elif case.find("skipped") is not None:
+                skipped_ids.append(nodeid)
+            else:
+                passed += 1
+
+    print(
+        f"suite-gate: parsed junit — {passed} passed, {failed} failed, "
+        f"{errors} errors, {len(skipped_ids)} skipped"
+    )
+
+    verdicts: list[str] = []
+    if failed or errors or proc.returncode != 0:
+        listed = ", ".join(problem_ids[:10]) or f"pytest exit {proc.returncode}"
+        verdicts.append(
+            f"{failed} failed / {errors} errors (pytest exit {proc.returncode}): {listed}"
+        )
+    new_skips = sorted(set(skipped_ids) - allowed)
+    if new_skips:
+        listed = ", ".join(new_skips[:10])
+        verdicts.append(
+            f"{len(new_skips)} skipped test(s) not in the allowlist "
+            f"(unexamined skip — examine, then allowlist or fix): {listed}"
+        )
+    if passed < EXPECTED_MIN_PASSED:
+        verdicts.append(
+            f"only {passed} passed; expected >= {EXPECTED_MIN_PASSED} (missing tests?)"
+        )
+    if verdicts:
+        fail("; ".join(verdicts))
+    print(f"suite-gate: PASS — {passed} passed, {len(skipped_ids)} skips all allowlisted")
+
+
+if __name__ == "__main__":
+    main()

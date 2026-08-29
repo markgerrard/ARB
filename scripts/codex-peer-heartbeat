@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Persistent Workflow 2 liveness heartbeat for an interactive Codex peer.
+# Run independently of codex-inbox-once so status remains present while Codex
+# is processing an envelope and before it arms the next one-envelope receiver.
+
+set -euo pipefail
+
+HOST=${AGENT_REDIS_HOST:-127.0.0.1}
+PORT=${AGENT_REDIS_PORT:-6390}
+DB=${AGENT_REDIS_DB:-12}
+PREFIX=${AGENT_REDIS_PREFIX:-agent_scratch:}
+REDIS_USER=${AGENT_REDIS_USER:-}
+REDIS_TLS=${AGENT_REDIS_TLS:-0}
+REDIS_PASSWORD=${AGENT_REDIS_PASSWORD:-}
+AGENT=${AGENT_ID:?AGENT_ID env var required}
+HEARTBEAT_TTL=${AGENT_HEARTBEAT_TTL:-60}
+HEARTBEAT_INTERVAL=${AGENT_HEARTBEAT_INTERVAL:-20}
+
+STATUS="${PREFIX}agent:${AGENT}:status"
+OWNER="alive:codex-heartbeat:$$"
+REDIS_FLAGS=(-h "${HOST}" -p "${PORT}" -n "${DB}" --no-auth-warning)
+case "${REDIS_TLS}" in 1|true|True|yes) REDIS_FLAGS+=(--tls) ;; esac
+[ -n "${REDIS_USER}" ] && REDIS_FLAGS+=(--user "${REDIS_USER}")
+[ -n "${REDIS_PASSWORD}" ] && export REDISCLI_AUTH="${REDIS_PASSWORD}"
+
+cleanup() {
+    local current
+    current=$(redis-cli "${REDIS_FLAGS[@]}" --raw GET "${STATUS}" 2>/dev/null || true)
+    if [ "${current}" = "${OWNER}" ]; then
+        redis-cli "${REDIS_FLAGS[@]}" DEL "${STATUS}" >/dev/null 2>&1 || true
+    fi
+}
+trap cleanup EXIT INT TERM
+
+while true; do
+    redis-cli "${REDIS_FLAGS[@]}" SET "${STATUS}" "${OWNER}" EX "${HEARTBEAT_TTL}" >/dev/null
+    sleep "${HEARTBEAT_INTERVAL}" &
+    wait $!
+done

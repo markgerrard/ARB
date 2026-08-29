@@ -1,0 +1,26 @@
+version: 1
+brief_id: AB-P1
+base_sha: f7d95cc340eb58efcd9aa12dc330fd064a344a0d
+facts:
+- id: F1
+  claim: controls base already has the Live mode button
+  file: src/arb_memory/static/index.html
+  line: 150
+  pattern: mode-live
+- id: F2
+  claim: controls base has shouldAutoFetchHistoryPage
+  file: src/arb_memory/static/app.js
+  line: 326
+  pattern: function shouldAutoFetchHistoryPage
+- id: F3
+  claim: controls base exports app.js functions through module.exports
+  file: src/arb_memory/static/app.js
+  line: 691
+  pattern: module.exports
+traps:
+- id: T1
+  name: viewport-fill-pagination-burst
+  precondition: history pagination auto-fetch ignores viewport/full-width suppression
+  file: src/arb_memory/static/app.js
+  symbol: shouldAutoFetchHistoryPage
+  historical_catch: docs/superpowers/reviews/2026-07-03-arb-visibility-web-controls-plan-panel-brief.md:32

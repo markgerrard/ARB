@@ -1,0 +1,14 @@
+task_id: c2-parser
+cluster: C2
+brief: |
+  Implement parse_record in parser.py using only the standard library. Write tests first.
+tdd: true
+battery_id: c2-parser
+worker_test_command: "python -m pytest tests -q --junitxml=report.xml"
+worker_test_report: report.xml
+expected_artifacts: ["parser.py"]
+allowed_paths: ["parser.py", "tests/**"]
+baseline_test_paths: []
+worker_test_paths: ["tests/test_worker.py"]
+prohibitions: []
+timeout_s: 900

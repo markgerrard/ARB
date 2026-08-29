@@ -1,0 +1,14 @@
+task_id: c7-provenance
+cluster: C7
+brief: |
+  Implement provenance_note.py and include tests first; do not claim uncreated SHAs.
+tdd: true
+battery_id: c7-provenance
+worker_test_command: "python -m pytest tests -q --junitxml=report.xml"
+worker_test_report: report.xml
+expected_artifacts: ["provenance_note.py"]
+allowed_paths: ["provenance_note.py", "tests/**"]
+baseline_test_paths: []
+worker_test_paths: ["tests/test_worker.py"]
+prohibitions: []
+timeout_s: 900

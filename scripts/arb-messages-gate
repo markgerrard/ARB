@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# arb-messages-gate — PostgreSQL-backed test gate for tests/arb_messages.
+# Without ARB_MESSAGES_TEST_DSN the DB-backed modules SKIP (module-level skipif);
+# a green run with every DB assertion skipped is the vacuously-green shape this
+# gate refuses. It ALSO pins the passed count: a silently missing/deselected test
+# is the same failure as a skip. Same contract as scripts/graph-sql-gate.
+set -euo pipefail
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [ -x "$REPO/.venv/bin/python" ]; then
+  PY="$REPO/.venv/bin/python"
+else
+  PY="${ARB_BRIDGE_VENV_PYTHON:-$REPO/.venv/bin/python}"
+fi                                    # pytest is NOT on PATH on this host
+cd "$REPO"                           # relative test paths below require repo-root CWD
+EXPECTED_MIN_PASSED=83               # pinned to the observed 2026-07-30 run; update when tests are added
+if [ -z "${ARB_MESSAGES_TEST_DSN:-}" ]; then
+  echo "arb-messages-gate: ARB_MESSAGES_TEST_DSN is not set — refusing to run a skippable gate" >&2
+  exit 1
+fi
+out=$("$PY" -m pytest -q -rs tests/arb_messages 2>&1) || {
+  echo "$out"; exit 1; }
+echo "$out"
+if echo "$out" | grep -qE "[0-9]+ skipped"; then
+  echo "arb-messages-gate: FAIL — DB tests were skipped; gate requires them to RUN" >&2
+  exit 1
+fi
+passed=$(echo "$out" | grep -oE "[0-9]+ passed" | grep -oE "[0-9]+" | head -1)
+if [ "${passed:-0}" -lt "$EXPECTED_MIN_PASSED" ]; then
+  echo "arb-messages-gate: FAIL — only ${passed:-0} passed; expected >= $EXPECTED_MIN_PASSED (missing tests?)" >&2
+  exit 1
+fi

@@ -1,0 +1,5 @@
+{
+  "name": "trust_root_rotation",
+  "type": "object",
+  "required": ["old_sha", "new_sha", "reason", "certifying_seats", "human_approver", "change_author", "invalidated_basis_records"]
+}

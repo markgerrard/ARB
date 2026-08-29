@@ -1,0 +1,59 @@
+[
+ {
+  "id": "M1",
+  "label": "seat_posture_v -> constant false (fail-open: every seat un-gated, spec \u00a73)",
+  "file": "src/arb_memory/schema.sql",
+  "find": "SELECT seat_id, requires_claim_ref FROM seat_posture;",
+  "replace": "SELECT seat_id, false AS requires_claim_ref FROM seat_posture;"
+ },
+ {
+  "id": "M2",
+  "label": "lease_lane_v -> constant 'exempt' (fail-open: total lane bypass, spec \u00a75.3)",
+  "file": "src/arb_memory/schema.sql",
+  "find": "SELECT lease_id, lane FROM lease_lanes;",
+  "replace": "SELECT lease_id, 'exempt'::text AS lane FROM lease_lanes;"
+ },
+ {
+  "id": "M3",
+  "label": "expiry operator  >  ->  >=",
+  "file": "src/arb_memory/schema.sql",
+  "find": "c.review_by > now()",
+  "replace": "c.review_by >= now()"
+ },
+ {
+  "id": "M4",
+  "label": "raw status/review_by hardwired in claim_admissibility_v",
+  "file": "src/arb_memory/schema.sql",
+  "find": "       c.status, c.review_by",
+  "replace": "       'confirmed'::text AS status, NULL::timestamptz AS review_by"
+ },
+ {
+  "id": "M5",
+  "label": "PUBLIC view revoke narrowed  REVOKE ALL -> REVOKE INSERT",
+  "file": "src/arb_memory/mcp/grants.py",
+  "find": "sql.SQL(\"REVOKE ALL ON {} FROM PUBLIC\").format(sql.SQL(\", \").join(views))",
+  "replace": "sql.SQL(\"REVOKE INSERT ON {} FROM PUBLIC\").format(sql.SQL(\", \").join(views))"
+ },
+ {
+  "id": "M6",
+  "label": "assert_gate_role_isolation() call removed from apply_gate_reader_grants",
+  "file": "src/arb_memory/mcp/grants.py",
+  "find": "    assert_gate_role_isolation(conn, role)\n",
+  "replace": ""
+ },
+ {
+  "id": "M7",
+  "label": "re-run FOREIGN KEY dropped",
+  "file": "src/arb_memory/schema.sql",
+  "regex": true,
+  "find": "ALTER TABLE attestations ADD CONSTRAINT attestations_rerun_artefact_fk\\n.*\\n.*;\\n",
+  "replace": ""
+ },
+ {
+  "id": "M8",
+  "label": "CHECK on attestations.falsifier_kind dropped",
+  "file": "src/arb_memory/schema.sql",
+  "find": "    falsifier_kind  text NOT NULL\n                    CHECK (falsifier_kind IN ('command','prose')),",
+  "replace": "    falsifier_kind  text NOT NULL,"
+ }
+]

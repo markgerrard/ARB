@@ -1,0 +1,61 @@
+[
+  {
+    "name": "memory_get",
+    "description": "",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "artefact_id": {
+          "title": "Artefact Id",
+          "type": "string"
+        },
+        "version": {
+          "title": "Version",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "artefact_id",
+        "version"
+      ],
+      "title": "memory_getArguments"
+    }
+  },
+  {
+    "name": "memory_recent",
+    "description": "",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "limit": {
+          "default": 10,
+          "title": "Limit",
+          "type": "integer"
+        }
+      },
+      "title": "memory_recentArguments"
+    }
+  },
+  {
+    "name": "memory_search",
+    "description": "",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "title": "Query",
+          "type": "string"
+        },
+        "k": {
+          "default": 8,
+          "title": "K",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "title": "memory_searchArguments"
+    }
+  }
+]

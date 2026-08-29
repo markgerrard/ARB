@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Truncation-resistant variant of scripts/agent-inbox-watcher for Claude
+# consumers (Claude Code Monitor task-notifications truncate the surfaced
+# <event> field, so long envelopes lose their tail).
+#
+# Wraps the canonical watcher with scripts/inbox-split-filter.py:
+#   - emits one short `[inbox-meta] id=… from=… kind=… event=… sent_at=…`
+#     line per envelope on stdout (always fits the Monitor preview cap)
+#   - writes the full envelope JSON to
+#     $AGENT_BRIDGE_INBOX_DIR/<id>.json   (default /tmp/agent-bridge-inbox/)
+#     so the Claude session can Read the full payload when needed
+#
+# Codex / Gemini consumers do NOT need this — they use
+# scripts/agent-redis-bridge-systemd, which speaks the engine's native
+# protocol and bypasses Monitor entirely.
+#
+# Usage (drop-in for the canonical watcher under Claude Code's Monitor):
+#   set -a; source .env; set +a
+#   AGENT_ID=<agent-id> ./scripts/agent-inbox-watcher-split 2>&1 | \
+#     grep --line-buffered -E '^\[inbox-meta\]|^\[watcher\]|ERROR|FATAL|NOAUTH|WRONGPASS|denied|rejected|connection refused|reconnecting|sender-rejected|envelope-invalid'
+#
+# Note the grep filter line uses `^\[inbox-meta\]` instead of `^\[inbox\]`.
+
+set -euo pipefail
+SCRIPT_DIR="$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
+exec "${SCRIPT_DIR}/agent-inbox-watcher" "$@" \
+    | python3 -u "${SCRIPT_DIR}/inbox-split-filter.py"

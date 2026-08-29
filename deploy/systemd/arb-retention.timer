@@ -1,0 +1,10 @@
+[Unit]
+Description=Run ARB Memory retention purge nightly
+
+[Timer]
+OnCalendar=*-*-* 02:15:00
+Persistent=true
+Unit=arb-retention.service
+
+[Install]
+WantedBy=timers.target

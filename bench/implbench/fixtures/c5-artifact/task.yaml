@@ -1,0 +1,14 @@
+task_id: c5-artifact
+cluster: C5
+brief: |
+  Generate report_builder.py. Write tests first and produce only the expected artifact.
+tdd: true
+battery_id: c5-artifact
+worker_test_command: "python -m pytest tests -q --junitxml=report.xml"
+worker_test_report: report.xml
+expected_artifacts: ["report_builder.py"]
+allowed_paths: ["report_builder.py", "tests/**"]
+baseline_test_paths: []
+worker_test_paths: ["tests/test_worker.py"]
+prohibitions: []
+timeout_s: 900

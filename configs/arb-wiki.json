@@ -1,0 +1,40 @@
+{
+  "repos": [
+    {
+      "name": "arb",
+      "path": ".",
+      "seat": {
+        "engine": "codex",
+        "target_id": "codex-bridge-dev-example",
+        "timeout": 3600
+      },
+      "pages": [
+        {
+          "id": "wiki-arb-overview",
+          "title": "ARB Overview",
+          "scope": "what the bridge is: dispatch bus, ARB planes, warm/cold orchestration, two-clone topology"
+        },
+        {
+          "id": "wiki-arb-dispatch-protocol",
+          "title": "ARB Dispatch Protocol",
+          "scope": "envelope, inbox/BLPOP, agent-dispatch vs dispatch-dev, run-id discipline, worktree dispatch, notify split"
+        },
+        {
+          "id": "wiki-arb-engines",
+          "title": "ARB Engines",
+          "scope": "engine adapters, role profiles, engine pool/parallelism, completion gates"
+        },
+        {
+          "id": "wiki-arb-memory-plane",
+          "title": "ARB Memory Plane",
+          "scope": "artefacts/hints schema, single-writer, doors, read tools, vault export + graph"
+        },
+        {
+          "id": "wiki-arb-observability",
+          "title": "ARB Observability",
+          "scope": "events:live/eval/trace/transcript tees, arb-watch/visibility, audit/vote plane"
+        }
+      ]
+    }
+  ]
+}

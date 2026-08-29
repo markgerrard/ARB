@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# arb-pi-orch — guarded Pi orchestrator launcher that injects close-discipline.
+#
+# Resolves <checkout>/prompts/arb-close-discipline.md from this script's location
+# and passes it as its own --append-system-prompt (orthogonal to any role profile
+# the caller also supplies). Refuses to launch (exit 78) when the file is
+# missing or unreadable — pi fails open on a dangling path (serves the path
+# string as prompt text), so the guard is the gate, not optional hygiene.
+#
+# Design: docs/superpowers/specs/2026-07-30-arb-b2-orchestrated-close-discipline-design.md
+set -euo pipefail
+
+# Resolve $0 even when invoked via symlink or PATH lookup.
+SOURCE="${BASH_SOURCE[0]}"
+while [[ -L "$SOURCE" ]]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+CHECKOUT="$(cd "$SCRIPT_DIR/.." && pwd)"
+PROMPT_PATH="$CHECKOUT/prompts/arb-close-discipline.md"
+
+if [[ "${1:-}" == "--print-prompt-path" ]]; then
+  printf '%s\n' "$PROMPT_PATH"
+  exit 0
+fi
+
+if [[ ! -r "$PROMPT_PATH" ]]; then
+  printf 'arb-pi-orch: close-discipline-unreadable path=%s — refusing to launch\n' \
+    "$PROMPT_PATH" >&2
+  exit 78
+fi
+
+# -r alone admits a zero-byte or truncated file: pi would then serve an EMPTY
+# append and the seat would launch looking configured with no discipline at all —
+# the same silent downgrade this launcher exists to prevent (r4, cold-Opus).
+if [[ ! -s "$PROMPT_PATH" ]]; then
+  printf 'arb-pi-orch: close-discipline-empty path=%s — refusing to launch\n' \
+    "$PROMPT_PATH" >&2
+  exit 78
+fi
+
+# INTENT only — what the launcher read. Pi re-reads the file at session load and
+# on every reload(), so this must not be cited as served-bytes evidence.
+if command -v shasum >/dev/null 2>&1; then
+  _sha="$(shasum -a 256 "$PROMPT_PATH" | awk '{print $1}')"
+elif command -v sha256sum >/dev/null 2>&1; then
+  _sha="$(sha256sum "$PROMPT_PATH" | awk '{print $1}')"
+else
+  _sha="$(openssl dgst -sha256 "$PROMPT_PATH" | awk '{print $NF}')"
+fi
+_bytes="$(wc -c < "$PROMPT_PATH" | tr -d '[:space:]')"
+printf 'close-discipline-intent sha256=%s bytes=%s\n' "$_sha" "$_bytes" >&2
+
+# Resolve PI_BIN to an absolute executable BEFORE any PATH mutation.
+# Default is the bare name "pi". `dirname pi` is "." — prepending that would put
+# the caller's cwd first on an exported PATH (cwd shadowing). Never prepend ".".
+PI_BIN="${PI_BIN:-pi}"
+if [[ "$PI_BIN" != /* ]]; then
+  if ! _pi_resolved="$(command -v -- "$PI_BIN" 2>/dev/null)"; then
+    printf 'arb-pi-orch: pi-bin-unresolvable PI_BIN=%s — refusing to launch\n' \
+      "$PI_BIN" >&2
+    exit 79
+  fi
+  PI_BIN="$_pi_resolved"
+fi
+# command -v may still yield a relative path when PATH has relative entries.
+if [[ "$PI_BIN" != /* ]]; then
+  _pi_dir_rel="$(dirname -- "$PI_BIN")"
+  if [[ "$_pi_dir_rel" == "." ]]; then
+    printf 'arb-pi-orch: pi-bin-cwd-path-refused PI_BIN=%s — refusing to launch\n' \
+      "$PI_BIN" >&2
+    exit 79
+  fi
+  PI_BIN="$(cd -- "$_pi_dir_rel" && pwd)/$(basename -- "$PI_BIN")"
+fi
+if [[ ! -x "$PI_BIN" ]]; then
+  printf 'arb-pi-orch: pi-bin-not-executable path=%s — refusing to launch\n' \
+    "$PI_BIN" >&2
+  exit 79
+fi
+_pi_dir="$(dirname -- "$PI_BIN")"
+# pi is a Node CLI (#!/usr/bin/env node); put its dirname on PATH so the shebang
+# resolves — only after we have a verified absolute directory (never ".").
+if [[ "$_pi_dir" == "." || -z "$_pi_dir" ]]; then
+  printf 'arb-pi-orch: pi-bin-cwd-path-refused path=%s — refusing to launch\n' \
+    "$PI_BIN" >&2
+  exit 79
+fi
+export PATH="${_pi_dir}:${PATH:-}"
+
+# Caller's args first (role profile, model, …); close-discipline is its own
+# trailing --append-system-prompt so it rides as a SECOND append when a role is
+# also supplied. Never concatenate into the role-profile channel.
+exec "$PI_BIN" "$@" --append-system-prompt "$PROMPT_PATH"

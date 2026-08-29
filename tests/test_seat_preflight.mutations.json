@@ -1,0 +1,1 @@
+{"schema": 1, "mutations": [{"id": "M1", "kind": "defect", "label": "swap worker-vantage attestation key", "file": "scripts/seat-preflight", "find": "WORKER_VANTAGE, env, process_env=process_env", "replace": "\"WRONG_KEY\", env, process_env=process_env", "expect_failed": ["tests/test_seat_preflight.py::test_attestation_call_site_binds_worker_vantage"]}]}

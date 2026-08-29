@@ -1,0 +1,150 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-redis-bridge"
+version = "0.1.0"
+description = "Bridge Codex App Server to an agent_scratch Redis bus."
+requires-python = ">=3.11"
+dependencies = [
+    "redis>=4.3",
+    "jsonschema>=4",
+    "pynacl>=1.5",
+    "psycopg[binary]>=3.1",
+    "cryptography>=41",
+    # libsecp256k1 bindings. BIP-340 for NIP-OA, imported at module level by both
+    # arb_registration.nip_oa and buzz_ops.nip_oa, so it belongs in the core set
+    # rather than an extra.
+    #
+    # CONSTRAINT, stated at the point of temptation: coincurve publishes wheels
+    # for cp39-cp313 only -- no abi3, no cp314 on any version. Raising the base
+    # image past 3.13 therefore forces a source build in the production image.
+    # `deploy/Dockerfile` is pinned to 3.13-slim for exactly this reason and the
+    # two must move together. Check before bumping either:
+    #   uv pip install --dry-run --only-binary :all: --python-version 3.X \
+    #     --python-platform x86_64-unknown-linux-gnu coincurve
+    # The `--only-binary :all:` is not optional -- without it a missing wheel
+    # resolves "successfully" by silently falling back to an sdist.
+    #
+    # OBSERVED DIVERGENCE, 2026-08-18. The constraint above is already broken on
+    # this fleet, and it is load-bearing to know that BEFORE the next import is
+    # added rather than after. Both DEPLOYED clones run Python 3.14.5, and
+    # coincurve is absent from both. No cp314 wheel exists, so this dependency
+    # cannot be installed there without a source build against libsecp256k1
+    # headers. The 3.12 venvs that run the suite do have it, 21.0.0.
+    #
+    # It is harmless ONLY because bridge.py imports neither arb_registration.nip_oa
+    # nor buzz_ops.nip_oa, so the daemon never reaches this dependency and the seats
+    # run fine. That is a property of the current import graph, not a guarantee.
+    # The first module on the daemon path that pulls in either one breaks both
+    # deployed clones, and it will present as a ModuleNotFoundError inside a seat
+    # rather than as a dependency problem -- the same fail-at-point-of-use shape as
+    # the cline-acp dispatcher gap (tests/test_dispatch_engine_parity.py).
+    #
+    # So: before adding a nip_oa import anywhere bridge.py can reach, either bring
+    # those clones back to <=3.13 or accept a source build there. Verify with the
+    # dry-run above, and check the clones' actual interpreter -- not the Dockerfile
+    # pin, which is what says 3.13 while the hosts say 3.14.
+    #
+    # RESOLVED, 2026-08-19: the divergence is ACCEPTED, not a defect to fix. Both
+    # clones above are DAEMON HOSTS ONLY -- they run bridge.py and nothing else;
+    # the suite runs on the 3.12 venvs. So the missing cp314 wheel costs nothing
+    # there and the interpreters stay put. Rejected alternatives: rebuilding those
+    # venvs on <=3.13, and source-building coincurve against libsecp256k1 headers.
+    # Neither buys anything a host that never imports nip_oa can use.
+    #
+    # This makes the import graph load-bearing, so it is now ENFORCED rather than
+    # merely described: tests/test_daemon_import_graph.py imports bridge.py in a
+    # clean subprocess and asserts coincurve and both nip_oa modules are absent
+    # from sys.modules, naming the file:line of any import that reaches them. Note
+    # it asserts ABSENCE, not that the import raises -- every venv running the
+    # suite has coincurve, so a does-it-blow-up check would pass vacuously. The
+    # paired positive-control test is what keeps the guard able to fail.
+    # The Dockerfile 3.13-slim pin and the dry-run recipe above are unchanged:
+    # they still govern the PRODUCTION image, which does import nip_oa.
+    "coincurve>=21; python_version < '3.14'",
+]
+
+# Optional — only needed by hosts that run the `agent-sdk` engine (M3/Kimi/GLM seats).
+# Core seats (codex/agy-print/pi/etc.) import bridge.py without it; AgentSdkEngine is
+# imported lazily inside build_engine() so this stays optional. Install with:
+#   pip install -e '.[agent-sdk]'
+[project.optional-dependencies]
+agent-sdk = [
+    "claude-agent-sdk>=0.2.104",
+]
+arb-memory = [
+    "pgvector>=0.3",
+    "openai>=1.0",
+    "mcp==1.28.0",
+    "pyotp>=2.9",
+    "PyYAML>=6",
+]
+bench = [
+    "PyYAML>=6",
+]
+arb-files = [
+    "boto3>=1.34.59",
+    "mcp==1.28.0",
+]
+arb-email = [
+    "httpx>=0.27",
+    "mcp==1.28.0",
+]
+visibility = [
+    "textual>=0.50",
+    "httpx>=0.27",
+]
+
+[project.scripts]
+agent-redis-bridge = "agent_redis_bridge.__main__:main"
+codex-redis-bridge = "agent_redis_bridge.__main__:main"
+codexctl = "agent_redis_bridge.ctl:main"
+arb-memory-local-mcp = "arb_memory.run:run_local_read_mcp"
+arb-memory-brief-hydrate = "arb_memory.brief_hydrate:main"
+arb-files-local-mcp = "arb_files.run:run_local_mcp"
+arb-email-local-mcp = "arb_email.run:run_local_mcp"
+arb-watch = "arb_memory.watch.app:main"
+seat-token = "arb_registration.token_cli:main"
+seat-register = "arb_registration.register_cli:main"
+seat-registrar = "arb_registration.registrar_cli:main"
+bus-register = "arb_registration.bus_register_cli:main"
+bus-registrar = "arb_registration.bus_registrar_cli:main"
+bus-registrar-approve = "arb_registration.bus_approval_cli:main"
+arb-journey-export = "arb_memory.journey_export:main"
+
+# Test tooling (PEP 735). `uv sync --all-extras` installs this by default; CI and any
+# fresh checkout get a collectable suite without hand-installing pytest/anyio.
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "anyio>=4",
+    "playwright>=1.45",
+    # scripts/suite-gate parses pytest's junit XML; hardened parser only, no fallback.
+    "defusedxml>=0.7",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+arb_memory = ["static/*"]
+
+[tool.pytest.ini_options]
+# Bare `pytest` = the main suite. tools/* carry their own suites (agent-sdk-probe,
+# eval, seat_deny_proof) and collecting them alongside tests/ causes module-name
+# collisions + missing-dep errors; run those explicitly from their own dirs.
+testpaths = ["tests"]
+# Repo root importable regardless of invocation style: `from tests....` helper
+# imports work under `python -m pytest` (CWD on sys.path) but not under the bare
+# `pytest` entrypoint without this.
+pythonpath = [".", "bench"]
+markers = [
+    "e2e: real-boundary end-to-end verification (cheap since d6e26e5 batching; include in targeted runs when guard machinery changes)",
+    "live_bakeoff: external macOS/UID/provider boundary evidence reserved for Task 14",
+    "pg: PostgreSQL-backed graph tests — run via scripts/graph-sql-gate; must never skip-green",
+    "slow: longer acceptance hooks (e.g. coverage mutation sweep); not deselected by default",
+    "primitive(name): names the external binary a macOS behavioural test is the SUBJECT of; read by test_script_portability.py to prove COVERED membership is earned",
+]
+addopts = "-m 'not live_bakeoff'"

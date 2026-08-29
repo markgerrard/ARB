@@ -1,0 +1,18 @@
+{
+ "schema": 1,
+ "mutations": [
+  {
+   "id": "M1",
+   "kind": "defect",
+   "label": "delete the expected_version compare (stale base would be allowed to write)",
+   "file": "src/arb_memory/store.py",
+   "find": "    if expected_version is not None:\n        if row is None:\n            # Observational head version 0 = no versions exist.\n            if expected_version != 0:\n                return artefact_id, 0, \"refused_version_mismatch\"\n        elif row[0] != expected_version:\n            return artefact_id, row[0], \"refused_version_mismatch\"\n",
+   "replace": "    if False:\n        pass\n",
+   "expect_failed": [
+    "tests/arb_memory/test_store.py::test_upsert_artefact_refuses_stale_expected_version_without_database",
+    "tests/arb_memory/test_store.py::test_upsert_artefact_create_only_and_absent_head_without_database",
+    "tests/arb_memory/test_store.py::test_upsert_artefact_compare_before_dedup_identical_content_refuses"
+   ]
+  }
+ ]
+}

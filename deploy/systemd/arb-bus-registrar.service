@@ -1,0 +1,37 @@
+[Unit]
+Description=ARB approval-gated legacy-bus machine registrar
+After=network-online.target valkey-arb.service
+Wants=network-online.target
+Requires=valkey-arb.service
+
+[Service]
+# SINGLE-INSTANCE INVARIANT: install only as arb-bus-registrar.service.
+# Never template this unit or run concurrent registrar/provisioner processes.
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/home/claude/AgentRedisBridge
+EnvironmentFile=/etc/arb-bus-registrar/registrar.env
+ExecStart=/home/claude/AgentRedisBridge/.venv/bin/python -m arb_registration.bus_registrar_cli --legacy-env-file /etc/arb-bus-registrar/legacy.env
+Restart=on-failure
+RestartSec=5
+StateDirectory=arb-bus-registrar
+StateDirectoryMode=0700
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+ReadWritePaths=/etc/valkey /var/lib/arb-bus-registrar
+
+# Mark approved the first live acknowledgement and continuous operation through
+# cutover. Every individual request remains operator-approval-gated.
+
+[Install]
+WantedBy=multi-user.target

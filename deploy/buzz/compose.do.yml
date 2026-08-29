@@ -1,0 +1,153 @@
+# DigitalOcean overlay for buzz's OWN production compose.
+#
+# Layered ON TOP of upstream's deploy/compose/compose.yml — never a copy of it.
+# Upstream maintains the relay service, its healthchecks, ports and volumes; we
+# override only what a DO deployment changes:
+#
+#   * Postgres  -> DO Managed Postgres (LON), not the in-compose container
+#   * S3        -> DO Spaces, not the in-compose MinIO
+#   * Redis     -> still local to the droplet (managed Valkey is a later swap)
+#
+# Because this is an overlay, an upstream change to the relay service reaches us
+# on the next pin bump with no merge. That is the whole reason we did not fork.
+#
+# Usage is via ./buzz-deploy, which pins the upstream ref and passes both files
+# in the right order. Do not invoke `docker compose -f` by hand — the pin check
+# is the thing that stops us silently deploying a moved upstream.
+
+services:
+  relay:
+    # Upstream declares `env_file: .env` RELATIVE TO ITS OWN directory, which
+    # we must not create — writing into the upstream clone would dirty it and
+    # trip buzz-deploy's own pin check. Repoint it at ours instead.
+    env_file: !reset
+      - .env
+    # Upstream defaults to ghcr.io/block/buzz:main — a MOVING tag. Pin it.
+    image: ${BUZZ_IMAGE:?set BUZZ_IMAGE to a pinned tag or digest, never :main}
+    environment:
+      # Managed Postgres. DO requires TLS: the URI must carry sslmode=require
+      # (their console gives it to you already appended).
+      # Use the PRIVATE-network host — same LON region as the droplet, so it
+      # stays off the public internet and off the egress meter.
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL to the DO managed PG URI (private host, sslmode=require)}
+      # Optional. Set only if a read replica exists; the relay serves
+      # membership checks from it (upstream #4124). Empty = disabled.
+      READ_DATABASE_URL: ${READ_DATABASE_URL:-}
+      # Bounded-staleness routing. 0 disables replica reads even when
+      # READ_DATABASE_URL is set — leaving this at 0 while setting the replica
+      # URL looks configured and does nothing.
+      BUZZ_REPLICA_READ_MAX_AGE_MS: ${BUZZ_REPLICA_READ_MAX_AGE_MS:-0}
+      # Pool sizes must respect the managed cluster's connection limit, which
+      # is small on entry-size DO plans and is shared with anything else that
+      # connects. Exceeding it fails at connect time, not at deploy time.
+      BUZZ_DB_POOL_SIZE: ${BUZZ_DB_POOL_SIZE:-10}
+      BUZZ_DB_READ_POOL_SIZE: ${BUZZ_DB_READ_POOL_SIZE:-5}
+
+      # DO Spaces (S3-compatible).
+      BUZZ_S3_ENDPOINT: ${BUZZ_S3_ENDPOINT:-https://<region>.digitaloceanspaces.com}
+      BUZZ_S3_REGION: ${BUZZ_S3_REGION:-lon1}
+      BUZZ_S3_BUCKET: ${BUZZ_S3_BUCKET:?set BUZZ_S3_BUCKET to the Space name}
+      BUZZ_S3_ACCESS_KEY: ${BUZZ_S3_ACCESS_KEY:?set BUZZ_S3_ACCESS_KEY}
+      BUZZ_S3_SECRET_KEY: ${BUZZ_S3_SECRET_KEY:?set BUZZ_S3_SECRET_KEY}
+      # Spaces serves virtual-hosted style; flip to path if a bucket name ever
+      # breaks host-style addressing.
+      BUZZ_S3_ADDRESSING_STYLE: ${BUZZ_S3_ADDRESSING_STYLE:-virtual}
+      # Public URL media links are rendered against — the Space or its CDN
+      # edge. Wrong here means uploads succeed and every link 404s.
+      BUZZ_MEDIA_BASE_URL: ${BUZZ_MEDIA_BASE_URL:?set BUZZ_MEDIA_BASE_URL to the Space/CDN public URL}
+
+      # Relay identity + public origin.
+      #
+      # These MUST be mapped here rather than left to `.env`: the `env_file:
+      # !reset` above resolves to NO env-file at all under Compose v5.x (the
+      # reset applies, the replacement list does not), so a variable reaches
+      # the container only if it appears in an `environment:` mapping. Verified
+      # on arb-buzz 2026-08-02 — `RUST_LOG` sat in .env and never reached the
+      # container.
+      #
+      # RELAY_URL — note the name: the relay reads `RELAY_URL`, NOT
+      # `BUZZ_RELAY_URL` (config.rs:476). The startup error in main.rs:262 says
+      # "BUZZ_RELAY_URL", which is wrong and will send you chasing the wrong
+      # variable. `BUZZ_RELAY_URL` is read only by buzz-cli/acp/agent.
+      # It drives two things that are silently wrong if left at the default
+      # `ws://localhost:3000`: the deployment community host
+      # (main.rs::relay_url_authority) and the media URL scheme, since
+      # media_base_url_for_tenant only emits https:// when this starts wss://
+      # or https:// — otherwise every rendered media link is http://.
+      RELAY_URL: ${RELAY_URL:?set RELAY_URL to the public wss:// origin, e.g. wss://buzz.example.com}
+
+      # Without this the relay boots on a hardcoded DEV keypair whose pubkey is
+      # 79be667e...81798 — the secp256k1 generator point, i.e. private key = 1.
+      # That is a published, world-known key: anyone can sign as this relay.
+      BUZZ_RELAY_PRIVATE_KEY: ${BUZZ_RELAY_PRIVATE_KEY:?set BUZZ_RELAY_PRIVATE_KEY to a real relay key (buzz-admin generate-key)}
+
+      # Serves the shipped web bundle at /repos and /repos/*. Off by default
+      # upstream (config.rs:908).
+      #
+      # Why you need this to see the web UI at all: `/` is an explicit relay
+      # route and NEVER reaches the SPA fallback (router.rs comment at
+      # nip11_or_ws_handler) — it returns the NIP-11 document or upgrades to a
+      # WebSocket, even for a browser sending Accept: text/html. Without this
+      # flag the only HTML entry point is /invite/<code>, and minting an invite
+      # requires NIP-98 signing plus owner/admin relay membership.
+      # `should_serve_spa` = is_invite_landing_path || (this && /, /repos*).
+      BUZZ_SERVE_GIT_WEB_GUI: ${BUZZ_SERVE_GIT_WEB_GUI:-false}
+
+      # --- relay-side auth gates ---------------------------------------------
+      # These matter most when the relay is NOT behind Cloudflare Access, since
+      # then they are the only thing between the internet and the relay.
+      #
+      # BUZZ_REQUIRE_AUTH_TOKEN is badly named: it has nothing to do with
+      # minting API tokens. While false, the REST auth path accepts a bare
+      # `X-Pubkey` header as proof of identity — no signature, no replay
+      # detection (api/bridge.rs:117-125, "Dev-mode fallback"). That means
+      # anyone can assert ANY pubkey on the REST surface. Setting it true
+      # removes that fallback and requires a signed NIP-98 event. Nothing needs
+      # provisioning to turn it on; it only breaks callers relying on the
+      # unsigned header.
+      BUZZ_REQUIRE_AUTH_TOKEN: ${BUZZ_REQUIRE_AUTH_TOKEN:-false}
+
+      # The pubkey ACL — the analogue of the Valkey bus's ACL. Enforces that a
+      # NIP-42-authenticated identity is an admitted relay member, not merely a
+      # valid keypair.
+      #
+      # ORDERING TRAP: enabling this against an EMPTY member list locks out
+      # everyone, including you. Add members FIRST:
+      #   buzz-deploy run --rm --no-deps --entrypoint buzz-admin relay \
+      #     add-member <pubkey-hex>
+      #   ... list-members   # verify
+      # then flip this to true.
+      BUZZ_REQUIRE_RELAY_MEMBERSHIP: ${BUZZ_REQUIRE_RELAY_MEMBERSHIP:-false}
+
+      # HARD DEPENDENCY of the gate above, not a nice-to-have: with
+      # BUZZ_REQUIRE_RELAY_MEMBERSHIP=true and this unset, the relay refuses to
+      # boot —
+      #   "BUZZ_REQUIRE_RELAY_MEMBERSHIP=true but RELAY_OWNER_PUBKEY is not set
+      #    or invalid"
+      # — and crash-loops. Set both together or neither. 64-char hex, not npub.
+      # It also populates the NIP-11 `pubkey` field (the relay OWNER, distinct
+      # from `self`, which comes from BUZZ_RELAY_PRIVATE_KEY).
+      RELAY_OWNER_PUBKEY: ${RELAY_OWNER_PUBKEY:-}
+
+    # Upstream waits on postgres + minio + minio-init, none of which exist here.
+    # `!reset` drops the inherited mapping outright; merge alone cannot remove a
+    # key, so without this the stack deadlocks waiting for containers that are
+    # disabled below.
+    depends_on: !reset null
+    # Re-declare only what we still run.
+    links: []
+
+  # Disabled, not deleted: a compose override cannot remove a service, but a
+  # profile that is never activated keeps it from starting. Leaving them
+  # defined also keeps `docker compose config` honest about what upstream ships.
+  postgres:
+    profiles: ["local-db-unused"]
+  minio:
+    profiles: ["local-s3-unused"]
+  minio-init:
+    profiles: ["local-s3-unused"]
+
+  redis:
+    # Still droplet-local. Swap to managed Valkey by giving the relay a
+    # REDIS_URL override and profiling this out, exactly as postgres is here.
+    restart: unless-stopped

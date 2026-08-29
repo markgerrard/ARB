@@ -1,0 +1,69 @@
+#!/usr/bin/env python3
+"""candid — fast adversarial-critique CLI via `codex exec`.
+
+DEPRECATED (2026-06-30). candid exists to dodge "the multi-minute floor the bridge path imposes"
+(below) — but that floor was a bug: per-token Redis writes throttling codex over the managed-bus TLS
+RTT, fixed in 9da7761 the same afternoon candid was added (ada513f, 6 minutes later). The bridge prose
+path is now fast, so a quick adversarial second opinion should go through a normal codex dispatch.
+Kept (not deleted) so existing `~/bin/candid` symlinks don't break; do not extend it.
+
+Cross-model thinking partner used mid-brainstorm. Reads prompt from
+positional args or stdin, prepends a mode-specific persona, and shells
+out to `codex exec` with low reasoning effort so the round-trip is
+sub-30s instead of the multi-minute floor the bridge path imposes.
+"""
+import argparse
+import subprocess
+import sys
+
+MODES = {
+    "default": """You are a fast adversarial decision critic.
+Verdict first. Max 180 words. No hedging. No essay.
+Attack the weakest assumption. Give one better path.
+Do not explain your process.""",
+    "code": """You are a blunt senior engineering reviewer.
+Verdict first. Max 220 words. Focus on correctness, maintainability, security, and hidden coupling.
+List concrete risks and the smallest better implementation path.
+No compliments. No essay.""",
+    "product": """You are a ruthless product/UX critic.
+Verdict first. Max 200 words. Focus on user value, friction, positioning, willingness to pay, and adoption risk.
+Attack weak assumptions. Give one sharper alternative.
+No generic advice.""",
+    "plan": """You are an implementation-plan attacker.
+Verdict first. Max 220 words. Identify the riskiest step, missing dependency, and simplest safer sequencing.
+Give a revised plan. No hedging. No essay.""",
+}
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Fast Codex adversarial critique")
+    parser.add_argument("prompt", nargs="*", help="Prompt text. If omitted, reads stdin.")
+    parser.add_argument("--mode", choices=MODES.keys(), default="default")
+    parser.add_argument("--effort", default="medium", choices=["minimal", "low", "medium", "high"])
+    parser.add_argument("--model", default="gpt-5.5")
+    args = parser.parse_args()
+
+    user_input = " ".join(args.prompt).strip() or sys.stdin.read().strip()
+    if not user_input:
+        print("No input provided.", file=sys.stderr)
+        sys.exit(1)
+
+    full_prompt = f"""{MODES[args.mode]}
+
+Input:
+{user_input}
+"""
+
+    cmd = ["codex", "exec", "-c", f"model_reasoning_effort={args.effort}"]
+    if args.model:
+        cmd += ["-c", f"model={args.model}"]
+    cmd.append(full_prompt)
+
+    try:
+        subprocess.run(cmd, check=False)
+    except KeyboardInterrupt:
+        sys.exit(130)
+
+
+if __name__ == "__main__":
+    main()

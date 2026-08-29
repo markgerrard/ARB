@@ -1,0 +1,14 @@
+task_id: c6-scope
+cluster: C6
+brief: |
+  Implement formatter.py and do not touch unrelated files. Write tests first.
+tdd: true
+battery_id: c6-scope
+worker_test_command: "python -m pytest tests -q --junitxml=report.xml"
+worker_test_report: report.xml
+expected_artifacts: ["formatter.py"]
+allowed_paths: ["formatter.py", "tests/**"]
+baseline_test_paths: ["tests/test_baseline.py"]
+worker_test_paths: ["tests/test_worker.py"]
+prohibitions: []
+timeout_s: 900

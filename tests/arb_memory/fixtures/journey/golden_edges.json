@@ -1,0 +1,21 @@
+{
+  "edges": [
+    [
+      "wiki-child",
+      "wiki-grandchild"
+    ],
+    [
+      "wiki-child",
+      "wiki-root"
+    ],
+    [
+      "wiki-root",
+      "art-1111111111111111"
+    ],
+    [
+      "wiki-root",
+      "wiki-child"
+    ]
+  ],
+  "dangling": 1
+}

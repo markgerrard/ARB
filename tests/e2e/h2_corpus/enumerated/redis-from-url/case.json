@@ -1,0 +1,50 @@
+{
+  "files": {
+    "pkg/a.py": "import redis\nclient = redis.from_url('redis://localhost:6379/0')\n"
+  },
+  "diff": "diff --git a/pkg/a.py b/pkg/a.py\n--- a/pkg/a.py\n+++ b/pkg/a.py\n@@ -0,0 +1,2 @@\n+import redis\n+client = redis.from_url('redis://localhost:6379/0')\n",
+  "changed_paths": [
+    "pkg/a.py"
+  ],
+  "phase_input": {
+    "h2_section": {
+      "coverage_acknowledgment": {
+        "acknowledged": true,
+        "additional_assumptions": []
+      },
+      "rows": [
+        {
+          "candidate_id": "redis:pkg/a.py:redis.from_url#1",
+          "disposition": "not_load_bearing",
+          "reason": "seeded e2e redis fixture",
+          "evidence": "pkg/a.py"
+        }
+      ]
+    }
+  },
+  "expected": {
+    "derived": [
+      "redis:pkg/a.py:redis.from_url#1"
+    ],
+    "status": "enforced",
+    "record": {
+      "complete": true,
+      "dispositions": [
+        {
+          "candidate_id": "redis:pkg/a.py:redis.from_url#1",
+          "disposition": "not_load_bearing",
+          "valid": true
+        }
+      ]
+    },
+    "graduation": {
+      "counted": true,
+      "disposition_counts": {
+        "answered": 0,
+        "not_load_bearing": 1,
+        "flag": 0
+      }
+    }
+  },
+  "notes": "Enumerated module-level redis.from_url trigger."
+}

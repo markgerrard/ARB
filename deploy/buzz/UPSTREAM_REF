@@ -1,0 +1,35 @@
+# The buzz commit this deployment is built and tested against.
+#
+# We do NOT fork buzz. Our clone is a pure consumer (zero tracked
+# modifications, verified 2026-08-02), so a fork would buy a permanent merge
+# burden for a capability we have never used. Instead we pin, and bumping the
+# pin is a reviewed diff like any other.
+#
+# Bump procedure:
+#   1. git -C <buzz clone> fetch && git log --oneline <old>..<new>
+#   2. Read deploy/compose/compose.yml for changes to the relay service —
+#      that file is the surface our overlay layers onto.
+#   3. Update REF + DESCRIBE below, rebuild, redeploy to staging, smoke.
+#   4. Commit with the upstream range in the message.
+REF=ac4fa13b8e4d947071d57deb6918dcf12bf74961
+DESCRIBE=desktop-v0.5.3-17-gac4fa13b8
+DATE=2026-08-01T13:32:16-04:00
+SUBJECT=perf(relay): serve relay-membership checks from the read replica (#4124)
+
+# Where a server can actually fetch it. Our dev clone's origin is
+# /Volumes/<workspace>/mirrors/buzz.git — a LOCAL mirror, unreachable from a
+# droplet — so builds off-box must use this URL instead.
+#
+# Verified 2026-08-02, not inferred from the ghcr image name:
+#   * anonymous `git ls-remote https://github.com/block/buzz HEAD` exits 0,
+#     so the droplet needs no deploy key;
+#   * the mirror's ONLY remote is git@github.com:block/buzz, so every commit
+#     in it originated there;
+#   * REF below is contained in the mirror's refs/heads/main, i.e. it is an
+#     ancestor of GitHub's main and can actually be checked out remotely.
+#     (A pin present only in a local mirror would fail at deploy, not here.)
+#
+# Use the HTTPS form. On the dev Macs a global `insteadOf` rewrites HTTPS to
+# SSH, so a local clone may transparently go over SSH; a droplet has no such
+# rewrite and the repo is public, so HTTPS is correct there.
+UPSTREAM_URL=https://github.com/block/buzz

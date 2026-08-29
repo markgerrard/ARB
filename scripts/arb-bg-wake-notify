@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# arb-bg-wake-notify — poke the **interactive** pi orch CLI awake.
+#
+# The interactive session must have arb-bg-wake loaded (session_start inbox
+# watcher). This does NOT talk to bridge seats.
+#
+# Usage:
+#   arb-bg-wake-notify "impl finished exit=0 see /tmp/.../luna.out"
+#   arb-bg-wake-notify --file /path/to/report.md
+#   echo "hello" | arb-bg-wake-notify --stdin
+#
+set -euo pipefail
+INBOX="${ARB_BG_WAKE_DIR:-/tmp/arb-orch/bg-wake}/inbox"
+mkdir -p "$INBOX"
+
+name="note-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+body=""
+
+if [[ "${1:-}" == "--file" ]]; then
+  body=$(cat "${2:?--file needs path}")
+elif [[ "${1:-}" == "--stdin" ]]; then
+  body=$(cat)
+else
+  body=${*:-}
+fi
+
+if [[ -z "${body// /}" ]]; then
+  echo "usage: $0 <message> | --file PATH | --stdin" >&2
+  exit 2
+fi
+
+path="$INBOX/${name}.md"
+# header so orch knows source
+{
+  echo "# External wake → interactive orch CLI"
+  echo ""
+  echo "- at: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "- via: arb-bg-wake-notify"
+  echo ""
+  echo "$body"
+} >"$path"
+
+echo "queued interactive wake: $path"

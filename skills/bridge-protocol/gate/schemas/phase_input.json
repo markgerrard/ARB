@@ -1,0 +1,5 @@
+{
+  "name": "phase_input",
+  "type": "object",
+  "required": ["phase", "phase_class", "artifact_sha", "correctness_basis", "reviewer_reports", "manifest_ref", "escaped_defect"]
+}

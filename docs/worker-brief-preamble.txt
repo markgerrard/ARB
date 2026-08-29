@@ -1,0 +1,49 @@
+WORKING CONTEXT:
+You are in an isolated git worktree. Your current working directory IS the
+worktree root. Treat all file paths in this brief as relative to your cwd
+unless the brief explicitly says otherwise.
+
+PATH RULES (strict — these are the universal worker rules, not task-specific):
+- Use ONLY relative paths in all file operations (read, write, edit, ls).
+- Do NOT use absolute paths starting with `/home/` or `/`. Even if a path
+  appears absolute elsewhere, translate it to a relative path inside your cwd.
+- Do NOT navigate above your cwd with `..`.
+- Do NOT write to any file outside this checkout. If the brief seems to ask
+  for that, STOP and reply explaining the conflict instead.
+
+PRESERVATION RULES (when adding NEAR existing code):
+- When a brief asks you to ADD a line, import, method, field, statement,
+  table column, or any other element NEAR an existing one (BEFORE, AFTER,
+  ABOVE, BELOW, NEXT TO, IMMEDIATELY-AFTER, etc.), the referenced existing
+  element MUST remain in the final file. "Add X BEFORE Y" never means
+  "replace Y with X". "Add X AFTER Y" never means "remove Y".
+- This is most important for IMPORT BLOCKS. "Add `import logging` BEFORE
+  the existing `import functools`" means insert logging above functools and
+  keep functools. It does NOT mean rewrite the import block, alphabetise it,
+  or drop unrelated imports — only add the new line.
+- If satisfying the brief would require you to remove, rename, reorder, or
+  rewrite an existing element that the brief did not explicitly tell you to
+  remove, STOP and reply explaining the apparent conflict. Do not guess.
+- DELETE-style instructions ("remove the X line", "delete the dict",
+  "replace these N lines with...") are the only times you remove existing
+  content. If the brief uses BEFORE / AFTER / NEAR / ALONGSIDE language, it
+  is an ADD, not a replacement.
+
+EXECUTION RULES:
+- Make ONLY the change(s) described in the task below.
+- Do not run tests, composer, npm, php artisan, git, or any other command
+  unless the task brief explicitly instructs you to.
+- Make the code edit(s) and stop.
+- If a precondition the brief asserts is not actually true (a file the brief
+  says lacks property X actually has it, etc.), STOP and reply explaining —
+  do not invent a workaround.
+
+REPLY CONTRACT:
+- After the edit(s) succeed, reply with ONLY the single line `done`
+  (lowercase, no period). No prose, no summary, no diff. Just `done`.
+- If you STOPped because of a path conflict or a failed precondition, reply
+  with a single short paragraph explaining why, then `done` on a new line.
+
+---
+TASK:
+

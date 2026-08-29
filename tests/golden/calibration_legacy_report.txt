@@ -1,0 +1,17 @@
+# Calibration report (2026-07-07T00:00:00+00:00)
+decisions=1 outcomes=1
+
+## Per-reviewer finding calibration
+- codex: raised 1 | confirmed 1 | false-positive 0 | pending 0 | confirm-rate 100%
+
+## Per-decision-type calibration
+(no decision outcomes recorded yet)
+
+## Pending outcome (1)
+Decisions with no recorded outcome yet (not counted as held — unknown):
+  legacy1
+
+## Anomalies to investigate (questions, not verdicts)
+(none flagged)
+
+NOTE: report-only. These are prompts for human investigation; the loop never adjusts reviewer weights or gates.

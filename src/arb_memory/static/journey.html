@@ -1,0 +1,422 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png">
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ARB Journey</title>
+  <style>
+    :root{
+      color-scheme:light dark;
+      --paper:#FAF8F4; --paper-sunk:#F3EFE8; --card:#FFFFFF;
+      --ink-900:#1F1D1A; --ink-700:#45413B; --ink-500:#6E6960; --ink-400:#918B80;
+      --line-200:#E7E2D8; --line-300:#D9D3C7;
+      --clay-600:#9E4A2E; --clay-700:#823A22; --clay-100:#EFE0D6;
+      --serif:'Newsreader',Georgia,'Times New Roman',serif;
+      --mono:'IBM Plex Mono',ui-monospace,'SF Mono',Menlo,monospace;
+      --ease:cubic-bezier(.4,0,.2,1);
+      --k-wiki:#9E4A2E; --k-manifest:#B08430; --k-learn:#4C7A5A;
+      --k-howto:#5A7A8C; --k-note:#6E6960; --edge:#C9C2B4;
+    }
+    @media (prefers-color-scheme: dark){
+      :root{
+        --paper:#1F1D1A; --paper-sunk:#28251F; --card:#322E27;
+        --ink-900:#FAF8F4; --ink-700:#D9D3C7; --ink-500:#A8A299; --ink-400:#6E6960;
+        --line-200:#3A362E; --line-300:#4A453B;
+        --clay-600:#C97350; --clay-700:#E0916B; --clay-100:#3D2A20;
+        --k-wiki:#C97350; --k-manifest:#CBA14C; --k-learn:#77A386;
+        --k-howto:#84A4B6; --k-note:#A8A299; --edge:#4A453B;
+      }
+    }
+    *{box-sizing:border-box}
+    body{margin:0;background:var(--paper);color:var(--ink-700);font-family:var(--serif);height:100vh;display:flex;flex-direction:column}
+    header{
+      display:flex;align-items:baseline;justify-content:space-between;gap:16px;
+      padding:14px 18px;background:var(--paper-sunk);border-bottom:1px solid var(--line-200);
+    }
+    h1{margin:0;font-family:var(--serif);font-weight:600;font-size:1.25rem;color:var(--ink-900)}
+    #generated-at{
+      font-family:var(--mono);font-size:.6875rem;text-transform:uppercase;
+      letter-spacing:.1em;color:var(--ink-500);
+    }
+    header{flex:none}
+    main{display:flex;flex-direction:column;flex:1;min-height:0}
+    #graph{width:100%;height:44vh;min-height:300px;flex:none;background:var(--paper-sunk);border-bottom:1px solid var(--line-200)}
+    .workbench{
+      display:grid;grid-template-columns:minmax(360px,1.1fr) minmax(340px,.9fr);
+      flex:1;min-height:0;
+    }
+    .left{border-right:1px solid var(--line-200);min-width:0;display:flex;flex-direction:column;min-height:0}
+    .tablewrap{overflow-y:auto;min-height:0;flex:1}
+    aside{overflow-y:auto;min-height:0}
+    .countbar{
+      display:flex;gap:14px;flex-wrap:wrap;padding:10px 12px;background:var(--card);
+      border-bottom:1px solid var(--line-200);
+      font-family:var(--mono);font-size:.6875rem;text-transform:uppercase;
+      letter-spacing:.08em;color:var(--ink-500);
+    }
+    .toolbar{
+      display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;padding:10px 12px;
+      background:var(--card);border-bottom:1px solid var(--line-200);
+    }
+    input,select{
+      min-width:0;padding:7px 9px;font-family:var(--mono);font-size:.8125rem;
+      color:var(--ink-900);background:var(--paper-sunk);
+      border:1px solid var(--line-300);border-radius:3px;
+      transition:border-color 120ms var(--ease),background-color 120ms var(--ease),box-shadow 120ms var(--ease);
+    }
+    input:focus-visible,select:focus-visible{
+      outline:none;border-color:var(--clay-600);background:var(--card);
+      box-shadow:0 0 0 3px var(--clay-100);
+    }
+    label{
+      display:flex;align-items:center;gap:6px;white-space:nowrap;
+      font-family:var(--mono);font-size:.6875rem;text-transform:uppercase;
+      letter-spacing:.08em;color:var(--ink-500);
+    }
+    input[type="checkbox"]{accent-color:var(--clay-600)}
+    table{width:100%;border-collapse:collapse;table-layout:fixed;background:var(--card)}
+    th,td{
+      padding:8px 12px;border-bottom:1px solid var(--line-200);text-align:left;
+      overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+      font-family:var(--mono);font-size:.8125rem;color:var(--ink-700);
+    }
+    th{
+      font-size:.6875rem;text-transform:uppercase;letter-spacing:.1em;
+      color:var(--ink-500);background:var(--paper-sunk);position:sticky;top:0;
+      border-bottom:1px solid var(--line-300);
+    }
+    tr{cursor:pointer}
+    tbody tr:hover{background:var(--paper-sunk)}
+    tbody tr.selected{background:var(--clay-100);box-shadow:inset 3px 0 0 var(--clay-600)}
+    tbody tr:focus-visible{outline:2px solid var(--clay-600);outline-offset:-2px}
+    aside{padding:18px;background:var(--card);min-width:0}
+    #detail h2{
+      margin:0 0 10px;font-family:var(--serif);font-weight:600;
+      font-size:1.125rem;color:var(--ink-900);line-height:1.3;
+    }
+    .meta{display:grid;grid-template-columns:110px 1fr;gap:6px 12px}
+    .meta dt{
+      font-family:var(--mono);font-size:.6875rem;text-transform:uppercase;
+      letter-spacing:.1em;color:var(--ink-500);padding-top:2px;
+    }
+    .meta dd{margin:0;overflow-wrap:anywhere;font-family:var(--mono);font-size:.8125rem;color:var(--ink-700)}
+    code{
+      display:block;padding:10px 12px;margin-top:14px;overflow-x:auto;
+      font-family:var(--mono);font-size:.8125rem;color:var(--ink-900);
+      background:var(--paper-sunk);border:1px solid var(--line-300);border-radius:3px;
+    }
+    .hint{color:var(--ink-500);font-style:italic}
+    #graph{cursor:grab;touch-action:none}
+    #graph:active{cursor:grabbing}
+    line,circle{vector-effect:non-scaling-stroke}
+    circle{cursor:pointer;stroke:var(--card);stroke-width:1.5;transition:stroke 120ms var(--ease)}
+    circle:hover{stroke:var(--clay-600)}
+    circle:focus-visible{outline:none;stroke:var(--clay-700);stroke-width:2.5}
+    line{stroke:var(--edge);stroke-opacity:.8}
+    .shelf-divider{stroke:var(--line-300);stroke-dasharray:4 4}
+    .shelf-label{font-family:var(--mono);font-size:10px;letter-spacing:.12em;fill:var(--ink-400)}
+    circle.iso{opacity:.55}
+    circle.dim{opacity:.15}
+    line.dim{stroke-opacity:.15}
+    circle.selected{stroke:var(--clay-700);stroke-width:3;opacity:1}
+    line.edge-active{stroke:var(--clay-600);stroke-opacity:1;stroke-width:1.8}
+    .legend{display:inline-flex;gap:10px;align-items:center;margin-left:auto}
+    .viewhint{color:var(--ink-400);margin-left:12px;letter-spacing:.06em}
+    .legend .dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:4px;vertical-align:-1px}
+    .legend i.kind-wiki-page{background:var(--k-wiki)}
+    .legend i.kind-wiki-manifest{background:var(--k-manifest)}
+    .legend i.kind-learn-proposal{background:var(--k-learn)}
+    .legend i.kind-howto{background:var(--k-howto)}
+    .legend i.kind-note{background:var(--k-note)}
+    .kind-wiki-page{fill:var(--k-wiki)}
+    .kind-wiki-manifest{fill:var(--k-manifest)}
+    .kind-learn-proposal{fill:var(--k-learn)}
+    .kind-howto{fill:var(--k-howto)}
+    .kind-note{fill:var(--k-note)}
+    @media (prefers-reduced-motion: reduce){
+      *,*::before,*::after{transition:none !important}
+    }
+    @media (max-width: 900px){
+      main{height:auto}
+      .workbench{grid-template-columns:1fr}
+      .left{border-right:0}
+      .tablewrap{max-height:50vh}
+      .toolbar{grid-template-columns:1fr 1fr}
+      .meta{grid-template-columns:90px 1fr}
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>ARB Journey</h1>
+    <div id="generated-at">generated_at: loading</div>
+  </header>
+  <main>
+    <svg id="graph" role="img" aria-label="Journey graph"></svg>
+    <div class="countbar" id="counts"></div>
+    <div class="workbench">
+      <section class="left">
+        <div class="toolbar">
+          <input id="q" placeholder="Filter text">
+          <select id="kind"><option value="">All kinds</option></select>
+          <input id="tag" placeholder="Tag">
+          <label><input id="isolated" type="checkbox"> isolated</label>
+        </div>
+        <div class="tablewrap">
+          <table>
+            <thead><tr><th>Title</th><th>Kind</th><th>Source</th><th>Degree</th></tr></thead>
+            <tbody id="rows"></tbody>
+          </table>
+        </div>
+      </section>
+      <aside id="detail"><p class="hint">Select a node in the graph or a row below it.</p></aside>
+    </div>
+  </main>
+  <script>
+    const state = {snapshot: null, selected: null};
+    const KINDS = new Set(["wiki-page","wiki-manifest","learn-proposal","howto","note"]);
+    const byId = id => document.getElementById(id);
+    const degree = n => (n.in_degree || 0) + (n.out_degree || 0);
+    function matches(node) {
+      const q = byId("q").value.toLowerCase();
+      const kind = byId("kind").value;
+      const tag = byId("tag").value.toLowerCase();
+      const isolated = byId("isolated").checked;
+      const hay = [node.id, node.title, node.source, node.author, (node.tags || []).join(" ")].join(" ").toLowerCase();
+      if (q && !hay.includes(q)) return false;
+      if (kind && node.kind !== kind) return false;
+      if (tag && !(node.tags || []).some(t => t.toLowerCase().includes(tag))) return false;
+      if (isolated && degree(node) !== 0) return false;
+      return true;
+    }
+    function renderCounts(s) {
+      byId("generated-at").textContent = "generated_at: " + s.generated_at;
+      const c = s.counts || {};
+      const kinds = [["wiki-page","wiki page"],["wiki-manifest","manifest"],["learn-proposal","learn"],["howto","howto"],["note","note"]];
+      byId("counts").innerHTML = `<span>nodes ${c.nodes || 0} | edges ${c.edges || 0} | dangling ${c.dangling || 0} | isolated ${c.isolated || 0} | free hints ${c.free_hints || 0}</span>`
+        + `<span class="legend">` + kinds.map(([k, label]) => `<i class="dot kind-${k}"></i>${label}`).join(" ")
+        + ` <span class="viewhint">drag pan · scroll zoom · dblclick reset</span></span>`;
+    }
+    function renderFilters(nodes) {
+      const select = byId("kind");
+      const current = select.value;
+      select.innerHTML = '<option value="">All kinds</option>';
+      [...new Set(nodes.map(n => n.kind))].sort().forEach(kind => {
+        const opt = document.createElement("option");
+        opt.value = kind; opt.textContent = kind; select.appendChild(opt);
+      });
+      select.value = current;
+    }
+    function selectNode(node) {
+      state.selected = node.id;
+      const neighbours = state.snapshot.edges.filter(e => e[0] === node.id || e[1] === node.id).map(e => e[0] === node.id ? e[1] : e[0]).sort();
+      byId("detail").innerHTML = `<h2>${escapeHtml(node.title || node.id)}</h2>
+        <dl class="meta">
+          <dt>id</dt><dd>${escapeHtml(node.id)}</dd>
+          <dt>kind</dt><dd>${escapeHtml(node.kind || "")}</dd>
+          <dt>source</dt><dd>${escapeHtml(node.source || "")}</dd>
+          <dt>author</dt><dd>${escapeHtml(node.author || "")}</dd>
+          <dt>created</dt><dd>${escapeHtml(node.created_at || "")}</dd>
+          <dt>version</dt><dd>${node.version || ""}</dd>
+          <dt>tags</dt><dd>${escapeHtml((node.tags || []).join(", "))}</dd>
+          <dt>neighbours</dt><dd>${escapeHtml(neighbours.join(", ") || "none")}</dd>
+        </dl>
+        <code>memory_get('${escapeAttr(node.id)}', ${Number(node.version || 1)})</code>`;
+      renderRows();
+      highlightSelection();
+    }
+    function selectHint(hint) {
+      state.selected = "hint-" + hint.id;
+      byId("detail").innerHTML = `<h2>Free hint ${hint.id}</h2><dl class="meta"><dt>created</dt><dd>${escapeHtml(hint.created_at || "")}</dd><dt>tags</dt><dd>${escapeHtml((hint.tags || []).join(", "))}</dd></dl>`;
+      renderRows();
+      highlightSelection();
+    }
+    function renderRows() {
+      const tbody = byId("rows");
+      tbody.innerHTML = "";
+      state.snapshot.nodes.filter(matches).forEach(node => {
+        const tr = document.createElement("tr");
+        tr.dataset.testid = "node-row";
+        tr.className = state.selected === node.id ? "selected" : "";
+        tr.innerHTML = `<td>${escapeHtml(node.title || node.id)}</td><td>${escapeHtml(node.kind || "")}</td><td>${escapeHtml(node.source || "")}</td><td>${degree(node)}</td>`;
+        tr.addEventListener("click", () => selectNode(node));
+        tbody.appendChild(tr);
+      });
+      state.snapshot.free_hints.forEach(hint => {
+        if (byId("isolated").checked) return;
+        const tagFilter = byId("tag").value.toLowerCase();
+        if (tagFilter && !(hint.tags || []).some(t => t.toLowerCase().includes(tagFilter))) return;
+        const tr = document.createElement("tr");
+        tr.className = state.selected === "hint-" + hint.id ? "selected" : "";
+        tr.innerHTML = `<td>Free hint ${hint.id}</td><td>free-hint</td><td></td><td>0</td>`;
+        tr.addEventListener("click", () => selectHint(hint));
+        tbody.appendChild(tr);
+      });
+    }
+    function renderGraph() {
+      const svg = byId("graph");
+      const width = svg.clientWidth || 800, height = svg.clientHeight || 360;
+      state.view = {x: 0, y: 0, w: width, h: height, w0: width, h0: height};
+      applyView();
+      svg.innerHTML = "";
+      state.gfx = {circles: new Map(), lines: []};
+
+      const shelfH = 74;                       // isolated shelf: the two-populations fact, by construction
+      const plotH = height - shelfH;
+      const all = state.snapshot.nodes.map(n => ({...n}));
+      const map = new Map(all.map(n => [n.id, n]));
+      const edges = state.snapshot.edges.filter(e => map.has(e[0]) && map.has(e[1]));
+      const deg2 = {};
+      edges.forEach(([s, d]) => { deg2[s] = (deg2[s] || 0) + 1; deg2[d] = (deg2[d] || 0) + 1; });
+      const connected = all.filter(n => deg2[n.id]);
+      const isolated = all.filter(n => !deg2[n.id]);
+
+      // force sim over CONNECTED nodes only, then fit-to-viewport (no boundary clamp during
+      // the sim — clamping is what pinned everything to the border)
+      connected.forEach((n, i) => {
+        const a = i * 2.399963;                // golden-angle seeding: spread, deterministic
+        const r = 12 * Math.sqrt(i);
+        n.x = Math.cos(a) * r; n.y = Math.sin(a) * r; n.vx = 0; n.vy = 0;
+      });
+      const links = edges.map(e => [map.get(e[0]), map.get(e[1])]).filter(([a, b]) => deg2[a.id] && deg2[b.id]);
+      for (let tick = 0; tick < 300; tick++) {
+        const cool = 1 - tick / 320;
+        for (let i = 0; i < connected.length; i++) for (let j = i + 1; j < connected.length; j++) {
+          const a = connected[i], b = connected[j];
+          let dx = a.x - b.x, dy = a.y - b.y, d2 = Math.max(64, dx*dx + dy*dy);
+          if (d2 > 40000) continue;            // repulsion is local: lets clusters separate
+          const f = 900 / d2 * cool;
+          a.vx += dx * f; a.vy += dy * f; b.vx -= dx * f; b.vy -= dy * f;
+        }
+        links.forEach(([a, b]) => {
+          let dx = b.x - a.x, dy = b.y - a.y, d = Math.max(1, Math.hypot(dx, dy)), f = (d - 60) * .04 * cool;
+          a.vx += dx / d * f; a.vy += dy / d * f; b.vx -= dx / d * f; b.vy -= dy / d * f;
+        });
+        connected.forEach(n => {
+          n.vx -= n.x * .004 * cool; n.vy -= n.y * .004 * cool;   // gentle centering, no walls
+          n.x += n.vx; n.y += n.vy; n.vx *= .78; n.vy *= .78;
+        });
+      }
+      if (connected.length) {                  // normalize the finished layout into the plot area
+        const xs = connected.map(n => n.x), ys = connected.map(n => n.y);
+        const minX = Math.min(...xs), maxX = Math.max(...xs), minY = Math.min(...ys), maxY = Math.max(...ys);
+        const pad = 34;
+        const sx = (width - 2*pad) / Math.max(1, maxX - minX), sy = (plotH - 2*pad) / Math.max(1, maxY - minY);
+        const s = Math.min(sx, sy);
+        connected.forEach(n => {
+          n.x = pad + (n.x - minX) * s + (width - 2*pad - (maxX - minX) * s) / 2;
+          n.y = pad + (n.y - minY) * s + (plotH - 2*pad - (maxY - minY) * s) / 2;
+        });
+      }
+      // isolated shelf: compact grid strip along the bottom, visually apart from the map
+      const perRow = Math.max(1, Math.floor((width - 130) / 22));
+      isolated.forEach((n, i) => {
+        n.x = 120 + (i % perRow) * 22;
+        n.y = plotH + 26 + Math.floor(i / perRow) * 20;
+      });
+
+      const divider = document.createElementNS("http://www.w3.org/2000/svg", "line");
+      divider.setAttribute("x1", 0); divider.setAttribute("y1", plotH);
+      divider.setAttribute("x2", width); divider.setAttribute("y2", plotH);
+      divider.setAttribute("class", "shelf-divider"); svg.appendChild(divider);
+      const shelfLabel = document.createElementNS("http://www.w3.org/2000/svg", "text");
+      shelfLabel.setAttribute("x", 12); shelfLabel.setAttribute("y", plotH + 30);
+      shelfLabel.setAttribute("class", "shelf-label");
+      shelfLabel.textContent = `ISOLATED (${isolated.length})`; svg.appendChild(shelfLabel);
+
+      links.forEach(([a, b]) => {
+        const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+        line.setAttribute("x1", a.x); line.setAttribute("y1", a.y);
+        line.setAttribute("x2", b.x); line.setAttribute("y2", b.y);
+        svg.appendChild(line);
+        state.gfx.lines.push({el: line, a: a.id, b: b.id});
+      });
+      all.forEach(n => {
+        const c = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+        const iso = !deg2[n.id];
+        c.setAttribute("cx", n.x); c.setAttribute("cy", n.y);
+        c.setAttribute("r", iso ? 5 : 6 + Math.min(16, (n.in_degree || 0) * 3));
+        c.setAttribute("class", "kind-" + (KINDS.has(n.kind) ? n.kind : "note") + (iso ? " iso" : ""));
+        c.addEventListener("click", () => selectNode(map.get(n.id)));
+        svg.appendChild(c);
+        state.gfx.circles.set(n.id, c);
+      });
+      highlightSelection();
+    }
+    function highlightSelection() {
+      if (!state.gfx) return;
+      const sel = state.gfx.circles.has(state.selected) ? state.selected : null;
+      const neighbours = new Set();
+      state.gfx.lines.forEach(({el, a, b}) => {
+        const active = sel && (a === sel || b === sel);
+        el.classList.toggle("edge-active", !!active);
+        if (active) { neighbours.add(a); neighbours.add(b); }
+      });
+      state.gfx.circles.forEach((el, id) => {
+        el.classList.toggle("selected", id === sel);
+        el.classList.toggle("dim", !!sel && id !== sel && !neighbours.has(id));
+      });
+    }
+    function applyView() {
+      const v = state.view;
+      if (v) byId("graph").setAttribute("viewBox", `${v.x} ${v.y} ${v.w} ${v.h}`);
+    }
+    let dragState = null, suppressClick = false;
+    function initPanZoom() {
+      const svg = byId("graph");
+      svg.addEventListener("wheel", e => {
+        const v = state.view; if (!v) return;
+        e.preventDefault();
+        const rect = svg.getBoundingClientRect();
+        const px = v.x + (e.clientX - rect.left) / rect.width * v.w;
+        const py = v.y + (e.clientY - rect.top) / rect.height * v.h;
+        const f = e.deltaY > 0 ? 1.15 : 1 / 1.15;
+        const w = Math.min(v.w0 * 4, Math.max(v.w0 / 16, v.w * f));
+        const h = w * v.h0 / v.w0;
+        v.x = px - (px - v.x) * (w / v.w);
+        v.y = py - (py - v.y) * (h / v.h);
+        v.w = w; v.h = h;
+        applyView();
+      }, {passive: false});
+      svg.addEventListener("pointerdown", e => {
+        if (!state.view) return;
+        dragState = {sx: e.clientX, sy: e.clientY, vx: state.view.x, vy: state.view.y, moved: false};
+      });
+      window.addEventListener("pointermove", e => {
+        const v = state.view; if (!dragState || !v) return;
+        if (Math.abs(e.clientX - dragState.sx) + Math.abs(e.clientY - dragState.sy) > 4) dragState.moved = true;
+        if (!dragState.moved) return;
+        const rect = svg.getBoundingClientRect();
+        v.x = dragState.vx - (e.clientX - dragState.sx) / rect.width * v.w;
+        v.y = dragState.vy - (e.clientY - dragState.sy) / rect.height * v.h;
+        applyView();
+      });
+      window.addEventListener("pointerup", () => {
+        if (dragState && dragState.moved) suppressClick = true;
+        dragState = null;
+      });
+      svg.addEventListener("click", e => {
+        if (suppressClick) { e.stopPropagation(); suppressClick = false; }
+      }, true);
+      svg.addEventListener("dblclick", () => {
+        const v = state.view; if (!v) return;
+        v.x = 0; v.y = 0; v.w = v.w0; v.h = v.h0;
+        applyView();
+      });
+    }
+    initPanZoom();
+    function escapeHtml(value) { return String(value).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+    function escapeAttr(value) { return escapeHtml(String(value).replace(/\\/g, "\\\\").replace(/'/g, "\\'")); }
+    async function load() {
+      const response = await fetch("/journey/graph.json", {credentials: "same-origin"});
+      if (!response.ok) throw new Error("snapshot unavailable");
+      state.snapshot = await response.json();
+      renderCounts(state.snapshot); renderFilters(state.snapshot.nodes); renderRows(); renderGraph();
+    }
+    ["q","kind","tag","isolated"].forEach(id => byId(id).addEventListener("input", renderRows));
+    load().catch(err => { byId("detail").innerHTML = `<p class="hint">${escapeHtml(err.message)}</p>`; });
+  </script>
+</body>
+</html>

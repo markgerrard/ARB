@@ -1,0 +1,158 @@
+[
+  {
+    "component": "skills/bridge-protocol/gate/gate.py",
+    "layer": "adapter",
+    "costly_dimensions": ["interface", "filesystem"],
+    "dimensions_considered_and_excluded": [],
+    "production_component": "skills/bridge-protocol/gate/gate.py",
+    "dimension_preserving_tests": {
+      "interface": "tests/test_bridge_protocol_gate.py::test_default_evaluate_uses_real_diff_for_manifest_miss_and_faithful_twin",
+      "filesystem": "tests/test_bridge_protocol_gate.py::test_default_evaluate_missing_required_artifacts_fail_closed"
+    },
+    "dimension_evidence": {
+      "interface": "real evaluate() default-path call over a temp git repo with the on-disk manifest, registry, readiness, stage modes, and trust root loaded by the gate",
+      "filesystem": "real on-disk artifact reads plus real git diff; missing committed artifacts block instead of being supplied by injected inputs"
+    },
+    "fake_tests_allowed_for": ["isolated unit checks with explicit artifact overrides"]
+  },
+  {
+    "component": "skills/bridge-protocol/gate/h2_collector.py",
+    "layer": "adapter",
+    "costly_dimensions": ["interface", "filesystem"],
+    "dimensions_considered_and_excluded": [],
+    "production_component": "skills/bridge-protocol/gate/h2_collector.py",
+    "dimension_preserving_tests": {
+      "interface": "tests/defect_hunts/test_h2_collector.py::test_log_path_is_outside_repo_tree",
+      "filesystem": "tests/defect_hunts/test_h2_collector.py::test_append_is_append_only"
+    },
+    "dimension_evidence": {
+      "interface": "real gate-produced H2 record is appended through h2_collector.append_record to an explicit out-of-repo shadow log path without dirtying the repo",
+      "filesystem": "real JSONL writes append two records to the same on-disk log and preserve order instead of overwriting the existing line"
+    },
+    "fake_tests_allowed_for": ["pure path-selection and payload-shape unit checks that do not certify append behavior"]
+  },
+  {
+    "component": "src/arb_files/store.py",
+    "layer": "storage-adapter",
+    "costly_dimensions": ["interface", "backend"],
+    "dimensions_considered_and_excluded": [],
+    "production_component": "src/arb_files/store.py",
+    "dimension_preserving_tests": {
+      "interface": "tests/arb_files/test_store_force_race.py::test_force_paths_use_same_unquoted_if_match",
+      "backend": "tests/arb_files/e2e_spaces_force.py::test_force_overwrite_real_spaces"
+    },
+    "dimension_evidence": {
+      "interface": "direct PUT kwargs, presign Params, and returned If-Match headers are pinned to the same exact unquoted opaque ETag while invalid values fail before side effects",
+      "backend": "the exact function invoked by main() runs create, direct force, presigned force, stale replay, and wrong-token cells against real Spaces and requires 2xx/412 outcomes plus zero cleanup residue"
+    },
+    "fake_tests_allowed_for": ["pure serializer, invalid-value ordering, and exact request-shape checks; fakes do not certify Spaces behavior"]
+  },
+  {
+    "component": "skills/_diagnose_common/canonical.py",
+    "layer": "diagnose-common",
+    "costly_dimensions": ["byte-form-determinism", "neutrality"],
+    "dimensions_considered_and_excluded": [],
+    "production_component": "skills/_diagnose_common/canonical.py",
+    "dimension_preserving_tests": {
+      "byte-form-determinism": "tests/test_diagnose_common.py::test_canonical_bytes_env_invariant",
+      "neutrality": "tests/test_diagnose_common.py::test_c0_neutrality_guard_scans_all_common_modules"
+    },
+    "dimension_evidence": {
+      "byte-form-determinism": "real canonical byte-form test proves key order is environment-invariant and seals match the canonical bytes",
+      "neutrality": "real _diagnose_common Python source files are read from disk and AST-scanned for steer data access, steer block tokens, and forbidden dispatch/steer imports"
+    },
+    "fake_tests_allowed_for": ["schema-shape and small pure-function unit checks that do not certify costly dimensions"]
+  },
+  {
+    "component": "skills/_diagnose_common/*.py",
+    "layer": "diagnose-common",
+    "costly_dimensions": ["dispatch-log-integrity", "neutrality"],
+    "dimensions_considered_and_excluded": [],
+    "production_component": "skills/_diagnose_common/*.py",
+    "dimension_preserving_tests": {
+      "dispatch-log-integrity": "tests/test_diagnose_common.py::test_dispatch_log_reorder_forgery_is_detected",
+      "neutrality": "tests/test_diagnose_common.py::test_c0_neutrality_guard_scans_all_common_modules"
+    },
+    "dimension_evidence": {
+      "dispatch-log-integrity": "real on-disk dispatch_log.jsonl is appended through _diagnose_common.clock, then reordered on disk and rejected by validate_dispatch_log via hash-chain detection",
+      "neutrality": "real _diagnose_common Python source files are read from disk and AST-scanned for steer data access, steer block tokens, and forbidden dispatch/steer imports"
+    },
+    "fake_tests_allowed_for": ["schema-shape and small pure-function unit checks that do not certify costly dimensions"]
+  },
+  {
+    "component": "skills/diagnose/containment.py",
+    "layer": "diagnose-skill",
+    "costly_dimensions": ["integrated-run", "test-containment"],
+    "dimensions_considered_and_excluded": [],
+    "production_component": "skills/diagnose/containment.py",
+    "dimension_preserving_tests": {
+      "integrated-run": "tests/test_diagnose.py::test_d1_scope_derives_from_recorded_traceback_and_live_run_passes",
+      "test-containment": "tests/test_diagnose_containment.py::test_hanging_test_and_children_reaped"
+    },
+    "dimension_evidence": {
+      "integrated-run": "real temporary git fixture runs diagnose through containment-backed traceback recording, derive_scope, extraction, and live-panel-shaped validation",
+      "test-containment": "real contained subprocess attempts to hang with a child process; run_contained times out and the child process is reaped"
+    },
+    "fake_tests_allowed_for": ["input schema unit checks and explicit harness-only marker checks"]
+  },
+  {
+    "component": "skills/diagnose/briefs.py",
+    "layer": "diagnose-skill",
+    "costly_dimensions": ["integrated-run"],
+    "dimensions_considered_and_excluded": [],
+    "production_component": "skills/diagnose/briefs.py",
+    "dimension_preserving_tests": {
+      "integrated-run": "tests/test_diagnose.py::test_run_diagnose_authors_live_panel_artifacts_and_recompute_basis"
+    },
+    "dimension_evidence": {
+      "integrated-run": "real temporary git fixtures run diagnose twice through brief authoring and post-brief recomputation, proving sealed pre/post artifacts and recompute-basis fields are produced by the live path"
+    },
+    "fake_tests_allowed_for": ["input schema unit checks and explicit harness-only marker checks"]
+  },
+  {
+    "component": "skills/diagnose/panel.py",
+    "layer": "diagnose-skill",
+    "costly_dimensions": ["integrated-run"],
+    "dimensions_considered_and_excluded": [],
+    "production_component": "skills/diagnose/panel.py",
+    "dimension_preserving_tests": {
+      "integrated-run": "tests/test_diagnose.py::test_run_panel_records_bus_reply_consistency_and_writes_outside_repo"
+    },
+    "dimension_evidence": {
+      "integrated-run": "real run_panel invocation over a temporary work directory dispatches sealed briefs, records bus_reply_sha256 anchors, writes replies outside the repo, and verifies reply contents"
+    },
+    "fake_tests_allowed_for": ["input schema unit checks and explicit harness-only marker checks"]
+  },
+  {
+    "component": "skills/diagnose/*.py",
+    "layer": "diagnose-skill",
+    "costly_dimensions": ["integrated-run"],
+    "dimensions_considered_and_excluded": [],
+    "production_component": "skills/diagnose/*.py",
+    "dimension_preserving_tests": {
+      "integrated-run": "tests/test_diagnose.py::test_evaluate_run_record_uses_real_dispatch_log_not_hand_built_fixture"
+    },
+    "dimension_evidence": {
+      "integrated-run": "test builds a real temporary git fixture, runs diagnose through derive_scope -> extract over real files -> validate_run_record with a clock-produced dispatch_log_ref, then mutates the dispatch ref to prove a hand-fed/missing fixture fails closed"
+    },
+    "fake_tests_allowed_for": ["input schema unit checks and explicit harness-only marker checks"]
+  },
+  {
+    "component": "skills/diagnose-steer/*.py",
+    "layer": "diagnose-steer-skill",
+    "costly_dimensions": ["integrated-run", "temporal-barrier", "confidence-correctness"],
+    "dimensions_considered_and_excluded": [],
+    "production_component": "skills/diagnose-steer/*.py",
+    "dimension_preserving_tests": {
+      "integrated-run": "tests/test_diagnose_steer.py::test_s1_steer_in_observation_channel_blocks_and_clean_twin_passes",
+      "temporal-barrier": "tests/test_diagnose_steer.py::test_s2_rejects_seat_supplied_prev_hash_and_detects_reorder_forgery",
+      "confidence-correctness": "tests/test_diagnose_steer.py::test_s3_confidence_both_properties"
+    },
+    "dimension_evidence": {
+      "integrated-run": "matched-pair control fires from a real run_diagnose_steer over a real git fixture (derive_scope -> extract -> staged dispatch -> validate_steer_run_record), each record carrying a clock-produced dispatch_log_ref; not a unit call on a hand-built record",
+      "temporal-barrier": "real append-only dispatch_log: a seat-supplied prev_hash is rejected and a reordered/rewritten log is caught by the hash chain end-to-end (not just duplicate-seq)",
+      "confidence-correctness": "real end-to-end run: certified file_line predicates are grouped by distinct hypothesis_b alternatives, capped per alternative, and combined with noisy-OR; same-alternative padding cannot raise Q while an additional distinct alternative does"
+    },
+    "fake_tests_allowed_for": ["citation-format unit checks and explicit harness-only marker checks"]
+  }
+]

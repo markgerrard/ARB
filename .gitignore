@@ -1,0 +1,105 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+uv.lock
+build/
+dist/
+
+# Environments
+.env
+.env.*
+!.env.example
+!.env.*.example
+.venv/
+venv/
+# Also ignore the SYMLINK form. A trailing slash matches directories only,
+# so `.venv/` did not stop a `.venv -> /abs/path` symlink being committed
+# (d6323248). That symlink pointed at one developer's Mac, was absent on
+# dev, and aborted a merge into a fresh worktree by colliding with the
+# local venv the worktree-mirror creates.
+.venv
+env/
+envs/*.env
+
+# Task / planning scratch
+tasks/
+
+# Per-seat runtime env files for templated systemd services (contain API keys)
+run/
+
+# Git worktrees created for dispatched-agent isolation
+.claude/worktrees/
+
+# Session handoff documents (working state, not project history)
+.claude/handoffs/
+.claude/session-checkpoints.md
+
+# FABA bridge-mode local lease recovery, exclusivity, and forensics state
+.claude/faba-bridge-leases.json*
+.claude/faba-locks/
+.claude/faba-forensics/
+
+# Per-round orchestration scaffolding: panel/dispatch driver scripts, minted
+# run-ids, and captured dispatch output. Transient by design — the durable
+# record is the committed reports, the run log, and the audit stream in
+# Postgres. Salvage anything that is a sole copy BEFORE deleting these.
+.claude/slice*-*.sh
+.claude/slice*.rid
+.claude/slice*-*.rid
+.claude/slice*-r[0-9]/
+.claude/slice*-impl/
+
+# IDE
+.idea/
+.vscode/
+
+# macOS Finder metadata
+.DS_Store
+
+# Playwright MCP scratch (browser-session artifacts, never project content)
+.playwright-mcp/
+
+# Logs / state
+*.log
+.local/
+
+# Redis dump (created when a local redis-server persists against this workdir)
+dump.rdb
+
+# pi-sdk-host: symlinks to globally-installed pi-coding-agent
+tools/pi-sdk-host/node_modules/
+
+# Go build artifact — build locally, do not commit
+tools/arb-watch-go/arb-watch-go
+
+# SQLite WAL sidecars generated when the test suite opens committed fixture DBs
+# (the canonical fixture is the .db itself; sidecars are transient per test run)
+tests/fixtures/*.db-shm
+tests/fixtures/*.db-wal
+
+# Go client-edge build artifact (auto-built by scripts/dispatch-dev)
+tools/go-client/go-client
+
+# Editor/edit backups
+*.bak-orig
+
+# Graphify code-graph output (generated nightly; per-host, never committed)
+graphify-out/
+.claude/plist-backups/
+.claude/worktrees-archive/
+
+# Claude Design handoff bundle (unrelated to the bridge; kept locally)
+design/
+/~/
+
+# dsh: host-local symlink to the deepseek-harness node_modules, created by the
+# seat setup so cordis can resolve plugin specifiers next to our composition.
+configs/dsh/node_modules
+
+# per-host worktree/branch prune audit scratch (evidence kept locally, not published)
+.claude/worktree-prune-*/

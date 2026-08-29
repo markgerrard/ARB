@@ -1,0 +1,31 @@
+# ARB Memory + Visibility docker-compose stack — boot autostart unit.
+#
+# Installed on the PROD host (arb-prod, host `arb-memory`) at
+# /etc/systemd/system/arb-memory-stack.service. Layers on top of the containers'
+# own `restart: unless-stopped`: Docker restarts individual containers on
+# crash/reboot; this unit makes systemd the declarative boot authority for the
+# whole stack (reconciles any left-stopped container to the compose file on boot,
+# and gives you `systemctl start/stop arb-memory-stack`).
+#
+# HOST-SPECIFIC: WorkingDirectory is the prod checkout path. Adjust per host.
+# Runs as the unprivileged `claude` user (must be in the `docker` group).
+
+[Unit]
+Description=ARB Memory + Visibility docker-compose stack
+Documentation=https://arb-visibility.example.com
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=claude
+SupplementaryGroups=docker
+WorkingDirectory=/home/claude/AgentRedisBridge
+ExecStart=/usr/bin/docker compose -f deploy/docker-compose.yml up -d
+ExecStop=/usr/bin/docker compose -f deploy/docker-compose.yml stop
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target

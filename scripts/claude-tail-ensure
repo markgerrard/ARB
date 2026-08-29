@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+# claude-tail-ensure — make sure the claude-tail daemon is running, then get out of the way.
+#
+# Called from the global SessionStart hook so that starting a Claude Code session on a host where
+# the tee daemon isn't up yet bootstraps it (first-run-on-a-new-host). The common case — daemon
+# already running — short-circuits in milliseconds. Everything here is FAIL-SOFT: any problem logs
+# to stderr and exits 0, so a session never breaks because the tee couldn't start.
+#
+# Supports macOS (launchd) and Linux/systemd-user. Assumptions on a fresh host:
+#   - The bridge clone (with .venv + scripts/claude-tail-daemon) is at this script's repo root.
+#   - The daemon's env file (envs/agent-redis-bridge-dev.env, gitignored — carries the Valkey URLs)
+#     already exists. Secrets are NOT provisioned here; if venv/env is missing we log and skip.
+#   - The local control-bus Redis (127.0.0.1:6379/12) is reachable on the host.
+set -u
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+DAEMON="${REPO}/scripts/claude-tail-daemon"
+VENV_PY="${REPO}/.venv/bin/python"
+ENV_FILE="${REPO}/envs/agent-redis-bridge-dev.env"
+log() { printf '[claude-tail-ensure] %s\n' "$*" >&2; }
+runnable() { [ -x "$VENV_PY" ] && [ -f "$DAEMON" ]; }
+
+# 1. Fast short-circuit: a daemon process is already tailing (works on macOS + Linux).
+if pgrep -f "scripts/claude-tail-daemon" >/dev/null 2>&1; then
+  exit 0
+fi
+
+setup_macos() {
+  local label="com.example.claude-tail.auto"
+  local plist="$HOME/Library/LaunchAgents/${label}.plist"
+  local existing
+  existing="$(ls "$HOME/Library/LaunchAgents/"com.example.claude-tail.*.plist 2>/dev/null | head -1 || true)"
+  if [ -n "${existing:-}" ]; then
+    local lbl; lbl="$(basename "$existing" .plist)"
+    launchctl bootstrap "gui/$(id -u)" "$existing" 2>/dev/null || true
+    launchctl kickstart -k "gui/$(id -u)/${lbl}" 2>/dev/null || true
+    log "kickstarted existing daemon ${lbl}"; return
+  fi
+  if ! runnable; then log "no plist and repo not runnable ($VENV_PY / $DAEMON); skipping"; return; fi
+  if [ ! -f "$ENV_FILE" ]; then log "no plist and env file $ENV_FILE missing; place it, then restart the session"; return; fi
+  mkdir -p "$HOME/Library/LaunchAgents"
+  cat > "$plist" <<PLIST_EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>AGENT_ENV_FILE</key><string>${ENV_FILE}</string>
+		<key>ARB_CLAUDE_TAIL_HEARTBEAT_LABEL</key><string>claude-tail.auto</string>
+		<key>ARB_CLAUDE_TAIL_INTERVAL_SECS</key><string>1.0</string>
+		<key>HOME</key><string>${HOME}</string>
+		<key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+	</dict>
+	<key>KeepAlive</key><true/>
+	<key>Label</key><string>${label}</string>
+	<key>ProgramArguments</key><array><string>${VENV_PY}</string><string>${DAEMON}</string></array>
+	<key>RunAtLoad</key><true/>
+	<key>StandardErrorPath</key><string>/tmp/${label}.launchd.err</string>
+	<key>StandardOutPath</key><string>/tmp/${label}.launchd.log</string>
+	<key>ThrottleInterval</key><integer>10</integer>
+</dict>
+</plist>
+PLIST_EOF
+  launchctl bootstrap "gui/$(id -u)" "$plist" 2>/dev/null || true
+  launchctl kickstart -k "gui/$(id -u)/${label}" 2>/dev/null || true
+  log "first-run: generated + bootstrapped ${label}"
+}
+
+setup_linux() {
+  local unit="$HOME/.config/systemd/user/claude-tail-auto.service"
+  if ! command -v systemctl >/dev/null 2>&1; then log "no systemctl; start the daemon manually on this host"; return; fi
+  if ! runnable; then log "repo not runnable ($VENV_PY / $DAEMON); skipping"; return; fi
+  if [ ! -f "$ENV_FILE" ]; then log "env file $ENV_FILE missing; place it, then restart the session"; return; fi
+  mkdir -p "$HOME/.config/systemd/user"
+  if [ ! -f "$unit" ]; then
+    cat > "$unit" <<UNIT_EOF
+[Unit]
+Description=Claude-tail transcript daemon (auto)
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=${REPO}
+Environment=AGENT_ENV_FILE=${ENV_FILE}
+Environment=ARB_CLAUDE_TAIL_HEARTBEAT_LABEL=claude-tail.auto
+Environment=ARB_CLAUDE_TAIL_INTERVAL_SECS=1.0
+ExecStart=${VENV_PY} ${DAEMON}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+UNIT_EOF
+    log "first-run: generated ${unit}"
+  fi
+  systemctl --user daemon-reload 2>/dev/null || true
+  systemctl --user enable --now claude-tail-auto.service 2>/dev/null || true
+  # Linger lets the --user service survive after logout. May need a one-time `sudo loginctl
+  # enable-linger $USER` if unprivileged; failure here is non-fatal (service still runs while
+  # the session is active).
+  loginctl enable-linger "$USER" 2>/dev/null || true
+  log "systemd user service claude-tail-auto ensured (run 'sudo loginctl enable-linger $USER' once if it must survive logout)"
+}
+
+case "$(uname -s)" in
+  Darwin) setup_macos ;;
+  Linux)  setup_linux ;;
+  *)      log "daemon not running; auto-setup unsupported on $(uname -s)" ;;
+esac
+exit 0

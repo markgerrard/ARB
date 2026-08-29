@@ -1,0 +1,4 @@
+#!/usr/bin/env python3
+from arb_registration.bus_approval_cli import main
+
+main()

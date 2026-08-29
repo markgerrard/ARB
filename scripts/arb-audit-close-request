@@ -1,0 +1,91 @@
+#!/usr/bin/env python3
+"""Request a reconcile-gated audit verdict close over the ARB Memory bus."""
+
+import argparse
+import json
+import math
+import os
+import sys
+import uuid
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+
+from arb_memory.audit import resolve_audit_env  # noqa: E402
+from arb_memory.close import close_request_stream, close_result_key  # noqa: E402
+
+
+def _read_payload(payload_file):
+    try:
+        if payload_file == "-":
+            raw = sys.stdin.read()
+        else:
+            with open(payload_file, encoding="utf-8") as payload_stream:
+                raw = payload_stream.read()
+        payload = json.loads(raw)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        print(f"arb-audit-close-request: payload is not valid JSON: {exc}", file=sys.stderr)
+        return None
+    if not isinstance(payload, dict):
+        print("arb-audit-close-request: payload must be a JSON object", file=sys.stderr)
+        return None
+    return payload
+
+
+def main(argv=None, *, redis_factory=None):
+    parser = argparse.ArgumentParser(prog="arb-audit-close-request")
+    parser.add_argument("--run-id", required=True)
+    parser.add_argument("--payload-file", required=True)
+    parser.add_argument("--timeout", type=float, default=90)
+    parser.add_argument("--requested-by", default=os.environ.get("ARB_AUDIT_REQUESTED_BY", "orchestrator"))
+    args = parser.parse_args(argv)
+
+    payload = _read_payload(args.payload_file)
+    if payload is None:
+        return 2
+
+    # ARB_AUDIT_* wins over ARB_MEMORY_*, matching bridge.resolve_audit_redis and the sibling
+    # audit CLIs. a79f14bf fixed arb-audit-emit and arb-panel-vote and missed this script, so on
+    # a role-split bus the close request was filed with the MEMORY credential against the AUDIT
+    # namespace — invisible while one shared user did both planes, a hard NOPERM once split.
+    url, prefix = resolve_audit_env()
+    if redis_factory is not None:
+        redis = redis_factory()
+    else:
+        import redis as redis_module
+
+        if not url:
+            print("ARB_AUDIT_REDIS_URL or ARB_MEMORY_REDIS_URL required", file=sys.stderr)
+            return 2
+        redis = redis_module.from_url(url, decode_responses=True)
+
+    request_id = uuid.uuid4().hex
+    redis.xadd(
+        close_request_stream(prefix),
+        {
+            "request_id": request_id,
+            "run_id": args.run_id,
+            "verdict": json.dumps(payload, separators=(",", ":")),
+            "requested_by": args.requested_by,
+        },
+    )
+    response = redis.blpop(
+        close_result_key(request_id, prefix=prefix),
+        timeout=max(1, math.ceil(args.timeout)),
+    )
+    if response is None:
+        print("arb-audit-close-request: no close-consumer response", file=sys.stderr)
+        return 7
+
+    try:
+        result = json.loads(response[1])
+        exit_code = int(result["exit_code"])
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        print(f"arb-audit-close-request: invalid close-consumer response: {exc}", file=sys.stderr)
+        return 7
+
+    print(json.dumps({"outcome": result.get("outcome"), "gaps": result.get("gaps", [])}, sort_keys=True))
+    return exit_code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

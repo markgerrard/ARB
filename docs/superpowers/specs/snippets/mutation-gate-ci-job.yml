@@ -1,0 +1,18 @@
+# Owner-gated snippet: enabling a workflow remains owner-executed.
+jobs:
+  changed-test-mutation-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: uv sync --all-extras
+      - name: Gate changed tests
+        env:
+          BASE: ${{ github.event.pull_request.base.ref }}
+        run: |
+          git branch "$BASE" "origin/$BASE" || true
+          expected="$(git show "${BASE}:scripts/changed_test_mutation_gate.py.sha256" | awk 'NF {pin=$NF} END {print pin}')"
+          actual="$(shasum -a 256 scripts/changed_test_mutation_gate.py | awk '{print $1}')"
+          test -n "$expected" && test "$expected" = "$actual"
+          .venv/bin/python scripts/changed_test_mutation_gate.py --base "$BASE" --json /tmp/mutation-gate-summary.json

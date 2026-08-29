@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+# verify-bridge-supervision — prove the systemd supervision actually RESTARTS a
+# bridge instance after BOTH a hard SIGKILL and a clean SIGTERM, with a FRESH
+# heartbeat from the new process.
+#
+# Why this ships: `Restart=always` is the policy that makes the bridge survive a
+# crash, but a unit can *look* supervised (enabled, running, survives reboot) while
+# silently having `Restart=no` or a policy that only covers some exit causes — you
+# only discover the gap during a real incident. The "kill it two ways and confirm
+# respawn" check is what proves the policy is real. This ships that verification so a
+# fresh host can run it after install, instead of trusting the unit by inspection.
+#
+# The subtle case it guards: `systemctl kill -s TERM` makes the process exit cleanly
+# (not a crash, not an intentional `stop`). `Restart=always` must still respawn it;
+# `Restart=on-failure` would NOT (clean exit is "success"). So a green SIGKILL test
+# alone is insufficient — both signals must be checked.
+#
+# It proves a FRESH heartbeat, not a stale one: after SIGKILL the dead process can't
+# clean up Redis, so its `agent:<id>:status` key (TTL-based) lingers until expiry. A
+# liveness check on TTL alone could pass off the OLD process's leftover heartbeat. The
+# bridge writes `status = "alive:<boot-token>"` and stores that token beside the
+# process PID in the registry. We require registry PID == NEW MainPID, status token
+# == registry token, and token != the prior boot — only a fresh registration from
+# the respawned process satisfies all three.
+#
+# Usage:
+#   verify-bridge-supervision <instance-agent-id> [--timeout SECS] [--unit-prefix NAME]
+#     <instance-agent-id>   e.g. codex-project-g-laravel-dev  ->  unit agent-bridge@<id>
+#     --timeout SECS        max wait for respawn + fresh heartbeat per signal (default 150)
+#     --unit-prefix NAME    systemd template prefix (default: agent-bridge)
+#
+# Run as the user that owns the `--user` units. The Redis connection (for the
+# status-pid check) is read from the unit's EnvironmentFile via `systemctl show`, so
+# the script is host-portable — no hardcoded paths.
+#
+# Note: each run causes 2 restarts. The unit's StartLimitBurst (default 5/60s) means
+# you can run it a couple of times back-to-back, but not in a tight loop, or systemd
+# rate-limits the restarts and the check (correctly) reports FAIL. On FAIL the script
+# attempts to bring the unit back up so the test itself never leaves the bridge down.
+#
+# Why the default timeout is generous (150s): the SIGKILL leg respawns fast (~RestartSec),
+# but the SIGTERM leg waits for a GRACEFUL shutdown first — and an engine with heavy
+# children (e.g. the codex app-server + its node/git subprocesses) can take ~30s to exit
+# cleanly before systemd's RestartSec + startup. Measured ~35s SIGTERM->respawn on a real
+# codex bridge; a 30s timeout false-FAILs a perfectly-supervised unit. Keep the timeout
+# comfortably above the unit's TimeoutStopSec + RestartSec + engine startup.
+set -euo pipefail
+
+# Must clear the worst-case SIGKILL leg with headroom: a just-refreshed stale lease
+# (up to the full 60s heartbeat TTL) + RestartSec + interpreter startup + (agent-sdk
+# seats) engine start before register. 90 was exactly equal to the default
+# identity-claim budget (TTL 60 + interval 30) — zero headroom.
+TIMEOUT=150
+UNIT_PREFIX=agent-bridge
+INSTANCE=
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --timeout) TIMEOUT=${2:?--timeout requires seconds}; shift 2 ;;
+    --unit-prefix) UNIT_PREFIX=${2:?--unit-prefix requires a name}; shift 2 ;;
+    -h|--help) sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -*) echo "unknown flag: $1" >&2; exit 2 ;;
+    *) INSTANCE=$1; shift ;;
+  esac
+done
+
+if [ -z "$INSTANCE" ]; then
+  echo "usage: verify-bridge-supervision <instance-agent-id> [--timeout SECS] [--unit-prefix NAME]" >&2
+  exit 2
+fi
+
+UNIT="${UNIT_PREFIX}@${INSTANCE}"
+
+# Resolve the instance's EnvironmentFile from systemd (portable). The
+# `systemctl show` value looks like "/path/to/instance.env (ignore_errors=no)".
+ENVLINE=$(systemctl --user show -p EnvironmentFiles --value "$UNIT" 2>/dev/null || true)
+ENVFILE=${ENVLINE%% (*}
+
+geti() {
+  [ -r "$1" ] || return 0
+  awk -F= -v k="$2" '$1==k { sub(/^[^=]*=/,""); gsub(/^"|"$/,""); print; exit }' "$1" 2>/dev/null || true
+}
+
+# The instance env points AGENT_ENV_FILE at the shared bus env (Redis creds live there).
+PING_ENV=$(geti "$ENVFILE" AGENT_ENV_FILE)
+if [ -z "$PING_ENV" ] || [ ! -r "$PING_ENV" ]; then
+  echo "[FAIL] could not resolve the bus env from the unit's EnvironmentFile ($ENVFILE) — is '$UNIT' installed?" >&2
+  exit 2
+fi
+
+R_HOST=$(geti "$PING_ENV" AGENT_REDIS_HOST)
+R_PORT=$(geti "$PING_ENV" AGENT_REDIS_PORT)
+R_DB=$(geti "$PING_ENV" AGENT_REDIS_DB)
+R_PREFIX=$(geti "$PING_ENV" AGENT_REDIS_PREFIX)
+R_USER=$(geti "$PING_ENV" AGENT_REDIS_USER)
+R_TLS=$(geti "$PING_ENV" AGENT_REDIS_TLS)
+R_PASS=$(geti "$PING_ENV" AGENT_REDIS_PASSWORD)
+if [ -z "$R_HOST" ] || [ -z "$R_PORT" ]; then
+  echo "[FAIL] could not resolve Redis host/port from $PING_ENV (AGENT_REDIS_HOST/PORT)" >&2
+  exit 2
+fi
+
+REDIS_FLAGS=(-h "$R_HOST" -p "$R_PORT" -n "${R_DB:-0}" --no-auth-warning)
+case "${R_TLS:-0}" in 1|true|True|yes) REDIS_FLAGS+=(--tls) ;; esac
+[ -n "$R_USER" ] && REDIS_FLAGS+=(--user "$R_USER")
+[ -n "$R_PASS" ] && export REDISCLI_AUTH="$R_PASS"
+STATUS_KEY="${R_PREFIX}agent:${INSTANCE}:status"
+REGISTRY_KEY="${R_PREFIX}registry:${INSTANCE}"
+
+mainpid() { systemctl --user show -p MainPID --value "$UNIT" 2>/dev/null || echo 0; }
+is_active() { [ "$(systemctl --user is-active "$UNIT" 2>/dev/null || true)" = active ]; }
+registry_pid() { redis-cli "${REDIS_FLAGS[@]}" HGET "$REGISTRY_KEY" pid 2>/dev/null || true; }
+registry_owner() {
+  local token
+  token=$(redis-cli "${REDIS_FLAGS[@]}" HGET "$REGISTRY_KEY" owner_token 2>/dev/null || true)
+  # Rolling compatibility for pre-token bridge registrations.
+  [ -n "$token" ] || token=$(registry_pid)
+  printf '%s' "$token"
+}
+status_owner() {
+  local value
+  value=$(redis-cli "${REDIS_FLAGS[@]}" GET "$STATUS_KEY" 2>/dev/null || true)
+  printf '%s' "${value#alive:}"
+}
+fresh_for_pid() {
+  local expected_pid=$1 token
+  token=$(registry_owner)
+  [ -n "$token" ] && [ "$(registry_pid)" = "$expected_pid" ] && [ "$(status_owner)" = "$token" ]
+}
+
+echo "verify-bridge-supervision: $UNIT  (timeout=${TIMEOUT}s, bus=$R_HOST:$R_PORT)"
+
+if ! is_active; then
+  echo "  [FAIL] unit is not active to begin with — start it first (systemctl --user start $UNIT)"
+  exit 1
+fi
+base_pid=$(mainpid)
+base_owner=$(registry_owner)
+if ! fresh_for_pid "$base_pid"; then
+  echo "  [FAIL] baseline: registry/status ownership does not match running MainPID $base_pid — fix the bridge before testing supervision"
+  exit 1
+fi
+echo "  [ok]   baseline running + fresh heartbeat (pid=$base_pid owner=$base_owner)"
+
+overall=0
+verify_signal() {
+  local sig=$1 old_pid old_owner new_pid new_owner deadline
+  old_pid=$(mainpid)
+  old_owner=$(registry_owner)
+  echo "  -- SIG$sig -> killing MainPID $old_pid; expecting respawn + fresh heartbeat within ${TIMEOUT}s"
+  systemctl --user kill -s "$sig" "$UNIT" || true
+  deadline=$((SECONDS + TIMEOUT))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    new_pid=$(mainpid)
+    new_owner=$(registry_owner)
+    if is_active && [ "$new_pid" != "$old_pid" ] && [ "$new_pid" != 0 ] \
+      && [ "$new_owner" != "$old_owner" ] && fresh_for_pid "$new_pid"; then
+      echo "  [ok]   respawned after SIG$sig (new pid=$new_pid owner=$new_owner wrote a fresh heartbeat)"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "  [FAIL] no respawn + fresh heartbeat within ${TIMEOUT}s after SIG$sig"
+  echo "         (Restart=always must cover this signal; on-failure/no would NOT respawn a clean SIGTERM exit)"
+  return 1
+}
+
+verify_signal KILL || overall=1
+verify_signal TERM || overall=1
+
+if [ "$overall" = 0 ]; then
+  echo "verify-bridge-supervision: PASS — '$UNIT' restarts on BOTH SIGKILL and SIGTERM with a fresh heartbeat"
+else
+  echo "verify-bridge-supervision: FAIL — supervision did not fully recover (see above)"
+  # The test itself sent the kills; never leave the bridge down because of the check.
+  echo "  -- attempting manual recovery of '$UNIT' (clears any tripped StartLimit) ..."
+  systemctl --user reset-failed "$UNIT" 2>/dev/null || true
+  systemctl --user start "$UNIT" 2>/dev/null || true
+  sleep 2
+  if is_active; then
+    echo "  [ok]   '$UNIT' is back up (started manually — supervision is still suspect; fix Restart= in the unit)"
+  else
+    echo "  [WARN] '$UNIT' is STILL DOWN — recover manually: systemctl --user reset-failed $UNIT && systemctl --user start $UNIT"
+  fi
+fi
+exit "$overall"

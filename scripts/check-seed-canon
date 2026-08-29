@@ -1,0 +1,369 @@
+#!/usr/bin/env python3
+"""Check that agent-memory seeds cite the CURRENT version of their ARB Memory canonical.
+
+A seed is a downstream copy living in machine-wide global stores that interactive CLIs and
+orchestrators read unbidden. Its whole value rests on the canonical pointer being live — and a
+pointer decays silently, because nothing at read time verifies it. Live example this lint was
+written for: `arb-seat-roster.md` cited `arb-seat-scorecard` v1 for ~24h while the store was at
+v3, so every codex CLI session on the host was told a retired seat prior was current.
+
+Checks per citation:
+  * EXACT pin  (``ARB Memory `id` v3``)  -> FAIL if the store has moved past v3.
+  * content hash, when cited             -> FAIL if it does not match that version in the store.
+  * internal agreement                   -> FAIL if the same id is cited at two versions in one
+                                            file (the frontmatter/body split that hid the v1 drift).
+  * FLOOR pin  (``v13+``)                -> WARN: satisfiable forever, so it can never detect drift.
+  * UNPINNED   (id, no version)          -> WARN (FAIL under --strict).
+
+--check-stores extends all of the above to the LIVE agent-memory stores this host fans out into,
+because the corpus being right is not the same as any agent reading it. Measured 2026-07-24: the
+GLM read-only correction was already committed while the codex store still served the inverted
+prior, and both codex and pi cited scorecard v1 against a store at v3.
+
+What is comparable depends on how a store's copies relate to the corpus (see STORES):
+  * verbatim (codex)          -> byte-diff against the corpus; divergence FAILS. Genuine forks
+                                 are recorded with --allow-divergent so they stay visible.
+  * adapted (pi, claude)      -> byte-diff is meaningless (pi restructures deliberately), so only
+                                 the canonical pointers are checked — with the same rules.
+Stores that are absent or unconfigured are REPORTED, never silently skipped. This flag reads
+host state, so it is deliberately off by default and does not belong in a clean-checkout gate.
+
+Exit: 0 clean, 1 drift/mismatch, 2 usage or store-config error.
+Without ARB_MEMORY_DSN the store checks are skipped (still parses and reports shape) unless
+--require-store is passed, so a checkout with no store access does not break the gate. Note the
+verbatim byte-diff needs no database at all — it catches store drift with zero store access.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+SEEDS = ROOT / "docs" / "agent-memory-seeds"
+
+# Live stores the corpus fans out into (--check-stores). `mode` says how a store's copies relate
+# to the corpus, and it decides what is even comparable:
+#   verbatim — byte-identical copies, so divergence from the corpus IS the finding.
+#   adapted  — copies are deliberately restructured per harness (pi has a seat table and local
+#              cache pointers; claude-harness is promoted upward from its live store), so a
+#              byte-diff is pure noise there. Only the canonical POINTERS are comparable.
+# Env var names follow each harness's own convention — seed-pi.py reads PI_AUTO_MEMORY_DIR and
+# appends /global, so the suffix is applied to the override too.
+STORES = [
+    {"name": "codex", "default": "~/.codex/auto-memory/global",
+     "env": "CODEX_AUTO_MEMORY_DIR", "suffix": "", "mode": "verbatim"},
+    {"name": "pi", "default": "~/.pi/agent/memory/global",
+     "env": "PI_AUTO_MEMORY_DIR", "suffix": "global", "mode": "adapted"},
+    # No single canonical path (project-slug dependent) — opt in via the env var.
+    {"name": "claude-harness", "default": None,
+     "env": "CLAUDE_HARNESS_MEMORY_DIR", "suffix": "", "mode": "adapted"},
+]
+
+
+def resolve_store(spec):
+    """Env override wins; otherwise the documented default. None means 'not configured'."""
+    override = os.environ.get(spec["env"])
+    if override:
+        p = Path(override).expanduser()
+        return p / spec["suffix"] if spec["suffix"] else p
+    return Path(spec["default"]).expanduser() if spec["default"] else None
+
+# "ARB Memory `arb-seat-scorecard`" — the anchor. Version/hash are read from the text that
+# follows, bounded by the next anchor so one citation cannot borrow the next one's version.
+ANCHOR = re.compile(r"ARB Memory\s+`([A-Za-z0-9_.\-]+)`")
+VERSION = re.compile(r"\bv(\d+)(\+?)")
+SHA256 = re.compile(r"\b([0-9a-f]{64})\b")
+# A single "ARB Memory ..." sentence often lists siblings: "`art-81438…` (ADR, v13+),
+# `art-96faf…` (explainer)". The trailing ids are citations too, and being unversioned is
+# exactly what makes them worth flagging. Restricted to the minted `art-<hex>` shape so prose
+# backticks (paths, flags, seat ids) cannot masquerade as artefact citations.
+SIBLING = re.compile(r"`(art-[0-9a-f]{6,})`")
+WINDOW = 260
+
+
+def rel(path):
+    """Repo-relative when possible; absolute otherwise (--seeds may point outside the repo)."""
+    try:
+        return path.relative_to(ROOT)
+    except ValueError:
+        return path
+
+
+class Citation:
+    def __init__(self, path, line, artefact_id, version, floor, content_hash):
+        self.path = path
+        self.line = line
+        self.artefact_id = artefact_id
+        self.version = version
+        self.floor = floor
+        self.content_hash = content_hash
+
+        self.label = None  # set by scan callers: which root this citation came from
+
+    @property
+    def where(self):
+        prefix = f"[{self.label}] " if self.label else ""
+        return f"{prefix}{rel(self.path)}:{self.line}"
+
+
+def parse_file(path):
+    """Yield Citations, plus loose `<id> v<N>` mentions that must agree with them."""
+    text = path.read_text(encoding="utf-8")
+    anchors = list(ANCHOR.finditer(text))
+    cites = []
+    for i, m in enumerate(anchors):
+        stop = anchors[i + 1].start() if i + 1 < len(anchors) else len(text)
+        tail = text[m.end():min(stop, m.end() + WINDOW)]
+        vm = VERSION.search(tail)
+        hm = SHA256.search(tail)
+        cites.append(Citation(
+            path=path,
+            line=text.count("\n", 0, m.start()) + 1,
+            artefact_id=m.group(1),
+            version=int(vm.group(1)) if vm else None,
+            floor=bool(vm and vm.group(2)),
+            content_hash=hm.group(1) if hm else None,
+        ))
+        # Sibling ids listed after the anchor. Each gets the version stated in ITS OWN
+        # parenthetical, if any — never the anchor's, or an unpinned sibling would silently
+        # inherit a pin it does not have.
+        for sm in SIBLING.finditer(tail):
+            if sm.group(1) == m.group(1):
+                continue
+            own = VERSION.search(tail[sm.end():sm.end() + 60])
+            cites.append(Citation(
+                path=path,
+                line=text.count("\n", 0, m.end() + sm.start()) + 1,
+                artefact_id=sm.group(1),
+                version=int(own.group(1)) if own else None,
+                floor=bool(own and own.group(2)),
+                content_hash=None,
+            ))
+
+    # Loose mentions: "canonical detail lives in arb-seat-scorecard v3" in frontmatter. These
+    # carry no backticks, so the anchor regex misses them — and that is exactly where the v1
+    # drift hid. Only look for ids already cited in this file.
+    loose = {}
+    for cid in {c.artefact_id for c in cites}:
+        for lm in re.finditer(rf"{re.escape(cid)}\s+v(\d+)", text):
+            ln = text.count("\n", 0, lm.start()) + 1
+            loose.setdefault(cid, []).append((ln, int(lm.group(1))))
+    return cites, loose
+
+
+def scan(root):
+    """Parse every markdown under `root`. Returns (citations, {path: loose mentions})."""
+    cites, loose_by_file = [], {}
+    for path in sorted(root.rglob("*.md")):
+        c, loose = parse_file(path)
+        cites.extend(c)
+        if loose:
+            loose_by_file[path] = loose
+    return cites, loose_by_file
+
+
+def compare_verbatim(seeds, store_dir, store_name, allow):
+    """Byte-compare a verbatim store against the corpus. Returns (failures, warnings).
+
+    Only meaningful for mode=verbatim. Divergence is a FAILURE, not a warning: a store that
+    silently disagrees with the corpus is the exact condition this whole check exists to surface
+    (the codex store served a retired GLM prior for a day while git was already correct).
+    Genuine forks — where the store legitimately holds organic content the corpus lacks — are
+    recorded explicitly via --allow-divergent so they stay visible instead of being muted.
+    """
+    failures, warnings = [], []
+    for src in sorted(seeds.glob("*.md")):
+        if src.name == "README.md":
+            continue
+        dst = store_dir / src.name
+        topic = src.stem
+        if not dst.exists():
+            warnings.append(f"[{store_name}] topic `{topic}` is in the corpus but not the store")
+            continue
+        if src.read_bytes() == dst.read_bytes():
+            continue
+        newer = "store" if dst.stat().st_mtime > src.stat().st_mtime else "corpus"
+        if topic in allow:
+            warnings.append(
+                f"[{store_name}] `{topic}` diverges from the corpus ({newer} is newer) "
+                f"— ALLOWED via --allow-divergent"
+            )
+        else:
+            failures.append(
+                f"[{store_name}] `{topic}` diverges from the corpus ({newer} side is newer) "
+                f"— a verbatim store must match; re-seed it, promote the store's version, or "
+                f"record the fork with --allow-divergent {topic}"
+            )
+    return failures, warnings
+
+
+def load_store(ids):
+    """Return ({id: max_version}, {(id, version): content_hash}) or None when unavailable."""
+    dsn = os.environ.get("ARB_MEMORY_DSN")
+    if not dsn:
+        return None
+    try:
+        import psycopg
+    except ImportError:
+        print("check-seed-canon: psycopg not importable; cannot reach the store", file=sys.stderr)
+        return None
+    ids = sorted(ids)
+    with psycopg.connect(dsn) as conn:
+        rows = conn.execute(
+            "SELECT artefact_id, version, content_hash FROM artefacts WHERE artefact_id = ANY(%s)",
+            (ids,),
+        ).fetchall()
+    current, hashes = {}, {}
+    for artefact_id, version, content_hash in rows:
+        current[artefact_id] = max(current.get(artefact_id, 0), version)
+        hashes[(artefact_id, version)] = content_hash
+    return current, hashes
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="check-seed-canon")
+    p.add_argument("--seeds", type=Path, default=SEEDS, help="seeds corpus root")
+    p.add_argument("--strict", action="store_true", help="treat floor/unpinned citations as failures")
+    p.add_argument("--require-store", action="store_true", help="fail if the store is unreachable")
+    p.add_argument("--list", action="store_true", help="print every citation found, then exit 0")
+    p.add_argument("--check-stores", action="store_true",
+                   help="also check the LIVE agent memory stores this host fans out into")
+    p.add_argument("--allow-divergent", default="",
+                   help="comma-separated topic names whose verbatim-store divergence is a known, "
+                        "accepted fork (still reported as a warning)")
+    a = p.parse_args(argv)
+
+    if not a.seeds.is_dir():
+        print(f"check-seed-canon: no seeds corpus at {a.seeds}", file=sys.stderr)
+        return 2
+
+    allow = {t.strip() for t in a.allow_divergent.split(",") if t.strip()}
+    roots = [("corpus", a.seeds, None)]
+    store_failures, store_warnings, unchecked = [], [], []
+
+    if a.check_stores:
+        for spec in STORES:
+            d = resolve_store(spec)
+            if d is None:
+                unchecked.append(f"{spec['name']} (no default path; set {spec['env']})")
+            elif not d.is_dir():
+                unchecked.append(f"{spec['name']} (not present at {d})")
+            else:
+                roots.append((spec["name"], d, spec["mode"]))
+                if spec["mode"] == "verbatim":
+                    f, w = compare_verbatim(a.seeds, d, spec["name"], allow)
+                    store_failures.extend(f)
+                    store_warnings.extend(w)
+
+    cites, loose_by_file = [], {}
+    for label, root, _mode in roots:
+        c, lb = scan(root)
+        for cit in c:
+            cit.label = None if label == "corpus" else label
+        cites.extend(c)
+        loose_by_file.update(lb)
+
+    if not cites:
+        print("check-seed-canon: no ARB Memory citations found — nothing to check")
+        return 0
+
+    if a.list:
+        for c in cites:
+            pin = "unpinned" if c.version is None else f"v{c.version}{'+' if c.floor else ''}"
+            h = f" hash={c.content_hash[:12]}…" if c.content_hash else ""
+            print(f"{c.where}\t{c.artefact_id}\t{pin}{h}")
+        return 0
+
+    store = load_store({c.artefact_id for c in cites})
+    if store is None:
+        msg = "store unreachable (set ARB_MEMORY_DSN)"
+        if a.require_store:
+            print(f"check-seed-canon: {msg}", file=sys.stderr)
+            return 2
+        print(f"check-seed-canon: {msg} — reporting citation shape only, version checks SKIPPED")
+        current, hashes = {}, {}
+    else:
+        current, hashes = store
+
+    failures, warnings = list(store_failures), list(store_warnings)
+
+    for c in cites:
+        if c.version is None:
+            warnings.append(f"{c.where}: `{c.artefact_id}` cited with NO version — drift undetectable")
+            continue
+        if c.floor:
+            warnings.append(
+                f"{c.where}: `{c.artefact_id}` cited as a floor (v{c.version}+) — satisfiable "
+                f"forever, so it can never detect drift; prefer an exact pin"
+            )
+        if not current:
+            continue
+        live = current.get(c.artefact_id)
+        if live is None:
+            failures.append(f"{c.where}: `{c.artefact_id}` is not in the store at all")
+            continue
+        if c.floor:
+            if live < c.version:
+                failures.append(
+                    f"{c.where}: `{c.artefact_id}` floor v{c.version}+ but store max is v{live}"
+                )
+        elif c.version != live:
+            failures.append(
+                f"{c.where}: `{c.artefact_id}` cites v{c.version} but store is at v{live} "
+                f"— seed is {live - c.version} version(s) stale"
+            )
+        if c.content_hash:
+            actual = hashes.get((c.artefact_id, c.version))
+            if actual is None:
+                failures.append(
+                    f"{c.where}: `{c.artefact_id}` v{c.version} cites a hash but that version "
+                    f"is not in the store"
+                )
+            elif actual != c.content_hash:
+                failures.append(
+                    f"{c.where}: `{c.artefact_id}` v{c.version} hash mismatch — "
+                    f"cited {c.content_hash[:12]}… store {actual[:12]}…"
+                )
+
+    # Internal agreement: same id, two versions, one file.
+    for path, loose in loose_by_file.items():
+        for cid, mentions in loose.items():
+            versions = {v for _, v in mentions}
+            pinned = {c.version for c in cites
+                      if c.path == path and c.artefact_id == cid and c.version is not None}
+            allv = versions | pinned
+            if len(allv) > 1:
+                spots = ", ".join(f"line {ln}→v{v}" for ln, v in sorted(mentions))
+                failures.append(
+                    f"{rel(path)}: `{cid}` cited at conflicting versions "
+                    f"{sorted(allv)} within one file ({spots})"
+                )
+
+    for w in warnings:
+        print(f"WARN  {w}")
+    for f in failures:
+        print(f"FAIL  {f}", file=sys.stderr)
+
+    # Never let unchecked coverage read as clean coverage.
+    for u in unchecked:
+        print(f"NOTE  store not checked: {u}")
+
+    checked = ", ".join(label for label, _, _ in roots)
+    if failures:
+        print(f"\ncheck-seed-canon: {len(failures)} failure(s), {len(warnings)} warning(s) "
+              f"across [{checked}]", file=sys.stderr)
+        return 1
+    if warnings and a.strict:
+        print(f"\ncheck-seed-canon: {len(warnings)} warning(s) escalated by --strict", file=sys.stderr)
+        return 1
+    scope = f"{len(cites)} citation(s)" + ("" if current else " (shape only)")
+    print(f"check-seed-canon: OK — {scope} across [{checked}], {len(warnings)} warning(s)")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png">
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Newsreader:opsz,wght@6..72,400;6..72,500;6..72,600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <title>ARB Visibility</title>
+    <style>
+      :root{
+        --paper:#FAF8F4; --paper-sunk:#F3EFE8; --card:#FFFFFF;
+        --ink-900:#1F1D1A; --ink-700:#45413B; --ink-500:#6E6960; --ink-400:#918B80;
+        --line-200:#E7E2D8; --line-300:#D9D3C7;
+        --clay-600:#9E4A2E; --clay-700:#823A22; --clay-100:#EFE0D6;
+        --serif:'Newsreader',Georgia,'Times New Roman',serif;
+        --mono:'IBM Plex Mono',ui-monospace,'SF Mono',Menlo,monospace;
+        --ease:cubic-bezier(.4,0,.2,1);
+      }
+      @media (prefers-color-scheme: dark) {
+        :root{
+          --paper:#1F1D1A; --paper-sunk:#28251F; --card:#322E27;
+          --ink-900:#FAF8F4; --ink-700:#D9D3C7; --ink-500:#A8A299; --ink-400:#6E6960;
+          --line-200:#3A362E; --line-300:#4A453B;
+          --clay-600:#C97350; --clay-700:#E0916B; --clay-100:#3D2A20;
+        }
+      }
+      *{box-sizing:border-box}
+      html,body{margin:0}
+      html, body{ height:100%; }
+      body{
+        background:var(--paper); color:var(--ink-700); font-family:var(--serif);
+        -webkit-font-smoothing:antialiased; line-height:1.4;
+        display:flex; flex-direction:column;
+      }
+      header{
+        align-items:end; background:var(--paper-sunk); border-bottom:1px solid var(--line-200);
+        display:grid; gap:12px;
+        grid-template-columns: minmax(140px,1fr) minmax(260px,auto) auto auto;
+        padding:14px 18px;
+      }
+      h1{
+        font-family:var(--serif); font-weight:600; font-size:1.25rem; color:var(--ink-900);
+        letter-spacing:0; margin:0;
+      }
+      label{
+        font-family:var(--mono); font-size:.6875rem; text-transform:uppercase;
+        letter-spacing:.1em; color:var(--ink-500); display:grid; gap:4px;
+      }
+      select#orchestrator{
+        font-family:var(--mono); font-size:.95rem; color:var(--ink-900);
+        background:var(--paper-sunk); border:1px solid var(--line-300);
+        border-radius:5px; padding:11px 13px; width:100%;
+        transition:border-color 120ms var(--ease), background-color 120ms var(--ease), box-shadow 120ms var(--ease);
+      }
+      .orchestrator-field{
+        align-items:center; display:flex; gap:8px; white-space:nowrap;
+      }
+      .orchestrator-field select{ min-width:180px; }
+      #tees-status{ margin-left:8px; font-size:12px; }
+      #tees-status .tee-fresh{ color:#3fb950; }
+      #tees-status .tee-stale, #tees-status .tee-missing{ color:#f85149; font-weight:600; }
+      select#orchestrator:focus{
+        outline:none; border-color:var(--clay-600); background:var(--card);
+        box-shadow:0 0 0 3px var(--clay-100);
+      }
+      button{
+        font-family:var(--mono); font-size:.8125rem; text-transform:uppercase;
+        letter-spacing:.1em; font-weight:500; border-radius:5px; padding:11px 14px;
+        cursor:pointer; background:var(--card); border:1px solid var(--line-300); color:var(--ink-700);
+        transition:background-color 120ms var(--ease), border-color 120ms var(--ease);
+      }
+      button:hover{background:var(--paper-sunk)}
+      button:focus-visible{outline:2px solid var(--clay-600); outline-offset:2px}
+      button:disabled{opacity:.5; cursor:not-allowed}
+
+      .segmented{display:inline-flex; border:1px solid var(--line-300); border-radius:5px; overflow:hidden}
+      .segmented button{border:0; border-radius:0; padding:11px 14px}
+      .segmented button + button{border-left:1px solid var(--line-300)}
+      .segmented button[aria-pressed="true"]{
+        background:var(--clay-100); border-color:var(--clay-600); color:var(--clay-700);
+      }
+
+      #filter-bar{
+        align-items:center; background:var(--paper-sunk); border-bottom:1px solid var(--line-200);
+        display:flex; flex-wrap:wrap; gap:16px; padding:10px 18px;
+      }
+      #filter-bar label{
+        align-items:center; color:var(--ink-500); display:inline-flex; gap:6px;
+        font-family:var(--mono); font-size:.6875rem; letter-spacing:.06em; text-transform:uppercase;
+      }
+      #filter-bar label[hidden]{ display:none; }
+      #filter-bar select, #filter-bar input[type="date"]{
+        background:var(--card); border:1px solid var(--line-300); border-radius:5px;
+        color:var(--ink-900); font-family:var(--mono); font-size:.8125rem; padding:6px 10px;
+      }
+      #filter-bar select:focus, #filter-bar input[type="date"]:focus{
+        background:var(--card); border-color:var(--clay-600); box-shadow:0 0 0 3px var(--clay-100);
+        outline:none;
+      }
+      #filter-count{
+        color:var(--ink-500); font-family:var(--mono); font-size:.75rem; margin-left:auto;
+      }
+
+      main{ display:grid; grid-template-columns:minmax(260px,34%) 1fr; flex:1 1 auto; min-height:0; }
+      aside#seat-panel{
+        background:var(--card); border-right:1px solid var(--line-200); border-radius:8px;
+        display:flex; flex-direction:column; min-height:0; overflow:hidden;
+      }
+      #seats{
+        flex:1 1 auto; list-style:none; margin:0; min-height:0; overflow-y:auto; padding:0;
+      }
+      #seats-orchestrator{
+        flex:0 0 auto; list-style:none; margin:0; padding:0;
+      }
+      #seats li, #seats-orchestrator li{ border-bottom:1px solid var(--line-200); }
+      #seats button, #seats-orchestrator button{
+        background:transparent; border:0; border-radius:0; color:inherit; cursor:pointer;
+        display:grid; grid-template-columns:1fr auto auto; column-gap:8px; row-gap:4px;
+        padding:12px 14px; text-align:left; width:100%;
+      }
+      #seats button[aria-current="true"], #seats-orchestrator button[aria-current="true"]{ background:var(--paper-sunk); }
+      .orchestrator-divider{
+        color:var(--ink-400); font-family:var(--mono); font-size:.6875rem;
+        letter-spacing:.08em; padding:6px 14px; text-align:center; text-transform:uppercase;
+      }
+
+      .seat-id{ font-family:var(--mono); font-weight:500; color:var(--ink-900); }
+      .run-id{ font-family:var(--mono); color:var(--ink-500); font-size:.75rem; }
+      .last-event{ font-family:var(--mono); color:var(--ink-500); font-size:.75rem; grid-column: 2 / span 2; }
+      .age{ font-family:var(--mono); color:var(--ink-500); font-size:.75rem; text-align:right; }
+
+      #history-status{
+        font-family:var(--mono); font-size:.6875rem; text-transform:uppercase; letter-spacing:.06em;
+        color:var(--ink-500); flex:0 0 auto; padding:10px 14px; border-top:1px solid var(--line-200);
+      }
+      #history-status:empty{ display:none; }
+
+      .state-cell{ display:inline-flex; align-items:center; gap:5px; }
+      .badge{
+        font-family:var(--mono); font-size:.6875rem; text-transform:uppercase; letter-spacing:.04em;
+        border:1px solid var(--ink-500); color:var(--ink-700); background:var(--paper-sunk);
+        border-radius:999px; padding:1px 8px;
+      }
+      .badge[data-state="stale"]{ color:var(--ink-400); }
+      .badge[data-state="failed"]{ border-color:var(--clay-700); color:var(--clay-700); }
+
+      .pulse-dot{ width:6px; height:6px; border-radius:50%; background:var(--clay-600); display:none; }
+      .state-cell.is-running .pulse-dot{
+        display:inline-block; animation:seat-pulse 1.6s var(--ease) infinite;
+      }
+      @keyframes seat-pulse{ 0%,100%{opacity:1} 50%{opacity:.25} }
+      @media (prefers-reduced-motion: reduce){
+        .state-cell.is-running .pulse-dot{ animation:none; opacity:1; }
+      }
+
+      section{
+        min-width:0; min-height:0; background:var(--paper); border-radius:8px;
+        display:flex; flex-direction:column;
+      }
+      aside#seat-panel[hidden]{ display:none; }
+      aside#seat-panel[hidden] + section{ grid-column:1 / -1; }
+      #timeline{
+        flex:1 1 auto; min-height:0; overflow:auto;
+        margin:0; padding:14px 18px; white-space:pre-wrap; font-family:var(--mono); color:var(--ink-700);
+      }
+      #timeline details summary{ color:var(--ink-500); cursor:pointer; }
+
+      #transcript-toolbar{
+        border-bottom:1px solid var(--line-200); display:flex; flex-wrap:wrap; gap:8px; padding:10px 14px;
+      }
+      #transcript-toolbar button{
+        font-size:.75rem; padding:6px 10px;
+      }
+      #transcript-toolbar button[aria-pressed="true"]{
+        background:var(--clay-100); border-color:var(--clay-600); color:var(--clay-700);
+      }
+      .dim{ color:var(--ink-500); }
+
+      #auth-banner{
+        background:var(--clay-100); border-bottom:1px solid var(--clay-600); color:var(--clay-700);
+        font-family:var(--mono); text-transform:uppercase; letter-spacing:.06em; font-size:.75rem;
+        padding:10px 18px;
+      }
+      #auth-banner[hidden]{ display:none; }
+
+      @media (max-width: 720px) {
+        header, main { grid-template-columns: 1fr; }
+        aside#seat-panel { border-right:0; max-height:42vh; }
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>ARB · Visibility</h1>
+      <input id="token" type="hidden" autocomplete="off">
+      <label class="orchestrator-field">
+        Orchestrator
+        <select id="orchestrator"></select>
+        <span id="tees-status" title="claude-tail tee heartbeat"></span>
+      </label>
+      <div class="segmented" role="group" aria-label="Seat source">
+        <button id="mode-live" type="button" aria-pressed="true" disabled>Live</button>
+        <button id="mode-history" type="button" aria-pressed="false" disabled>History</button>
+      </div>
+      <button id="clear-token" type="button">Clear</button>
+    </header>
+    <div id="auth-banner" hidden role="alert">Session expired — redirecting to sign in…</div>
+    <div id="filter-bar">
+      <label>
+        Status
+        <select id="status-filter">
+          <option value="all">all</option>
+          <option value="running">running</option>
+          <option value="incomplete">incomplete</option>
+          <option value="done">done</option>
+          <option value="failed">failed</option>
+          <option value="voted">voted</option>
+          <option value="stale">stale</option>
+          <option value="unknown">unknown</option>
+        </select>
+      </label>
+      <label>
+        Agent
+        <select id="agent-filter">
+          <option value="all">all</option>
+        </select>
+      </label>
+      <label id="date-filter-label" hidden>
+        Date
+        <input type="date" id="date-filter">
+      </label>
+      <span id="filter-count"></span>
+    </div>
+    <main id="app">
+      <aside id="seat-panel">
+        <ul id="seats"></ul>
+        <ul id="seats-orchestrator"></ul>
+        <div id="history-status" aria-live="polite"></div>
+      </aside>
+      <section>
+        <div id="transcript-toolbar">
+          <button id="toggle-timestamps" type="button" aria-pressed="false">Timestamps</button>
+          <button id="toggle-labels" type="button" aria-pressed="false">Labels</button>
+          <button id="toggle-expand" type="button" aria-pressed="false">Expand output</button>
+          <button id="toggle-fullwidth" type="button" aria-pressed="false">Full width</button>
+          <button id="copy-transcript" type="button">Copy</button>
+        </div>
+        <pre id="timeline"></pre>
+      </section>
+    </main>
+    <script src="/app.js"></script>
+  </body>
+</html>

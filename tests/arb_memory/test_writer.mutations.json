@@ -1,0 +1,16 @@
+{
+ "schema": 1,
+ "mutations": [
+  {
+   "id": "M1",
+   "kind": "defect",
+   "label": "writer stops 400ing expected_version without await",
+   "file": "src/arb_memory/writer.py",
+   "find": "            and artefact.get(\"expected_version\") is not None\n            and not await_result\n",
+   "replace": "            and False\n            and not await_result\n",
+   "expect_failed": [
+    "tests/arb_memory/test_writer.py::test_writer_rejects_expected_version_without_await"
+   ]
+  }
+ ]
+}

@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# graph-sql-gate — PostgreSQL-backed test gate for the graph read tools.
+# The scratch fixture SKIPS silently without ARB_MEMORY_DSN; a green run with every
+# SQL assertion skipped is the vacuously-green shape this gate refuses. It ALSO pins
+# the passed count: a silently missing/deselected test is the same failure as a skip.
+set -euo pipefail
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [ -x "$REPO/.venv/bin/python" ]; then
+  PY="$REPO/.venv/bin/python"
+else
+  PY="${ARB_BRIDGE_VENV_PYTHON:-$REPO/.venv/bin/python}"
+fi                                    # pytest is NOT on PATH on this host
+cd "$REPO"                           # relative test paths below require repo-root CWD
+EXPECTED_MIN_PASSED=89               # pin to the count observed in Step 2; +2 for B19c AC4/AC16
+if [ -z "${ARB_MEMORY_DSN:-}" ]; then
+  echo "graph-sql-gate: ARB_MEMORY_DSN is not set — refusing to run a skippable gate" >&2
+  exit 1
+fi
+out=$("$PY" -m pytest -q -rs \
+  tests/arb_memory/test_graph_pg.py tests/arb_memory/test_vault_export.py \
+  tests/arb_memory/test_expected_version_pg.py tests/arb_memory/test_store.py \
+  tests/arb_memory/test_write_tools.py 2>&1) || {
+  echo "$out"; exit 1; }
+echo "$out"
+if echo "$out" | grep -qE "[0-9]+ skipped"; then
+  echo "graph-sql-gate: FAIL — SQL tests were skipped; gate requires them to RUN" >&2
+  exit 1
+fi
+passed=$(echo "$out" | grep -oE "[0-9]+ passed" | grep -oE "[0-9]+" | head -1)
+if [ "${passed:-0}" -lt "$EXPECTED_MIN_PASSED" ]; then
+  echo "graph-sql-gate: FAIL — only ${passed:-0} passed; expected >= $EXPECTED_MIN_PASSED (missing tests?)" >&2
+  exit 1
+fi

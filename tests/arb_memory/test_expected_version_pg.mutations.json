@@ -1,0 +1,16 @@
+{
+ "schema": 1,
+ "mutations": [
+  {
+   "id": "M1",
+   "kind": "defect",
+   "label": "reinstate the max(version) re-read on the guarded path (the cold-Opus r2 lost-update defect)",
+   "file": "src/arb_memory/store.py",
+   "find": "    if expected_version is not None:\n        version = expected_version + 1\n    else:\n        row = conn.execute(",
+   "replace": "    if False:\n        version = expected_version + 1\n    else:\n        row = conn.execute(",
+   "expect_failed": [
+    "tests/arb_memory/test_expected_version_pg.py::test_toctou_unique_violation_then_refusal_on_retry"
+   ]
+  }
+ ]
+}

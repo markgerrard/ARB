@@ -1,0 +1,1210 @@
+#!/usr/bin/env python3
+"""arb-orch-panel — roster-driven parallel panel dispatch + vote parse.
+
+Low-context ARB orch helper. Stops orchestrators hand-rolling fragile bash
+panel loops (vote-fence `{...}` regex under command substitution breaks;
+`jobs -p` hangs under non-interactive bash).
+
+Canonical orch pattern (NEVER model-side poll loops — they waste tokens):
+
+  # Fire panel in its own session; return immediately to the orch turn.
+  arb-orch-panel --detach --stage plan --round 3 \
+    --artifact /abs/plan.md --repo /abs/git/repo
+  # → DETACHED out=<dir> pid=<n>
+
+  # Optional: one background monitor process (not the model) that blocks
+  # until summary.json exists, then exits with the gate code. Start via
+  # start_new_session / harness background job — do NOT sleep-poll in-model.
+  arb-orch-panel --monitor --out-dir <dir>   # blocks; exit 0/1 = PASS/FAIL
+
+  # When the orch turn resumes (user/harness wake), collect once:
+  arb-orch-panel --collect --out-dir <dir>
+
+Foreground (only for short/--dry-run or non-interactive shells that can wait):
+
+  arb-orch-panel --stage design --round 1 --artifact … --repo …
+
+Exit codes:
+  0  gate PASS (collect/run) or detach started ok / status=done PASS
+  1  gate FAIL or runner dead without summary
+  2  usage
+  3  status/collect: still running (not an error — try again)
+"""
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path as _Path
+
+# Prefer <workspace> .venv so events-tee can import redis and other project deps.
+# System python3 often lacks them; without this, --events-tee silently writes nothing.
+# Compare sys.prefix (not resolved executable): venv python is a symlink into
+# Homebrew's framework binary, so Path.resolve() falsely looks "already in venv".
+_BRIDGE_ROOT = _Path(__file__).resolve().parent.parent
+_VENV_PY = _BRIDGE_ROOT / ".venv" / "bin" / "python"
+_VENV_PREFIX = (_BRIDGE_ROOT / ".venv").resolve()
+_VENV_REEXEC_SENTINEL = "ARB_ORCH_PANEL_VENV_REEXECED"
+
+
+def _reexec_in_venv_once() -> None:
+    if os.environ.pop(_VENV_REEXEC_SENTINEL, None) == "1":
+        return
+    if not _VENV_PY.is_file() or _Path(sys.prefix).resolve() == _VENV_PREFIX:
+        return
+    os.environ[_VENV_REEXEC_SENTINEL] = "1"
+    try:
+        os.execv(str(_VENV_PY), [str(_VENV_PY), str(_Path(__file__).resolve()), *sys.argv[1:]])
+    except OSError:
+        os.environ.pop(_VENV_REEXEC_SENTINEL, None)
+
+
+_reexec_in_venv_once()
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+BRIDGE_ROOT = SCRIPT_DIR.parent
+# Panels use the Go-backed dispatch-dev edge.  The bash dispatcher remains an
+# explicit escape hatch for local diagnostics, never the panel default.
+DEFAULT_DISPATCH = SCRIPT_DIR / "dispatch-dev"
+DEFAULT_PY_SRC = BRIDGE_ROOT / "src"
+ORCH_DIR = Path("/tmp/arb-orch")
+
+sys.path.insert(0, str(DEFAULT_PY_SRC))
+from arb_memory.stance import StanceError, parse_stance  # noqa: E402
+from agent_redis_bridge.dispatch_cli import wrap_instructions_as_brief  # noqa: E402
+from agent_redis_bridge.panel_input import panel_input_lock_reason  # noqa: E402
+
+
+COLD_EVENT_KINDS = {
+    "task_started", "command_started", "command_finished", "command_output",
+    "stall_detected", "stall_unknown", "turn_heartbeat", "task_continuing",
+    "agent_committed", "orchestrator_committed", "post_timeout_agent_committed",
+    "post_timeout_committed", "steer_sent", "steer_rejected", "cancel_sent",
+    "cancel_rejected", "vote", "task_finished", "task_failed",
+}
+
+
+def allowed_cold_event(event: object) -> bool:
+    if not isinstance(event, dict):
+        return False
+    # Bridge push_task_event stores the name in `type`; live tee uses `event_type`.
+    kind = str(event.get("kind") or event.get("event_type") or event.get("type") or "")
+    return kind in COLD_EVENT_KINDS
+
+
+class TaskIdRegistry:
+    """Concurrent-safe seat-slug → latest task-id journal.
+
+    The per-seat sidecar is written before the process exits.  The shared JSON
+    file is rebuilt under one lock, so concurrent read/merge/write operations
+    cannot lose a sibling seat.
+    """
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self.lock = threading.RLock()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+    def update(self, slug: str, task_id: str) -> None:
+        with self.lock:
+            sidecar = self.path.parent / f"{slug}.task-id"
+            sidecar.write_text(task_id + "\n", encoding="utf-8")
+            merged: dict[str, str] = {}
+            if self.path.is_file():
+                try:
+                    raw = json.loads(self.path.read_text(encoding="utf-8"))
+                    if isinstance(raw, dict):
+                        merged.update({str(k): str(v) for k, v in raw.items()})
+                except json.JSONDecodeError:
+                    pass
+            merged[slug] = task_id
+            fd, tmp_name = tempfile.mkstemp(prefix="task-ids.", suffix=".json", dir=self.path.parent)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    json.dump(merged, handle, sort_keys=True)
+                    handle.write("\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(tmp_name, self.path)
+            finally:
+                if os.path.exists(tmp_name):
+                    os.unlink(tmp_name)
+
+    def read(self) -> dict[str, str]:
+        with self.lock:
+            if not self.path.is_file():
+                return {}
+            try:
+                value = json.loads(self.path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                return {}
+            return {str(k): str(v) for k, v in value.items()} if isinstance(value, dict) else {}
+
+
+def fallback_task_events(streams: dict[str, list[dict]], task_ids: dict[str, str]):
+    """Yield only task streams that were already proven by task-id capture."""
+    for slug, task_id in task_ids.items():
+        for event in streams.get(task_id, []):
+            if allowed_cold_event(event):
+                yield slug, event
+
+
+def read_known_task_events(client, prefix: str, registry: TaskIdRegistry, cursors: dict[str, str], *, block: int = 1):
+    """XREAD only task streams whose ids came from the early-id registry."""
+    for slug, task_id in registry.read().items():
+        stream = f"{prefix}task:{task_id}:events"
+        cursor = cursors.get(task_id, "0-0")
+        batches = client.xread({stream: cursor}, count=100, block=block)
+        for _, entries in batches:
+            for entry_id, fields in entries:
+                cursors[task_id] = entry_id
+                if allowed_cold_event(fields):
+                    yield slug, {"stream_id": entry_id, **fields}
+
+
+def validate_panel_input_policy(seats: list[dict], *, no_audit_panel: bool, panel_input_locked: bool) -> None:
+    if no_audit_panel and any(bool(seat.get("certifying", True)) for seat in seats) and not panel_input_locked:
+        die("certifying panels require --audit-panel or --panel-input-locked; bare --no-audit-panel is refused", 2)
+
+
+def refuse_run_id_this_tool_will_rewrite(*, run_id: str | None, no_audit_panel: bool) -> None:
+    """Refuse an explicit --run-id, because this tool does not produce a bound run.
+
+    Each seat is dispatched under ``f"{run_id}-{slug}"`` (see _job), and this tool emits
+    NEITHER the dispatch manifest NOR the verdict -- it has no arb-audit-emit or
+    arb-audit-close-request call site. So a caller who supplies a run_id gets N independent
+    single-vote runs, each at seq 1, with no manifest and no verdict, while every seat
+    reports success. reconcile() can never refuse it because no close is ever requested.
+
+    Measured: 92 orphan seat runs across 28 panel bases, 2026-07-18 onward, none with a
+    dispatch or verdict row. See docs/defect-classes/run-id-silently-rewritten.md.
+
+    Only fires when votes would actually be written; --no-audit-panel emits none, so a
+    run_id is then just a label and harmless.
+    """
+    if run_id and not no_audit_panel:
+        die(
+            "refusing --run-id: this tool dispatches each seat under "
+            "'<run-id>-<seat-slug>' and emits no manifest and no verdict, so the run you "
+            "think you are binding will not exist.\n"
+            "  For an audited run use the three-emitter procedure by hand "
+            "(docs/orchestrator-patterns.md 'Auditing a review/design panel'):\n"
+            "    1. arb-audit-emit --kind dispatch --run-id <id> --payload '{\"roster\":[\"seat:<id>\",...]}'\n"
+            "    2. agent-dispatch --audit-panel --run-id <THE SAME id>   (once per seat)\n"
+            "    3. arb-audit-close-request --run-id <id> --payload-file - --requested-by <you>\n"
+            "  For unaudited parallel dispatch, omit --run-id.",
+            2,
+        )
+
+
+def gc_seat_events(out_dir: Path, *, summary_written: bool) -> list[Path]:
+    if not summary_written or os.environ.get("ARB_KEEP_SEAT_EVENTS") == "1":
+        return []
+    removed: list[Path] = []
+    for path in out_dir.glob("*.events.jsonl"):
+        path.unlink(missing_ok=True)
+        removed.append(path)
+    return removed
+
+
+def merge_env_file(env: dict, path: Path) -> dict:
+    """Load only missing process settings used by the panel/seat bus."""
+    if not path.is_file():
+        return env
+    merged = dict(env)
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in merged:
+            merged[key] = value
+    return merged
+
+
+def utc_stamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def die(msg: str, code: int = 2) -> None:
+    print(f"arb-orch-panel: {msg}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def load_roster(path: Path) -> dict:
+    if not path.is_file():
+        die(f"roster not found: {path}")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def seat_slug(target_id: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9._-]+", "_", target_id)
+
+
+def stage_owner(roster: dict, stage: str) -> tuple[str, str]:
+    if stage == "impl":
+        seat = roster["implementor"]
+    else:
+        seat = roster["authors"][stage]
+    return seat.get("targetId") or "inline", seat.get("lineage") or "inline"
+
+
+def collect_seats(roster: dict, include_adjuncts: bool) -> list[dict]:
+    seats: list[dict] = []
+    for s in roster.get("panel") or []:
+        seats.append({**s, "certifying": True, "role": "panel"})
+    if include_adjuncts:
+        for s in roster.get("adjuncts") or []:
+            seats.append({**s, "certifying": False, "role": "adjunct"})
+    seen: set[str] = set()
+    out: list[dict] = []
+    for s in seats:
+        tid = s.get("targetId")
+        if not tid or tid == "inline" or tid in seen:
+            continue
+        seen.add(tid)
+        out.append(s)
+    return out
+
+
+def write_status(out_dir: Path, **fields) -> None:
+    payload = {"updated_at": datetime.now(timezone.utc).isoformat(), **fields}
+    (out_dir / "status.json").write_text(
+        json.dumps(payload, indent=2) + "\n", encoding="utf-8"
+    )
+
+
+def pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def read_runner_pid(out_dir: Path) -> int | None:
+    pidf = out_dir / "runner.pid"
+    if not pidf.is_file():
+        return None
+    raw = pidf.read_text(encoding="utf-8").strip()
+    if not raw.isdigit():
+        return None
+    return int(raw)
+
+
+def default_brief(
+    *,
+    stage: str,
+    round_n: int,
+    artifact: Path,
+    repo: Path,
+    stage_lineage: str,
+) -> str:
+    art = str(artifact)
+    return f"""# Panel brief — {stage} r{round_n} (auto)
+
+## Role
+You are a **certifying** reviewer for Pipeline B stage **{stage}**.
+If dispatched as adjunct/advisory, findings still count but severity labels are advisory.
+
+## Same-seat / lineage
+- Dispatcher skips the stage author/implementor when their target-id equals a panel seat.
+- Same-lineage as author/implementor may vote but must **not** be sole certifier.
+- Author/implementor lineage for this stage: `{stage_lineage}`
+
+## Artifact
+- Repo: `{repo}`
+- File: `{art}`
+- Read the artifact from disk before commenting. Evidence-first only.
+
+## Rules
+- Do **not** implement code or edit the artifact.
+- Do **not** read other reviewers' reports.
+- Write the full report **inline in your reply only** (dispatcher captures stdout). Do not write into the repo.
+- If the artifact claims prior remediation, verify folds **and** hunt regressions.
+
+## Required output
+1. Short summary (3–6 lines)
+2. Findings: severity P0|P1|P2|none, evidence quote, why it matters, suggested fix
+3. Final vote fence (exactly one):
+
+```vote
+{{"stance":"approve|needs-changes","severity":"none|P2|P1|P0","refs":[{json.dumps(art)}],"note":"one sentence"}}
+```
+"""
+
+
+def start_events_tee(
+    *,
+    out_dir: Path,
+    run_id: str,
+    env: dict,
+    stop: threading.Event,
+    task_ids: TaskIdRegistry | None = None,
+    client_factory=None,
+) -> threading.Thread:
+    """Tail the seats' live stream into per-seat JSONL files.
+
+    The Redis cursor is captured before the caller submits its first seat. A
+    missing live bus is a passive degradation; task-id-gated task streams can
+    still be used as fallback.
+    """
+    def connect():
+        if client_factory is not None:
+            value = client_factory(env)
+            return value[0], value[1]
+        import redis  # type: ignore
+
+        url = env.get("ARB_LIVE_REDIS_URL") or env.get("AGENT_REDIS_URL")
+        prefix = env.get("ARB_LIVE_PREFIX") or env.get("AGENT_REDIS_PREFIX") or "agent_scratch:"
+        # F15: from_url must decode too — bytes-keyed xread fields make
+        # allowed_cold_event and the run_id filter drop every event.
+        client = redis.Redis.from_url(url, decode_responses=True) if url else redis.Redis(
+            host=env.get("AGENT_REDIS_HOST") or "127.0.0.1",
+            port=int(env.get("AGENT_REDIS_PORT") or 6379),
+            db=int(env.get("AGENT_REDIS_DB") or 12),
+            decode_responses=True,
+        )
+        client.ping()
+        return client, prefix
+
+    try:
+        client, prefix = connect()
+        stream = f"{prefix}events:live"
+        before = client.xrevrange(stream, count=1)
+        cursor = before[0][0] if before else "0-0"
+    except Exception:
+        client = None
+        prefix = env.get("ARB_LIVE_PREFIX") or env.get("AGENT_REDIS_PREFIX") or "agent_scratch:"
+        stream = f"{prefix}events:live"
+        cursor = "0-0"
+    fallback_cursors: dict[str, str] = {}
+
+    def append(slug: str, fields: dict) -> None:
+        path = out_dir / f"{seat_slug(slug)}.events.jsonl"
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(fields, ensure_ascii=False) + "\n")
+
+    def run() -> None:
+        nonlocal client, prefix, stream, cursor
+        while not stop.is_set():
+            if client is None:
+                try:
+                    client, prefix = connect()
+                    stream = f"{prefix}events:live"
+                    before = client.xrevrange(stream, count=1)
+                    cursor = before[0][0] if before else "0-0"
+                except Exception:
+                    time.sleep(0.25)
+                    continue
+            matched_live = False
+            try:
+                batches = client.xread({stream: cursor}, block=100, count=100)
+                for _, entries in batches:
+                    for entry_id, fields in entries:
+                        cursor = entry_id
+                        if not isinstance(fields, dict) or not allowed_cold_event(fields):
+                            continue
+                        event_run = str(fields.get("run_id") or "")
+                        if not (event_run == run_id or event_run.startswith(run_id + "-")):
+                            continue
+                        matched_live = True
+                        slug = str(fields.get("seat_id") or fields.get("task_id") or "seat")
+                        append(slug, {"stream_id": entry_id, **fields})
+            except Exception:
+                client = None
+                continue
+            # A live stream can exist but be empty/misconfigured for this run.
+            # Once dispatch has captured a task id, read only those task streams
+            # so degraded observability cannot turn into an unbounded Redis scan.
+            if not matched_live and task_ids is not None:
+                try:
+                    for slug, fields in read_known_task_events(client, prefix, task_ids, fallback_cursors, block=1):
+                        append(slug, fields)
+                except Exception:
+                    client = None
+
+    thread = threading.Thread(target=run, name="arb-panel-events-tee", daemon=True)
+    thread.start()
+    return thread
+
+
+def extract_result_text(raw: str) -> tuple[dict | None, str]:
+    raw = raw or ""
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None, raw
+    if not isinstance(data, dict):
+        return None, raw
+    result = data.get("result")
+    if result is None:
+        result = data.get("reply") or data.get("message") or ""
+    if isinstance(result, (dict, list)):
+        text = json.dumps(result, indent=2)
+    else:
+        text = str(result)
+    return data, text
+
+
+def dispatch_one(
+    *,
+    dispatch: Path,
+    engine: str,
+    target: str,
+    run_id: str,
+    timeout: int,
+    repo: Path,
+    prompt: str,
+    out_path: Path,
+    err_path: Path,
+    audit_panel: bool,
+    dry_run: bool,
+    env: dict,
+    task_ids: TaskIdRegistry | None = None,
+    slug: str | None = None,
+    panel_input_locked: bool = False,
+) -> dict:
+    if dry_run:
+        payload = {
+            "ok": True,
+            "result": (
+                "DRY_RUN\n\n```vote\n"
+                '{"stance":"approve","severity":"none","refs":[],"note":"dry-run"}\n'
+                "```"
+            ),
+            "dry_run": True,
+        }
+        out_path.write_text(json.dumps(payload), encoding="utf-8")
+        err_path.write_text("", encoding="utf-8")
+        return {
+            "target": target,
+            "engine": engine,
+            "exit_code": 0,
+            "ok": True,
+            "seconds": 0.0,
+        }
+
+    # NOTE: agent-dispatch has no --workdir flag (unknown option).
+    # Panel prompts use absolute artifact paths; run dispatch with cwd=repo
+    # so any relative paths resolve inside the git checkout.
+    # Impl stage: pass --repo=<implementor worktree> so reviewers see IMPL_SHA.
+    # expected_artifacts (if used on impl dispatches) are validated against the
+    # *seat* cwd from standup (/tmp/arb-orch/<p>/work), NOT task-body paths —
+    # orch must verify worktree bytes independently (2026-07-18 testv2b gotcha).
+    #
+    # Slice 1d-iv: publish-then-quartet (no free-form positional task).
+    redis_url = str(env.get("ARB_MEMORY_REDIS_URL") or os.environ.get("ARB_MEMORY_REDIS_URL") or "").strip()
+    if not redis_url:
+        err = (
+            "ARB_MEMORY_REDIS_URL required for harness publish "
+            "(Slice 1d-iv authority path)\n"
+        )
+        out_path.write_text("", encoding="utf-8")
+        err_path.write_text(err, encoding="utf-8")
+        return {
+            "target": target,
+            "engine": engine,
+            "exit_code": 2,
+            "ok": False,
+            "seconds": 0.0,
+            "dispatch_ok_field": None,
+            "completion": None,
+            "task_id": None,
+        }
+
+    with tempfile.TemporaryDirectory(prefix="panel-dispatch-") as tmp:
+        tmp_p = Path(tmp)
+        brief_file = tmp_p / "brief.md"
+        brief_file.write_text(
+            wrap_instructions_as_brief(prompt, vantage="arb-orch-panel"),
+            encoding="utf-8",
+        )
+        pub = subprocess.run(
+            [
+                str(BRIDGE_ROOT / "scripts" / "arb-memory-harness-publish"),
+                "--target-agent-id",
+                target,
+                "--brief",
+                str(brief_file),
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            env=env,
+            cwd=str(BRIDGE_ROOT),
+        )
+        if pub.returncode != 0:
+            out_path.write_text(pub.stdout or "", encoding="utf-8")
+            err_path.write_text(
+                f"harness-publish failed rc={pub.returncode}: {pub.stderr}",
+                encoding="utf-8",
+            )
+            return {
+                "target": target,
+                "engine": engine,
+                "exit_code": pub.returncode,
+                "ok": False,
+                "seconds": 0.0,
+                "dispatch_ok_field": None,
+                "completion": None,
+                "task_id": None,
+            }
+        receipt = json.loads(pub.stdout)
+        receipt_file = tmp_p / "receipt.json"
+        receipt_file.write_text(json.dumps(receipt), encoding="utf-8")
+        cmd = [
+            str(dispatch),
+            "--run-id",
+            run_id,
+            "--engine",
+            engine,
+            "--target-id",
+            target,
+            "--timeout",
+            str(timeout),
+            "--artefact-id",
+            str(receipt["artefact_id"]),
+            "--version",
+            str(receipt["version"]),
+            "--receipt",
+            str(receipt_file),
+            "--brief",
+            str(brief_file),
+        ]
+        if audit_panel:
+            cmd.append("--audit-panel")
+        if panel_input_locked:
+            cmd.append("--panel-input-locked")
+        # Enqueue without publish credentials (non-FABA identity).
+        from agent_redis_bridge.dispatch_authority import filter_publish_env
+
+        enq_env = filter_publish_env(env)
+
+        t0 = time.monotonic()
+        # Popen is intentional: task-id is printed before the bridge wait.  Both
+        # pipes are drained concurrently; reading stderr alone can deadlock a
+        # chatty dispatcher once stdout reaches the OS pipe capacity.
+        # TemporaryDirectory stays open until after wait so receipt/brief paths
+        # remain valid for the dispatcher child.
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=enq_env,
+            text=True,
+            bufsize=1,
+            cwd=str(repo),
+        )
+        stdout_lines: list[str] = []
+        stderr_lines: list[str] = []
+        task_pattern = re.compile(r"^task-id:\s*(\S+)")
+
+        def drain(stream, target: list[str], capture_task_id: bool = False) -> None:
+            for line in iter(stream.readline, ""):
+                target.append(line)
+                if capture_task_id and task_ids and slug:
+                    match = task_pattern.match(line.strip())
+                    if match:
+                        # DSP-1 retry emits another task-id; latest wins.
+                        task_ids.update(slug, match.group(1))
+            stream.close()
+
+        out_thread = threading.Thread(target=drain, args=(proc.stdout, stdout_lines), daemon=True)
+        err_thread = threading.Thread(target=drain, args=(proc.stderr, stderr_lines, True), daemon=True)
+        out_thread.start()
+        err_thread.start()
+        try:
+            proc.wait(timeout=max(1, timeout))
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        out_thread.join()
+        err_thread.join()
+        stdout = "".join(stdout_lines)
+        stderr = "".join(stderr_lines)
+        dt = time.monotonic() - t0
+        out_path.write_text(stdout, encoding="utf-8")
+        err_path.write_text(stderr, encoding="utf-8")
+        disp, _ = extract_result_text(stdout)
+        ok = bool(disp and disp.get("ok") is True) and proc.returncode == 0
+        return {
+            "target": target,
+            "engine": engine,
+            "exit_code": proc.returncode,
+            "ok": ok,
+            "seconds": round(dt, 2),
+            "dispatch_ok_field": None if disp is None else disp.get("ok"),
+            "completion": None if disp is None else disp.get("completion"),
+            "task_id": (task_ids.read().get(slug) if task_ids and slug else None),
+        }
+
+
+def severity_rank(sev: str) -> int:
+    return {"P0": 3, "P1": 2, "P2": 1, "none": 0}.get(sev or "none", 0)
+
+
+
+def cmd_monitor(out_dir: Path, timeout: int) -> int:
+    """Block until panel finishes. For harness background jobs — not model polls."""
+    out_dir = out_dir.expanduser().resolve()
+    if not out_dir.is_dir():
+        die(f"out-dir missing: {out_dir}", 1)
+    deadline = time.monotonic() + timeout if timeout > 0 else None
+    write_status(out_dir, state="monitoring", monitor_pid=os.getpid(), timeout=timeout)
+    while True:
+        summary_p = out_dir / "summary.json"
+        if summary_p.is_file():
+            summary = json.loads(summary_p.read_text(encoding="utf-8"))
+            gate = summary.get("gate", "?")
+            (out_dir / "monitor.exit").write_text(
+                json.dumps({"gate": gate, "code": 0 if gate == "PASS" else 1}) + "\n",
+                encoding="utf-8",
+            )
+            print(f"MONITOR done gate={gate} out={out_dir}", flush=True)
+            return 0 if gate == "PASS" else 1
+        pid = read_runner_pid(out_dir)
+        if pid is not None and not pid_alive(pid) and not summary_p.is_file():
+            # give filesystem a moment
+            time.sleep(0.5)
+            if not summary_p.is_file():
+                print(f"MONITOR dead runner pid={pid} no summary", file=sys.stderr)
+                (out_dir / "monitor.exit").write_text(
+                    json.dumps({"gate": "DEAD", "code": 1}) + "\n", encoding="utf-8"
+                )
+                return 1
+        if deadline is not None and time.monotonic() >= deadline:
+            print(f"MONITOR timeout out={out_dir}", file=sys.stderr)
+            (out_dir / "monitor.exit").write_text(
+                json.dumps({"gate": "TIMEOUT", "code": 1}) + "\n", encoding="utf-8"
+            )
+            return 1
+        time.sleep(1)
+
+
+def cmd_status(out_dir: Path) -> int:
+    out_dir = out_dir.expanduser().resolve()
+    if not out_dir.is_dir():
+        die(f"out-dir missing: {out_dir}", 1)
+    summary_p = out_dir / "summary.json"
+    pid = read_runner_pid(out_dir)
+    alive = bool(pid and pid_alive(pid))
+
+    if summary_p.is_file():
+        summary = json.loads(summary_p.read_text(encoding="utf-8"))
+        gate = summary.get("gate", "?")
+        print(f"done out={out_dir} gate={gate} max_severity={summary.get('max_severity')}")
+        print(f"  summary={summary_p}")
+        print(f"  votes={out_dir / 'votes.md'}")
+        if pid and alive:
+            print(f"  note: runner pid={pid} still alive after summary (exiting soon?)")
+        return 0 if gate == "PASS" else 1
+
+    if alive:
+        # progress: how many .out files
+        outs = list(out_dir.glob("*.out"))
+        print(f"running out={out_dir} pid={pid} outs={len(outs)}")
+        if (out_dir / "status.json").is_file():
+            try:
+                st = json.loads((out_dir / "status.json").read_text(encoding="utf-8"))
+                print(f"  status={st.get('state')} seats={st.get('seats')}")
+            except json.JSONDecodeError:
+                pass
+        return 3
+
+    print(f"dead out={out_dir} pid={pid} (no summary.json)", file=sys.stderr)
+    log = out_dir / "runner.log"
+    if log.is_file():
+        print(f"  runner.log tail:", file=sys.stderr)
+        print("\n".join(log.read_text(encoding="utf-8", errors="replace").splitlines()[-30:]), file=sys.stderr)
+    return 1
+
+
+def cmd_collect(out_dir: Path, wait: int) -> int:
+    out_dir = out_dir.expanduser().resolve()
+    deadline = time.monotonic() + max(0, wait)
+    while True:
+        code = cmd_status(out_dir)
+        if code != 3:
+            # print votes if present
+            votes = out_dir / "votes.md"
+            if votes.is_file():
+                print(votes.read_text(encoding="utf-8"))
+            return code
+        if wait <= 0 or time.monotonic() >= deadline:
+            return 3
+        time.sleep(2)
+
+
+def detach_self(argv: list[str], out_dir: Path) -> int:
+    """Re-exec without --detach in a new session; return immediately."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    # strip --detach from child argv
+    child_argv = [a for a in argv if a != "--detach"]
+    child_cmd = [sys.executable, str(Path(__file__).resolve()), *child_argv]
+    # force same out-dir so parent and child agree
+    if "--out-dir" not in child_argv:
+        child_cmd.extend(["--out-dir", str(out_dir)])
+
+    log_path = out_dir / "runner.log"
+    log_f = open(log_path, "ab", buffering=0)
+    # inherit env (FROM_AGENT_ID, AGENT_ENV_FILE, PYTHONPATH, …)
+    proc = subprocess.Popen(
+        child_cmd,
+        stdin=subprocess.DEVNULL,
+        stdout=log_f,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+        env=os.environ.copy(),
+    )
+    (out_dir / "runner.pid").write_text(str(proc.pid) + "\n", encoding="utf-8")
+    write_status(
+        out_dir,
+        state="detached",
+        pid=proc.pid,
+        cmd=child_cmd,
+    )
+    print(f"DETACHED out={out_dir}")
+    print(f"  pid={proc.pid}")
+    print(f"  log={log_path}")
+    print(f"  # harness bg monitor (optional; do NOT model-poll):")
+    print(f"  #   arb-orch-panel --monitor --out-dir {out_dir} --timeout 1800")
+    print(f"  # when orch resumes: arb-orch-panel --collect --out-dir {out_dir}")
+    return 0
+
+
+def resolve_out_dir(args: argparse.Namespace, project: str) -> Path:
+    if args.out_dir:
+        return args.out_dir.expanduser().resolve()
+    return (ORCH_DIR / project / "panels" / f"{args.stage}-r{args.round}").resolve()
+
+
+def run_panel(args: argparse.Namespace) -> int:
+    # Before ANY work, including --detach: a supplied run_id does not survive this tool.
+    refuse_run_id_this_tool_will_rewrite(
+        run_id=args.run_id, no_audit_panel=args.no_audit_panel
+    )
+    artifact = args.artifact.expanduser().resolve()
+    repo = args.repo.expanduser().resolve()
+    if not artifact.is_file():
+        die(f"artifact missing: {artifact}", 1)
+    if not ((repo / ".git").exists()):
+        die(
+            f"--repo is not a git checkout: {repo}\n"
+            "  throwaway workdirs yield completion not_a_git_repo and weak panel evidence",
+            1,
+        )
+    if not args.dispatch.is_file():
+        die(f"agent-dispatch not found: {args.dispatch}", 1)
+
+    roster_path = (
+        args.roster.expanduser().resolve()
+        if args.roster
+        else (ORCH_DIR / "roster-latest.json")
+    )
+    roster = load_roster(roster_path)
+    project = roster.get("project") or "project"
+    sender = roster.get("senderId") or f"pi-{project}-orch"
+    skip_target, stage_lineage = stage_owner(roster, args.stage)
+    out_dir = resolve_out_dir(args, project)
+
+    if args.detach:
+        # Build argv for child from current args (reconstruct cleanly)
+        child: list[str] = [
+            "--stage",
+            args.stage,
+            "--round",
+            str(args.round),
+            "--artifact",
+            str(artifact),
+            "--repo",
+            str(repo),
+            "--timeout",
+            str(args.timeout),
+            "--out-dir",
+            str(out_dir),
+            "--roster",
+            str(roster_path),
+            "--dispatch",
+            str(args.dispatch),
+        ]
+        if args.brief:
+            child.extend(["--brief", str(args.brief.expanduser().resolve())])
+        if args.include_adjuncts:
+            child.append("--include-adjuncts")
+        if args.run_id:
+            child.extend(["--run-id", args.run_id])
+        if args.dry_run:
+            child.append("--dry-run")
+        if args.no_audit_panel:
+            child.append("--no-audit-panel")
+        if args.panel_input_locked:
+            child.append("--panel-input-locked")
+        if args.events_tee:
+            child.append("--events-tee")
+        if args.no_events_tee:
+            child.append("--no-events-tee")
+        rc = detach_self(child, out_dir)
+        # Optional co-detached monitor: blocks in its own session until gate.
+        # Orch must NOT poll; harness may wait on monitor.pid if it supports wakes.
+        if getattr(args, "monitor", False):
+            mon_cmd = [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "--monitor",
+                "--out-dir",
+                str(out_dir),
+                "--timeout",
+                str(max(args.timeout * 4, 1800)),
+            ]
+            mon_log = open(out_dir / "monitor.log", "ab", buffering=0)
+            mon = subprocess.Popen(
+                mon_cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=mon_log,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                env=os.environ.copy(),
+            )
+            (out_dir / "monitor.pid").write_text(str(mon.pid) + "\n", encoding="utf-8")
+            print(f"MONITOR_DETACHED pid={mon.pid} log={out_dir / 'monitor.log'}")
+            print(f"  wait externally on pid/file; do not model-poll")
+        return rc
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    run_id = args.run_id or f"{args.stage}-r{args.round}-{utc_stamp()}"
+    (out_dir / "run-id.txt").write_text(run_id + "\n", encoding="utf-8")
+    # record our pid when running (foreground or detached child)
+    (out_dir / "runner.pid").write_text(str(os.getpid()) + "\n", encoding="utf-8")
+
+    if args.brief:
+        brief_path = args.brief.expanduser().resolve()
+        if not brief_path.is_file():
+            die(f"brief missing: {brief_path}", 1)
+        brief_text = brief_path.read_text(encoding="utf-8")
+    else:
+        brief_text = default_brief(
+            stage=args.stage,
+            round_n=args.round,
+            artifact=artifact,
+            repo=repo,
+            stage_lineage=stage_lineage,
+        )
+    (out_dir / "brief.md").write_text(brief_text, encoding="utf-8")
+
+    seats = collect_seats(roster, include_adjuncts=args.include_adjuncts)
+    launched: list[dict] = []
+    skipped: list[dict] = []
+    for s in seats:
+        tid = s["targetId"]
+        if tid == skip_target and skip_target != "inline":
+            skipped.append(
+                {
+                    "targetId": tid,
+                    "reason": f"same-seat {args.stage} author/implementor",
+                }
+            )
+            continue
+        launched.append(s)
+
+    if not launched:
+        die("no panel seats left to dispatch after same-seat skip", 1)
+    validate_panel_input_policy(
+        launched,
+        no_audit_panel=args.no_audit_panel,
+        panel_input_locked=args.panel_input_locked,
+    )
+
+    env = os.environ.copy()
+    env.setdefault("PYTHONPATH", str(DEFAULT_PY_SRC))
+    project_env = ORCH_DIR / project / ".env.bridge"
+    env = merge_env_file(env, Path(env.get("AGENT_ENV_FILE", project_env)))
+    if project_env.is_file():
+        env.setdefault("AGENT_ENV_FILE", str(project_env))
+    env.setdefault("FROM_AGENT_ID", sender)
+    env.setdefault("BRANCH", os.environ.get("BRANCH") or "main")
+
+    prompt = (
+        f"Read {out_dir / 'brief.md'} and execute it fully. "
+        f"Artifact under review: {artifact} (inside repo {repo}). "
+        "Reply with your full report and a single vote fence only."
+    )
+
+    write_status(
+        out_dir,
+        state="running",
+        run_id=run_id,
+        stage=args.stage,
+        round=args.round,
+        seats=[s["targetId"] for s in launched],
+        skipped=skipped,
+        pid=os.getpid(),
+    )
+
+    print(f"arb-orch-panel run_id={run_id}", flush=True)
+    print(f"  stage={args.stage} round={args.round} project={project}", flush=True)
+    print(f"  artifact={artifact}", flush=True)
+    print(f"  repo={repo}", flush=True)
+    print(f"  out={out_dir}", flush=True)
+    print(f"  seats={', '.join(s['targetId'] for s in launched)}", flush=True)
+    if skipped:
+        print(f"  skipped={skipped}", flush=True)
+
+    audit_panel = not args.no_audit_panel
+    results: list[dict] = []
+    task_ids = TaskIdRegistry(out_dir / "task-ids.json")
+    tee_stop = threading.Event()
+    tee_thread = None
+    if args.events_tee and not args.dry_run:
+        # Capture the stream cursor before pool.submit: this is the anti-race
+        # boundary for task_started/lifecycle events.
+        tee_thread = start_events_tee(out_dir=out_dir, run_id=run_id, env=env, stop=tee_stop, task_ids=task_ids)
+
+    def _job(s: dict) -> dict:
+        slug = seat_slug(s["targetId"])
+        meta = dispatch_one(
+            dispatch=args.dispatch,
+            engine=s["engine"],
+            target=s["targetId"],
+            run_id=f"{run_id}-{slug}",
+            timeout=args.timeout,
+            repo=repo,
+            prompt=prompt,
+            out_path=out_dir / f"{slug}.out",
+            err_path=out_dir / f"{slug}.err",
+            audit_panel=audit_panel,
+            dry_run=args.dry_run,
+            env=env,
+            task_ids=task_ids,
+            slug=slug,
+            panel_input_locked=args.panel_input_locked,
+        )
+        meta["slug"] = slug
+        meta["lineage"] = s.get("lineage")
+        meta["certifying"] = bool(s.get("certifying", True))
+        meta["label"] = s.get("label")
+        meta["same_lineage_as_owner"] = (
+            (s.get("lineage") == stage_lineage)
+            and stage_lineage not in ("inline", None, "")
+        )
+        # progress marker for --status
+        done_path = out_dir / f"{slug}.done"
+        done_path.write_text(json.dumps(meta) + "\n", encoding="utf-8")
+        return meta
+
+    with ThreadPoolExecutor(max_workers=max(1, len(launched))) as pool:
+        futs = {pool.submit(_job, s): s for s in launched}
+        for fut in as_completed(futs):
+            meta = fut.result()
+            results.append(meta)
+            print(
+                f"DONE {meta['target']} exit={meta['exit_code']} ok={meta['ok']} "
+                f"t={meta['seconds']}s",
+                flush=True,
+            )
+
+    tee_stop.set()
+    if tee_thread:
+        tee_thread.join(timeout=2)
+
+    votes: list[dict] = []
+    max_sev = "none"
+    gate_fail_reasons: list[str] = []
+
+    for meta in sorted(results, key=lambda m: m["target"]):
+        slug = meta["slug"]
+        raw = (out_dir / f"{slug}.out").read_text(encoding="utf-8")
+        disp, text = extract_result_text(raw)
+        (out_dir / f"{slug}.report.md").write_text(text or "", encoding="utf-8")
+
+        row: dict = {
+            "target": meta["target"],
+            "engine": meta["engine"],
+            "label": meta.get("label"),
+            "lineage": meta.get("lineage"),
+            "certifying": meta.get("certifying"),
+            "same_lineage_as_owner": meta.get("same_lineage_as_owner"),
+            "dispatch_exit": meta["exit_code"],
+            "dispatch_ok": meta["ok"],
+            "seconds": meta["seconds"],
+        }
+        if not meta["ok"]:
+            gate_fail_reasons.append(f"{meta['target']}: dispatch not ok")
+        try:
+            stance = parse_stance(text or "")
+            row.update(stance)
+            if severity_rank(stance["severity"]) > severity_rank(max_sev):
+                max_sev = stance["severity"]
+            if stance["severity"] in ("P0", "P1"):
+                gate_fail_reasons.append(
+                    f"{meta['target']}: severity {stance['severity']} ({stance['stance']})"
+                )
+        except StanceError as exc:
+            row["stance"] = None
+            row["severity"] = None
+            row["parse_error"] = str(exc)
+            gate_fail_reasons.append(f"{meta['target']}: vote parse failed: {exc}")
+        votes.append(row)
+
+    gate_pass = len(gate_fail_reasons) == 0
+    summary = {
+        "run_id": run_id,
+        "stage": args.stage,
+        "round": args.round,
+        "project": project,
+        "sender": sender,
+        "artifact": str(artifact),
+        "repo": str(repo),
+        "out_dir": str(out_dir),
+        "stage_owner_target": skip_target,
+        "stage_owner_lineage": stage_lineage,
+        "skipped": skipped,
+        "gate": "PASS" if gate_pass else "FAIL",
+        "max_severity": max_sev,
+        "fail_reasons": gate_fail_reasons,
+        "votes": votes,
+        "note": (
+            "ORCH: seat votes are claims — verify every P0/P1 against primary artifact bytes "
+            "(and runnable probes) before fold/remediate; write orch-disposition.md. "
+            "Severity is orch-owned. Persist *.report.md only after summary is durable. "
+            "Same-lineage must not sole-certify. Re-panel until gate PASS (0 P0/P1). "
+            "See <workspace>/docs/evidence-first-remediation.md."
+        ),
+    }
+    (out_dir / "summary.json").write_text(
+        json.dumps(summary, indent=2) + "\n", encoding="utf-8"
+    )
+    gc_seat_events(out_dir, summary_written=True)
+    write_status(
+        out_dir,
+        state="done",
+        run_id=run_id,
+        gate=summary["gate"],
+        max_severity=max_sev,
+        pid=os.getpid(),
+    )
+
+    lines = [
+        f"# Panel votes — {args.stage} r{args.round}",
+        "",
+        f"- run_id: `{run_id}`",
+        f"- gate: **{summary['gate']}** (max severity `{max_sev}`)",
+        f"- artifact: `{artifact}`",
+        "",
+        "| seat | stance | severity | same-lineage | note |",
+        "|---|---|---|---|---|",
+    ]
+    for v in votes:
+        note = (v.get("note") or v.get("parse_error") or "").replace("|", "\\|")
+        lines.append(
+            f"| `{v['target']}` | {v.get('stance')} | {v.get('severity')} | "
+            f"{v.get('same_lineage_as_owner')} | {note[:120]} |"
+        )
+    if gate_fail_reasons:
+        lines += ["", "## Fail reasons", ""]
+        lines += [f"- {r}" for r in gate_fail_reasons]
+    lines += [
+        "",
+        "## Orchestrator (do not skip)",
+        "",
+        "Seat votes/notes are **claims**. Before fold or implement:",
+        "1. Open each P0/P1 `*.report.md` and the cited artifact section (primary bytes).",
+        "2. Run a minimal probe when the claim is behavioral (e.g. vacuous `unittest` on main).",
+        "3. Accept / reject / reseverity severity in `orch-disposition.md` under the repo panel dir.",
+        "4. Only then edit the artifact and re-panel.",
+        "",
+        "Refs: `<workspace>/docs/evidence-first-remediation.md`, `<workspace>/AGENTS.md` (claims vs evidence).",
+        "",
+    ]
+    (out_dir / "votes.md").write_text("\n".join(lines), encoding="utf-8")
+
+    print(f"=== GATE {summary['gate']} max_severity={max_sev} ===", flush=True)
+    print(f"summary: {out_dir / 'summary.json'}", flush=True)
+    print(f"votes:    {out_dir / 'votes.md'}", flush=True)
+    if not gate_pass:
+        for r in gate_fail_reasons:
+            print(f"  - {r}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+
+    p = argparse.ArgumentParser(
+        prog="arb-orch-panel",
+        description="Roster-driven parallel panel dispatch + vote parse for /arb-orch",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Orch: never foreground-wait and never model-poll.\n"
+            "  arb-orch-panel --detach --monitor --stage plan --round N --artifact A --repo R\n"
+            "    → returns immediately; panel+monitor run in own sessions\n"
+            "  later (on wake/user): arb-orch-panel --collect --out-dir DIR\n"
+        ),
+    )
+    p.add_argument("--detach", action="store_true", help="start panel in background; return immediately")
+    p.add_argument("--status", action="store_true", help="check detached/foreground run status")
+    p.add_argument("--collect", action="store_true", help="print votes + exit gate code when done")
+    p.add_argument(
+        "--monitor",
+        action="store_true",
+        help="with --detach: also spawn bg monitor (non-blocking). alone: block until done (for harness job)",
+    )
+    p.add_argument("--wait", type=int, default=0, help="with --collect: poll up to N seconds (avoid in orch; prefer --detach --monitor)")
+    p.add_argument("--stage", choices=["design", "spec", "plan", "impl"])
+    p.add_argument("--round", type=int, default=1)
+    p.add_argument("--artifact", type=Path)
+    p.add_argument("--repo", type=Path)
+    p.add_argument("--brief", type=Path, default=None)
+    p.add_argument("--roster", type=Path, default=None)
+    p.add_argument("--timeout", type=int, default=600)
+    p.add_argument("--include-adjuncts", action="store_true")
+    p.add_argument("--run-id", default=None)
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--no-audit-panel", action="store_true")
+    p.add_argument("--panel-input-locked", action="store_true", help="stamp a certifying request as input-locked when audit is intentionally disabled")
+    p.add_argument("--events-tee", dest="events_tee", action="store_true", help="tee live Redis events (default for detach)")
+    p.add_argument("--no-events-tee", dest="no_events_tee", action="store_true", help="disable live Redis event tee")
+    p.add_argument("--dispatch", type=Path, default=DEFAULT_DISPATCH)
+    p.add_argument("--out-dir", type=Path, default=None)
+    args = p.parse_args(argv)
+    if args.no_events_tee:
+        args.events_tee = False
+    elif args.detach:
+        args.events_tee = True
+
+    # monitor-only / status / collect (no new panel)
+    if args.status or args.collect or (args.monitor and not args.detach):
+        if not args.out_dir:
+            die("--status/--collect/--monitor require --out-dir")
+        if args.monitor and not args.detach:
+            return cmd_monitor(args.out_dir, timeout=args.timeout)
+        if args.status and not args.collect:
+            return cmd_status(args.out_dir)
+        return cmd_collect(args.out_dir, wait=args.wait)
+
+    if not args.stage or not args.artifact or not args.repo:
+        die("--stage, --artifact, and --repo are required (unless --status/--collect/--monitor)")
+
+    return run_panel(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

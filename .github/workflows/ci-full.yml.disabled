@@ -1,0 +1,138 @@
+# CI — runs the non-e2e suite on every push/PR so verification doesn't live in
+# session memory. Mirrors the local recipe: fresh `uv sync --all-extras` env
+# (dev group carries pytest/anyio), pgvector-enabled Postgres + Redis services
+# so the arb_memory scratch-schema fixtures and redis_bus fixtures run for real
+# instead of skipping. e2e-marked tests stay explicit-only (they hit real
+# external boundaries).
+name: CI
+
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+
+env:
+  # Ephemeral CI service container on the runner's loopback only, torn down with the job -- this
+  # is not a secret and needs no repo configuration. Derived per-run so the file ships no literal:
+  # the `github` context IS available to workflow-level `env` and to `services.<id>.env`, which
+  # matters because service containers start BEFORE any step, so nothing sourced from a checked-out
+  # file (a .env, a script) can reach them. Only the *user* has to match the local dev convention
+  # (see the service block below) -- the password does not.
+  ARB_CI_PG_PASSWORD: ci-ephemeral-${{ github.run_id }}
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      postgres:
+        # pgvector image: tests CREATE EXTENSION vector in their scratch schemas.
+        # User/password/db mirror the canonical local dev convention
+        # (docs/runbooks/arb-memory-seat-e2e.md): tests derive the MCP-role DSN by
+        # rewriting the user "arb_memory:" -> "arbmem_mcp:" in ARB_MEMORY_DSN, so
+        # the superuser MUST be named arb_memory or the deny-proof tests silently
+        # run as superuser and fail.
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: arb_memory
+          POSTGRES_PASSWORD: ${{ env.ARB_CI_PG_PASSWORD }}
+          POSTGRES_DB: arb_memory
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U arb_memory"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history + all branches: the defect_hunts harness replays
+          # historical commits via `git show <sha>:<path>`, and the bridge-protocol
+          # gate resolves target_branch=main — both break on a depth-1 single-ref clone.
+          fetch-depth: 0
+      - name: Ensure local main ref exists
+        # The bridge-protocol gate resolves target_branch=main via `git merge-base
+        # main HEAD`; actions/checkout creates only the triggering branch and git
+        # does not DWIM origin/main for merge-base, so the gate fail-closes with
+        # a setup-error block. No-op when the triggering branch IS main.
+        run: git branch main origin/main || true
+      - uses: astral-sh/setup-uv@v5
+        with:
+          # Matches deploy/Dockerfile. coincurve is a runtime dependency and
+          # publishes no cp314 wheel, so 3.14 here would either fail the sync or
+          # build libsecp256k1 from source -- and would test a different
+          # interpreter than the one that ships. Bump both together, or neither.
+          python-version: "3.13"
+          enable-cache: true
+      - name: Install (all extras + dev group)
+        run: uv sync --all-extras
+      - name: Prepare database
+        # 1. arbmem_mcp needs LOGIN+password so the deny-proof tests can actually
+        #    reconnect as it (the conftest creates it password-less otherwise, and
+        #    _ensure_mcp_role skips creation when the role already exists).
+        # 2. schema.sql applied to public mirrors every real deployment: the
+        #    visibility app's own connections resolve unqualified tables
+        #    (transcript_io etc.) from public, not from the fixtures' scratch schemas.
+        env:
+          PGPASSWORD: ${{ env.ARB_CI_PG_PASSWORD }}
+        run: |
+          psql -h 127.0.0.1 -U arb_memory -d arb_memory -v ON_ERROR_STOP=1 \
+            -c "CREATE ROLE arbmem_mcp LOGIN PASSWORD '${{ env.ARB_CI_PG_PASSWORD }}'"
+          psql -h 127.0.0.1 -U arb_memory -d arb_memory -v ON_ERROR_STOP=1 -q \
+            -f src/arb_memory/schema.sql
+      - name: Install Playwright browser (journey live-render test is CI-required)
+        run: uv run playwright install --with-deps chromium
+
+      - name: Run test suite (non-e2e)
+        env:
+          ARB_MEMORY_DSN: postgresql://arb_memory:${{ env.ARB_CI_PG_PASSWORD }}@127.0.0.1:5432/arb_memory
+          # arb_messages tests read this at import (fail-loud) and self-provision
+          # their tables via setup_schema; sharing the DB with arb_memory is fine —
+          # arb_memory works in per-test UUID schemas, arb_messages in public.
+          ARB_MESSAGES_TEST_DSN: postgresql://arb_memory:${{ env.ARB_CI_PG_PASSWORD }}@127.0.0.1:5432/arb_memory
+          # Deliberately NOT set: ARB_MEMORY_REDIS_URL. The arb_memory redis_bus
+          # fixture already defaults to redis://127.0.0.1:6379/15, and the bridge
+          # reads the same variable as its AUDIT bus URL — exporting it globally
+          # made every test-constructed Bridge wire a real audit_redis client,
+          # breaking from_url call-count asserts and the transcript hotpath budget.
+        run: uv run pytest -m "not e2e" -q
+      # Capability-suite hermetic tests (merged 2026-07-09). Run from their own
+      # dirs per the pyproject testpaths note — collecting them alongside tests/
+      # collides on module basenames. Each suite's SPEC mandates CI coverage.
+      - name: Instrument 1 (tools/eval) hermetic suite
+        run: uv run pytest tools/eval/tests -q
+      - name: Implementor bench hermetic suite
+        run: uv run pytest bench/implbench/tests -q
+      - name: Author bench hermetic suite
+        run: uv run pytest tools/authorbench -q
+      # pi-sdk host node suite (added 2026-07-09): this suite previously ran only
+      # locally, which let mcp-bridge.adapter.test.mjs silently break against the
+      # pi-ai 0.80 export change until three review seats independently hit it.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: tools/pi-sdk-host/package-lock.json
+      - name: pi-sdk host node suite
+        working-directory: tools/pi-sdk-host
+        # The @earendil-works packages are intentionally NOT package.json deps:
+        # locally install.sh symlinks them from the global pi install (~300 MB
+        # tree shared with the pi-rpc engine). CI has no global pi, so install
+        # them pinned + --no-save. Keep the pin in lockstep with the fleet's
+        # global pi version (npm ls -g @earendil-works/pi-coding-agent).
+        run: |
+          npm ci
+          # Both packages explicitly: npm nests pi-ai under pi-coding-agent
+          # instead of hoisting, and the adapter test imports pi-ai top-level
+          # (same reason install.sh symlinks both).
+          npm install --no-save @earendil-works/pi-coding-agent@0.80.3 @earendil-works/pi-ai@0.80.3
+          npm test

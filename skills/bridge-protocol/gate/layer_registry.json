@@ -1,0 +1,115 @@
+{
+  "excluded_roots": [
+    "tests/**",
+    "docs/**",
+    "*.md",
+    "skills/__init__.py",
+    "skills/_diagnose_common/schemas/**",
+    "skills/diagnose/*.json",
+    "skills/diagnose-steer/*.json",
+    "pyproject.toml",
+    "skills/bridge-protocol/gate/schemas/**",
+    "skills/bridge-protocol/gate/*.json",
+    "skills/bridge-protocol/gate/results/**",
+    "**/.gitignore",
+    ".gitignore",
+    "**/*.gitignore"
+  ],
+  "rules": [
+    {
+      "pattern": "engines/**",
+      "layer": "engine",
+      "required_dimensions": [
+        "latency",
+        "state",
+        "interface"
+      ],
+      "owner": "bridge"
+    },
+    {
+      "pattern": "skills/bridge-protocol/gate/*.py",
+      "layer": "adapter",
+      "required_dimensions": [
+        "interface",
+        "filesystem"
+      ],
+      "owner": "bridge-protocol"
+    },
+    {
+      "pattern": "skills/_diagnose_common/canonical.py",
+      "layer": "diagnose-common",
+      "required_dimensions": [
+        "byte-form-determinism",
+        "neutrality"
+      ],
+      "owner": "diagnose"
+    },
+    {
+      "pattern": "skills/_diagnose_common/*.py",
+      "layer": "diagnose-common",
+      "required_dimensions": [
+        "dispatch-log-integrity",
+        "neutrality"
+      ],
+      "owner": "diagnose"
+    },
+    {
+      "pattern": "skills/diagnose/containment.py",
+      "layer": "diagnose-skill",
+      "required_dimensions": [
+        "integrated-run",
+        "test-containment"
+      ],
+      "owner": "diagnose"
+    },
+    {
+      "pattern": "skills/diagnose/briefs.py",
+      "layer": "diagnose-skill",
+      "required_dimensions": [
+        "integrated-run"
+      ],
+      "owner": "diagnose"
+    },
+    {
+      "pattern": "skills/diagnose/panel.py",
+      "layer": "diagnose-skill",
+      "required_dimensions": [
+        "integrated-run"
+      ],
+      "owner": "diagnose"
+    },
+    {
+      "pattern": "skills/diagnose/*.py",
+      "layer": "diagnose-skill",
+      "required_dimensions": [
+        "integrated-run"
+      ],
+      "owner": "diagnose"
+    },
+    {
+      "pattern": "skills/diagnose-steer/*.py",
+      "layer": "diagnose-steer-skill",
+      "required_dimensions": [
+        "integrated-run",
+        "temporal-barrier",
+        "confidence-correctness"
+      ],
+      "owner": "diagnose"
+    },
+    {
+      "pattern": "src/arb_files/**",
+      "layer": "storage-adapter",
+      "required_dimensions": [
+        "interface",
+        "backend"
+      ],
+      "owner": "arb-files"
+    },
+    {
+      "pattern": "**",
+      "layer": "unclassified",
+      "required_dimensions": [],
+      "owner": "bridge"
+    }
+  ]
+}

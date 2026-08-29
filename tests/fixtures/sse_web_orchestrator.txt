@@ -1,0 +1,22 @@
+id: 1719341000000-0
+event: seat_appear
+data: {"run_id":"run-web","task_id":"task-a","seat_id":"codex-web","orchestrator":"claude-web","event_type":"task_started","sent_at":"2026-06-25T10:00:00+00:00","data":"{}"}
+
+: ping
+
+id: 1719341000001-0
+event: seat_update
+data: {"run_id":"run-web","task_id":"task-b","seat_id":"agy-web","orchestrator":"claude-web","event_type":"task_continuing","sent_at":"2026-06-25T10:00:01+00:00","data":"{}"}
+
+id: 1719341000002-0
+event: seat_update
+data: {"run_id":"run-web","task_id":"task-b","seat_id":"agy-web","orchestrator":"claude-web","event_type":"vote","sent_at":"2026-06-25T10:00:02+00:00","data":"{\"stance\":\"approve\"}"}
+
+id: 1719341000003-0
+event: seat_finish
+data: {"run_id":"run-web","task_id":"task-a","seat_id":"codex-web","orchestrator":"claude-web","event_type":"task_finished","sent_at":"2026-06-25T10:00:03+00:00","data":"{\"ok\":true}"}
+
+id: 1719341000004-0
+event: seat_finish
+data: {"run_id":"run-web","task_id":"task-b","seat_id":"agy-web","orchestrator":"claude-web","event_type":"task_finished","sent_at":"2026-06-25T10:00:04+00:00","data":"{\"ok\":false}"}
+

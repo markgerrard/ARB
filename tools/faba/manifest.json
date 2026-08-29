@@ -1,0 +1,25 @@
+{
+  "manifest_version": 1,
+  "description": "FABA prototype permission manifest: broad read + exec + workspace writes for verify-don't-trust rounds; commit/push/deploy structurally denied. Declared at launch, never inherited interactively.",
+  "allowed_tools": [
+    "Read",
+    "Grep",
+    "Glob",
+    "Write",
+    "Edit",
+    "Bash",
+    "mcp__arb-memory-local__memory_search",
+    "mcp__arb-memory-local__memory_get",
+    "mcp__arb-memory-local__memory_recent"
+  ],
+  "disallowed_tools": [
+    "Task",
+    "WebFetch",
+    "WebSearch",
+    "Bash(git commit:*)",
+    "Bash(git push:*)",
+    "Bash(git merge:*)",
+    "Bash(git rebase:*)"
+  ],
+  "permission_mode": "acceptEdits"
+}

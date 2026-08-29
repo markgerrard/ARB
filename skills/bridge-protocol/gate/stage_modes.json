@@ -1,0 +1,8 @@
+{
+  "stages": {
+    "design-panel": {"mode": "blind", "eligible_validator": "diagnose"},
+    "spec-panel": {"mode": "blind", "eligible_validator": "diagnose"},
+    "steered-panel": {"mode": "steered", "eligible_validator": "diagnose-steer"},
+    "bridge-protocol-root": {"mode": "external", "eligible_validator": "external-base-case"}
+  }
+}

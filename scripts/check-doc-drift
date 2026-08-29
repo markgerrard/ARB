@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+"""Check mirrored doc fragments against docs/fragments atoms."""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+# The dispatch recipe, env-override table and failure-shape table moved out of the
+# root README when it was split into per-area READMEs (docs/readme-split): the root
+# file is now the orchestrator-first front door, and the operator surface these
+# fragments belong to lives beside the daemon.
+BRIDGE_README = ROOT / "src/agent_redis_bridge/README.md"
+SKILL = ROOT / "skills/using-agent-bridge/SKILL.md"
+ORCHESTRATOR_PATTERNS = ROOT / "docs/orchestrator-patterns.md"
+PIPELINE_MANUAL = ROOT / "docs/pipeline-operating-manual.md"
+
+FRAGMENTS = {
+    "dispatch-recipe": {
+        "path": ROOT / "docs/fragments/dispatch-recipe.md",
+        "targets": [BRIDGE_README, SKILL],
+    },
+    "env-overrides": {
+        "path": ROOT / "docs/fragments/env-overrides.md",
+        "targets": [BRIDGE_README, SKILL],
+    },
+    "failure-shapes": {
+        "path": ROOT / "docs/fragments/failure-shapes.md",
+        "targets": [BRIDGE_README, SKILL, ORCHESTRATOR_PATTERNS, PIPELINE_MANUAL],
+    },
+    "vote-fence": {
+        "path": ROOT / "docs/fragments/vote-fence.md",
+        "targets": [SKILL],
+    },
+}
+
+
+def extract_block(text: str, name: str, path: Path) -> str:
+    begin = f"<!-- fragment:{name} begin -->"
+    end = f"<!-- fragment:{name} end -->"
+    start = text.find(begin)
+    finish = text.find(end)
+    if start == -1 or finish == -1 or finish < start:
+        raise ValueError(f"{path.relative_to(ROOT)}: missing fragment markers for {name}")
+    start += len(begin)
+    return text[start:finish].strip()
+
+
+def owned_src_packages() -> list[str]:
+    """Top-level importable packages this repo ships (same discovery as tests/conftest.py)."""
+    src = ROOT / "src"
+    return sorted(
+        entry.name
+        for entry in src.iterdir()
+        if entry.is_dir()
+        and (entry / "__init__.py").is_file()
+        and not entry.name.endswith(".egg-info")
+    )
+
+
+def check_overview_names_packages() -> list[str]:
+    """ARB-B12 durable form: the orientation doc must name every shipped package.
+
+    The overview went 13 months naming zero of the subsystems added after
+    2026-06-10; a reader following "read this first" never learned they exist.
+    This assertion makes that drift a red check instead of a reviewer memory.
+    """
+    overview = ROOT / "docs/architecture-overview.md"
+    if not overview.is_file():
+        return [f"{overview.relative_to(ROOT)}: missing — the orientation doc is asserted by this check"]
+    text = overview.read_text()
+    return [
+        f"docs/architecture-overview.md: does not name src package `{pkg}` "
+        "(every top-level src/ package must appear in the orientation doc — ARB-B12)"
+        for pkg in owned_src_packages()
+        if pkg not in text
+    ]
+
+
+def main() -> int:
+    errors: list[str] = []
+    errors.extend(check_overview_names_packages())
+    expected: dict[str, str] = {}
+    for name, fragment_spec in FRAGMENTS.items():
+        fragment = fragment_spec["path"]
+        try:
+            expected[name] = fragment.read_text().strip()
+        except OSError as exc:
+            errors.append(
+                f"{fragment.relative_to(ROOT)}: missing fragment {name}: {exc.strerror}"
+            )
+    for name, fragment_spec in FRAGMENTS.items():
+        if name not in expected:
+            continue
+        expected_text = expected[name]
+        for target in fragment_spec["targets"]:
+            text = target.read_text()
+            try:
+                actual = extract_block(text, name, target)
+            except ValueError as exc:
+                errors.append(str(exc))
+                continue
+            if actual != expected_text:
+                errors.append(
+                    f"{target.relative_to(ROOT)}: fragment {name} differs from "
+                    f"{fragment_spec['path'].relative_to(ROOT)}"
+                )
+    if errors:
+        for error in errors:
+            print(f"doc-drift: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

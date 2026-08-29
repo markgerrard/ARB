@@ -1,0 +1,13 @@
+{
+  "P_max": 0.72,
+  "alt_contribution_cap": 0.9,
+  "floor": 0.05,
+  "weights": {
+    "predicate": 1.0
+  },
+  "strength_by_category": {
+    "live_data": 1.0,
+    "file_line": 0.55,
+    "none": 0.08
+  }
+}

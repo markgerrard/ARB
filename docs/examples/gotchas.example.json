@@ -1,0 +1,25 @@
+{
+  "_comment": "Example gotcha registry for gotcha-lint (Pattern D graduation). Copy to your project repo as .gotchas.json and edit. Only mechanically-greppable gotchas belong here; context-dependent ones stay as briefing notes injected into review briefs. See docs/gotcha-lint.md.",
+  "gotchas": [
+    {
+      "id": "pest-tothrow-throwable",
+      "description": "Pest toThrow(\\Throwable) falls back to message-substring matching, so the assertion passes for the wrong exception.",
+      "hint": "Assert a concrete exception class: toThrow(MyException::class).",
+      "pattern": "toThrow\\(\\s*\\\\?Throwable",
+      "include": ["*.php"],
+      "exclude": ["*vendor/*"],
+      "occurrences": 3,
+      "enforce": true
+    },
+    {
+      "id": "cascade-on-delete-history-fk",
+      "description": "cascadeOnDelete() on a history/audit-bearing FK lets a single hard delete vaporize the whole trail.",
+      "hint": "On history-bearing FKs prefer nullOnDelete() + softDeletes(). (Context-dependent — briefing only; review the FK before flipping enforce.)",
+      "pattern": "cascadeOnDelete\\(",
+      "include": ["*/migrations/*.php"],
+      "exclude": [],
+      "occurrences": 2,
+      "enforce": false
+    }
+  ]
+}

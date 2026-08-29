@@ -1,0 +1,64 @@
+# Local-only compose overlay. The Postgres password has no default on purpose: set
+# ARB_LOCAL_PG_PASSWORD yourself (e.g. `export ARB_LOCAL_PG_PASSWORD=$(openssl rand -hex 16)`)
+# before `docker compose up`, or compose fails with the message below. Throwaway, localhost
+# container only — never reuse it anywhere real.
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: arb_memory
+      POSTGRES_USER: arb_memory
+      POSTGRES_PASSWORD: ${ARB_LOCAL_PG_PASSWORD:?set ARB_LOCAL_PG_PASSWORD to a throwaway local password}
+    ports:
+      - "5544:5432"
+    volumes:
+      - arb_memory_pg:/var/lib/postgresql/data
+
+  valkey:
+    image: valkey/valkey:8-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+
+  memory:
+    depends_on:
+      - postgres
+      - valkey
+    environment:
+      ARB_MEMORY_DSN: postgresql://arb_memory:${ARB_LOCAL_PG_PASSWORD:?set ARB_LOCAL_PG_PASSWORD to a throwaway local password}@postgres:5432/arb_memory
+      ARB_MEMORY_REDIS_URL: redis://valkey:6379/15
+
+  audit:
+    depends_on:
+      - postgres
+      - valkey
+    environment:
+      ARB_MEMORY_DSN: postgresql://arb_memory:${ARB_LOCAL_PG_PASSWORD:?set ARB_LOCAL_PG_PASSWORD to a throwaway local password}@postgres:5432/arb_memory
+      ARB_MEMORY_REDIS_URL: redis://valkey:6379/15
+
+  mcp:
+    depends_on:
+      - postgres
+    environment:
+      ARB_MEMORY_MCP_PUBLIC_BASE_URL: http://127.0.0.1:8000
+      ARB_MEMORY_MCP_DSN: postgresql://arbmem_mcp:${ARB_LOCAL_PG_PASSWORD:?set ARB_LOCAL_PG_PASSWORD to a throwaway local password}@postgres:5432/arb_memory
+
+  # Local containerized visibility gateway for testing (web page + Go TUI target). Deliberately
+  # points at the HOST's real fleet data (the arb-memory-pg-dev standalone Postgres container on
+  # :5544, and the host's own Redis on :6379 db12/db13 — the actual bridge dispatch bus with real
+  # seat activity) via host.docker.internal, rather than this file's own empty postgres/valkey —
+  # an isolated fresh DB would show no seats at all. Dev-only: reuses the owner DSN directly
+  # (no least-privilege read role), same as the prior ad-hoc `python -m arb_memory visibility` run.
+  visibility:
+    ports:
+      - "8810:8810"
+    environment:
+      ARB_MEMORY_DSN: postgresql://arb_memory:${ARB_LOCAL_PG_PASSWORD:?set ARB_LOCAL_PG_PASSWORD to a throwaway local password}@host.docker.internal:5544/arb_memory
+      ARB_BRIDGE_BUS_URL: redis://host.docker.internal:6379/12
+      ARB_BRIDGE_BUS_PREFIX: "agent_scratch:"
+      ARB_TRACE_REDIS_URL: redis://host.docker.internal:6379/13
+      ARB_MEMORY_MCP_PUBLIC_BASE_URL: http://localhost:8810
+
+volumes:
+  arb_memory_pg:

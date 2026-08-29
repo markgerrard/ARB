@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Thin wrapper around `python -m agent_redis_bridge.gotcha_lint`.
+# Pattern D graduation: fail when a graduated (enforce:true) recurring gotcha
+# reappears. See docs/gotcha-lint.md.
+#
+#   gotcha-lint                         # scan tracked files against .gotchas.json
+#   gotcha-lint --diff main..HEAD       # scan only the added lines of a diff (CI)
+#   gotcha-lint --list                  # show the registry
+#   gotcha-lint --check-graduation      # flag briefing gotchas due for promotion
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PY="${AGENT_BRIDGE_PYTHON:-}"
+# venv may sit at the repo root or one level up (this host: /srv/agent-redis-bridge/.venv).
+for cand in "${REPO_ROOT}/.venv/bin/python" "${REPO_ROOT}/../.venv/bin/python"; do
+  [ -z "$PY" ] && [ -x "$cand" ] && PY="$cand"
+done
+[ -z "$PY" ] && PY=python3
+
+PYTHONPATH="${REPO_ROOT}/src${PYTHONPATH:+:$PYTHONPATH}" exec "$PY" -m agent_redis_bridge.gotcha_lint "$@"

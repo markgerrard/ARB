@@ -1,0 +1,262 @@
+#!/usr/bin/env python3
+"""Probe the reliable-inbox owner fence against a real Redis bus.
+
+Gate command:
+    uv run --extra arb-memory scripts/verify-reliable-inbox-owner-fence
+"""
+
+import argparse
+import json
+import os
+from pathlib import Path
+import sys
+import uuid
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from agent_redis_bridge.redis_io import RedisCli, RedisConfig  # noqa: E402
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="verify-reliable-inbox-owner-fence")
+    parser.add_argument(
+        "--env-file",
+        default=os.environ.get("AGENT_ENV_FILE"),
+        help="bridge Redis env file (defaults to AGENT_ENV_FILE; AGENT_REDIS_* env also works)",
+    )
+    parser.add_argument(
+        "--agent-id",
+        default=None,
+        help="probe agent id (defaults to a unique disposable id)",
+    )
+    args = parser.parse_args(argv)
+
+    config_path = Path(args.env_file) if args.env_file else Path("/dev/null")
+    try:
+        config = RedisConfig.from_env_file(config_path, overrides={})
+    except ValueError as exc:
+        print(f"owner-fence probe: Redis configuration error: {exc}", file=sys.stderr)
+        return 2
+
+    cli = RedisCli(config)
+    agent_id = args.agent_id or f"m2-owner-fence-probe-{uuid.uuid4().hex}"
+    body = json.dumps(
+        {"id": f"m2-probe-{uuid.uuid4().hex}", "kind": "request"},
+        separators=(",", ":"),
+    )
+    processing_key = config.processing_key(agent_id)
+    inbox_key = config.inbox_key(agent_id)
+    claim_key = config.processing_claim_key(agent_id, body)
+    owner_x = uuid.uuid4().hex
+    owner_y = uuid.uuid4().hex
+    recovery_body = json.dumps(
+        {"id": f"m2-recovery-probe-{uuid.uuid4().hex}", "kind": "request"},
+        separators=(",", ":"),
+    )
+    recovery_claim_key = config.processing_claim_key(agent_id, recovery_body)
+    crash_gap_body = json.dumps(
+        {"id": f"m2-crash-gap-probe-{uuid.uuid4().hex}", "kind": "request"},
+        separators=(",", ":"),
+    )
+    crash_gap_claim_key = config.processing_claim_key(agent_id, crash_gap_body)
+    mismatch_body_b = json.dumps(
+        {"id": f"m2-mismatch-b-{uuid.uuid4().hex}", "kind": "request"},
+        separators=(",", ":"),
+    )
+    mismatch_body_a = json.dumps(
+        {"id": f"m2-mismatch-a-{uuid.uuid4().hex}", "kind": "request"},
+        separators=(",", ":"),
+    )
+    mismatch_claim_key_b = config.processing_claim_key(agent_id, mismatch_body_b)
+    mismatch_claim_key_a = config.processing_claim_key(agent_id, mismatch_body_a)
+
+    try:
+        cli.client.delete(processing_key, inbox_key, claim_key)
+        cli.client.rpush(processing_key, body)
+        cli.claim_processing(agent_id, body, owner_x, ttl=60)
+        removed = cli.remove_processing(agent_id, body, owner_y)
+        survivors = cli.client.lrange(processing_key, 0, -1)
+        current_claim = cli.client.get(claim_key)
+        if removed != 0 or survivors != [body] or current_claim != owner_x:
+            print(
+                "owner-fence probe: FAIL "
+                f"removed={removed} survivors={survivors!r} claim_matches={current_claim == owner_x}",
+                file=sys.stderr,
+            )
+            return 1
+        print("owner-fence probe: PASS scenario=existing stale_remove=0 body_survives=1")
+
+        cli.client.delete(processing_key, inbox_key, claim_key, recovery_claim_key)
+        cli.client.rpush(processing_key, recovery_body)
+        cli.claim_processing(agent_id, recovery_body, owner_x, ttl=60)
+        recovered = cli.recover_processing_to_inbox(agent_id)
+        if recovered != recovery_body:
+            print(
+                f"owner-fence probe: FAIL recovery-window recovered={recovered!r}",
+                file=sys.stderr,
+            )
+            return 1
+        cli.clear_processing_claim(agent_id, recovered)
+        successor_body = cli.blmove_to_processing(agent_id, timeout=1)
+        recovery_removed = cli.remove_processing(agent_id, successor_body, owner_x)
+        recovery_survivors = cli.client.lrange(processing_key, 0, -1)
+        recovery_claim = cli.client.get(recovery_claim_key)
+        if (
+            successor_body != recovery_body
+            or recovery_removed != 0
+            or recovery_survivors != [recovery_body]
+            or recovery_claim is not None
+        ):
+            print(
+                "owner-fence probe: FAIL recovery-window "
+                f"successor_reparked={successor_body == recovery_body} stale_remove={recovery_removed} "
+                f"survivors={recovery_survivors!r} claim_absent={recovery_claim is None}",
+                file=sys.stderr,
+            )
+            return 1
+
+        cli.claim_processing(agent_id, recovery_body, owner_y, ttl=60)
+        successor_removed = cli.remove_processing(agent_id, recovery_body, owner_y)
+        if successor_removed != 1 or cli.client.lrange(processing_key, 0, -1) != []:
+            print(
+                "owner-fence probe: FAIL recovery-window successor-remove "
+                f"removed={successor_removed} survivors={cli.client.lrange(processing_key, 0, -1)!r}",
+                file=sys.stderr,
+            )
+            return 1
+        print(
+            "owner-fence probe: PASS scenario=recovery-window "
+            "stale_remove=0 body_survives=1 successor_remove=1"
+        )
+
+        cli.client.delete(
+            processing_key,
+            inbox_key,
+            claim_key,
+            recovery_claim_key,
+            crash_gap_claim_key,
+        )
+        cli.client.rpush(processing_key, crash_gap_body)
+        cli.claim_processing(agent_id, crash_gap_body, owner_x, ttl=60)
+        if cli.peek_processing(agent_id) != crash_gap_body:
+            print("owner-fence probe: FAIL crash-gap peek", file=sys.stderr)
+            return 1
+        cli.clear_processing_claim(agent_id, crash_gap_body)
+        gap_removed = cli.remove_processing(agent_id, crash_gap_body, owner_x)
+        gap_processing = cli.client.lrange(processing_key, 0, -1)
+        gap_inbox = cli.client.lrange(inbox_key, 0, -1)
+        if (
+            gap_removed != 0
+            or gap_processing != [crash_gap_body]
+            or gap_inbox
+            or cli.client.get(crash_gap_claim_key) is not None
+        ):
+            print(
+                "owner-fence probe: FAIL crash-gap stale-remove "
+                f"removed={gap_removed} processing={gap_processing!r} inbox={gap_inbox!r} "
+                f"claim_absent={cli.client.get(crash_gap_claim_key) is None}",
+                file=sys.stderr,
+            )
+            return 1
+
+        if cli.peek_processing(agent_id) != crash_gap_body:
+            print("owner-fence probe: FAIL crash-gap retry-peek", file=sys.stderr)
+            return 1
+        cli.clear_processing_claim(agent_id, crash_gap_body)
+        recovered_gap = cli.recover_processing_to_inbox(agent_id)
+        gap_inbox = cli.client.lrange(inbox_key, 0, -1)
+        if (
+            recovered_gap != crash_gap_body
+            or cli.peek_processing(agent_id) is not None
+            or gap_inbox != [crash_gap_body]
+            or cli.client.get(crash_gap_claim_key) is not None
+        ):
+            print(
+                "owner-fence probe: FAIL crash-gap recovery "
+                f"recovered={recovered_gap == crash_gap_body} "
+                f"processing_peek={cli.peek_processing(agent_id)!r} "
+                f"inbox={gap_inbox!r} claim_absent={cli.client.get(crash_gap_claim_key) is None}",
+                file=sys.stderr,
+            )
+            return 1
+        print(
+            "owner-fence probe: PASS scenario=crash-gap "
+            "stale_remove=0 body_survives=1 recovered_once=1 claim_absent=1"
+        )
+
+        cli.client.delete(
+            processing_key,
+            inbox_key,
+            mismatch_claim_key_b,
+            mismatch_claim_key_a,
+        )
+        cli.client.rpush(processing_key, mismatch_body_b, mismatch_body_a)
+        cli.claim_processing(agent_id, mismatch_body_b, owner_x, ttl=60)
+        cli.claim_processing(agent_id, mismatch_body_a, owner_x, ttl=60)
+        peeked_body = cli.peek_processing(agent_id)
+        mismatch_removed = cli.remove_processing(agent_id, peeked_body, owner_x)
+        mismatch_recovery = cli.recover_validated(agent_id, peeked_body)
+        recovered_mismatch = cli.recover_validated(agent_id, mismatch_body_b)
+        moved_claim = cli.client.get(mismatch_claim_key_b)
+        mismatch_inbox = cli.client.lrange(inbox_key, 0, -1)
+        if (
+            peeked_body != mismatch_body_a
+            or mismatch_removed != 1
+            or mismatch_recovery != 0
+            or recovered_mismatch != 1
+            or cli.client.lrange(processing_key, 0, -1)
+            or mismatch_inbox != [mismatch_body_b]
+            or moved_claim is not None
+        ):
+            print(
+                "owner-fence probe: FAIL peek-move-mismatch recovery "
+                f"peeked_a={peeked_body == mismatch_body_a} removed_a={mismatch_removed} "
+                f"validation={mismatch_recovery} recovered_b={recovered_mismatch} "
+                f"processing={cli.client.lrange(processing_key, 0, -1)!r} "
+                f"inbox={mismatch_inbox!r} moved_claim_absent={moved_claim is None}",
+                file=sys.stderr,
+            )
+            return 1
+        successor_mismatch = cli.blmove_to_processing(agent_id, timeout=1)
+        cli.claim_processing(agent_id, successor_mismatch, owner_y, ttl=60)
+        stale_mismatch = cli.remove_processing(agent_id, successor_mismatch, owner_x)
+        mismatch_survivors = cli.client.lrange(processing_key, 0, -1)
+        if (
+            successor_mismatch != mismatch_body_b
+            or stale_mismatch != 0
+            or mismatch_survivors != [mismatch_body_b]
+            or cli.client.get(mismatch_claim_key_b) != owner_y
+        ):
+            print(
+                "owner-fence probe: FAIL peek-move-mismatch stale-remove "
+                f"successor_reparked={successor_mismatch == mismatch_body_b} "
+                f"stale_remove={stale_mismatch} survivors={mismatch_survivors!r} "
+                f"successor_claim={cli.client.get(mismatch_claim_key_b) == owner_y}",
+                file=sys.stderr,
+            )
+            return 1
+        print(
+            "owner-fence probe: PASS scenario=peek-move-mismatch "
+            "stale_remove=0 body_survives=1 moved_claim_absent=1"
+        )
+        return 0
+    except Exception as exc:  # noqa: BLE001 - a probe must report bus failures clearly
+        print(f"owner-fence probe: ERROR {exc}", file=sys.stderr)
+        return 1
+    finally:
+        try:
+            cli.client.delete(
+                processing_key,
+                inbox_key,
+                claim_key,
+                recovery_claim_key,
+                crash_gap_claim_key,
+                mismatch_claim_key_b,
+                mismatch_claim_key_a,
+            )
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,18 @@
+{
+  "type": "object",
+  "required": ["paths", "window"],
+  "properties": {
+    "paths": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "window": {
+      "type": "object",
+      "required": ["start", "end"],
+      "properties": {
+        "start": {"type": "integer"},
+        "end": {"type": "integer"}
+      }
+    }
+  }
+}

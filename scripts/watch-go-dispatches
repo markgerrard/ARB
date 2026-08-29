@@ -1,0 +1,225 @@
+#!/usr/bin/env bash
+# watch-go-dispatches — silent completion waiter for go-client / agent-dispatch panels
+#
+# WHY THIS EXISTS (Grok Build §8b / §8d):
+#   Ad-hoc monitor loops false-fired (pgrep races, matching the monitor's own argv,
+#   "no go-client yet" in the first seconds after & launch). Each false DONE still
+#   costs a full warm-session model turn over huge context. This script prints
+#   NOTHING until true completion, and never uses process-name discovery.
+#
+# USAGE:
+#   # After launching N background dispatches, write a manifest then wait:
+#   cat > /tmp/panel.manifest <<EOF
+#   sol  12345  94054c79-...  /tmp/panel-sol.out
+#   grok 12346  9636a92b-...  /tmp/panel-grok.out
+#   agy  12347  ddffaa71-...  /tmp/panel-agy.out
+#   EOF
+#   # columns: label  pid  task-id  out-path
+#
+#   scripts/watch-go-dispatches /tmp/panel.manifest
+#   # exit 0 when all seats done; prints one banner to stdout
+#
+# OPTIONS (env):
+#   WATCH_SLEEP_SECS=20          poll interval (default 20)
+#   WATCH_MIN_WAIT_SECS=15       do not declare done before this many seconds (default 15)
+#   WATCH_MAX_WAIT_SECS=7200     give up after this (default 7200); exit 124
+#   WATCH_REDIS_HOST=127.0.0.1
+#   WATCH_REDIS_PORT=6379
+#   WATCH_REDIS_DB=12
+#   WATCH_REDIS_PREFIX=agent_scratch:
+#   WATCH_REDIS_TLS=0            1|true|yes for managed TLS buses
+#   WATCH_REDIS_USER=            ACL user (managed buses)
+#   WATCH_REDIS_PASSWORD=        exported as REDISCLI_AUTH, never argv
+#   WATCH_BANNER=IMPL PANEL R1   first line label (default DISPATCHES COMPLETE)
+#
+# DONE only when every output parses with ok=true AND Redis reports terminal success.
+# ok=false, invalid JSON, or a terminal failure state fails immediately.
+#
+# NEVER uses pgrep -f / pgrep -x go-client for done detection.
+set -euo pipefail
+
+MANIFEST=${1:-}
+if [[ -z "$MANIFEST" || ! -f "$MANIFEST" ]]; then
+  echo "usage: $0 <manifest-file>" >&2
+  echo "manifest lines: label  pid  task-id  out-path" >&2
+  exit 2
+fi
+
+SLEEP=${WATCH_SLEEP_SECS:-20}
+MIN_WAIT=${WATCH_MIN_WAIT_SECS:-15}
+MAX_WAIT=${WATCH_MAX_WAIT_SECS:-7200}
+RHOST=${WATCH_REDIS_HOST:-127.0.0.1}
+RPORT=${WATCH_REDIS_PORT:-6379}
+RDB=${WATCH_REDIS_DB:-12}
+RPREFIX=${WATCH_REDIS_PREFIX:-agent_scratch:}
+BANNER=${WATCH_BANNER:-DISPATCHES COMPLETE}
+
+# Managed-bus support: without TLS/auth flags the watcher silently sees every
+# task as nonterminal on a DO-Valkey-class bus and waits out the full timeout.
+REDIS_FLAGS=(-h "$RHOST" -p "$RPORT" -n "$RDB" --no-auth-warning)
+case "${WATCH_REDIS_TLS:-0}" in 1|true|True|yes) REDIS_FLAGS+=(--tls) ;; esac
+[[ -n "${WATCH_REDIS_USER:-}" ]] && REDIS_FLAGS+=(--user "$WATCH_REDIS_USER")
+[[ -n "${WATCH_REDIS_PASSWORD:-}" ]] && export REDISCLI_AUTH="$WATCH_REDIS_PASSWORD"
+
+is_success_state() {
+  case "${1:-}" in completed|done|ok) return 0 ;; *) return 1 ;; esac
+}
+
+is_failure_state() {
+  case "${1:-}" in failed|error|cancelled) return 0 ;; *) return 1 ;; esac
+}
+
+task_state() {
+  local tid=$1
+  redis-cli "${REDIS_FLAGS[@]}" \
+    HGET "${RPREFIX}task:${tid}:status" state 2>/dev/null || true
+}
+
+# Parse the dispatcher result without confusing a partially-written file with
+# a terminal failure. Redis polarity decides whether invalid/missing JSON is
+# terminal; a complete JSON ok=false is independently terminal.
+reply_ok() {
+  local out=$1
+  python3 - "$out" <<'PY'
+import json, sys
+try:
+    value = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception:
+    print("invalid")
+else:
+    if not isinstance(value, dict):
+        print("invalid")
+    elif value.get("ok") is True:
+        print("true")
+    elif value.get("ok") is False:
+        print("false")
+    else:
+        print("invalid")
+PY
+}
+
+# Return: 0=proven success, 1=pending, 2=proven failure.
+seat_done() {
+  local tid=$1 out=$2
+  local size=0 st ok
+  st=$(task_state "$tid")
+  is_failure_state "$st" && return 2
+  [[ -f "$out" ]] && size=$(wc -c <"$out" | tr -d ' ')
+  if [[ "${size:-0}" -le 0 ]]; then
+    is_success_state "$st" && return 2
+    return 1
+  fi
+  ok=$(reply_ok "$out")
+  [[ "$ok" == false ]] && return 2
+  if [[ "$ok" == invalid ]]; then
+    is_success_state "$st" && return 2
+    return 1
+  fi
+  is_success_state "$st" && return 0
+  return 1
+}
+
+# Parse once so an empty/comment-only manifest cannot satisfy vacuous "all",
+# and EOF without a trailing newline cannot silently drop the last seat.
+LABELS=()
+PIDS=()
+TASK_IDS=()
+OUT_PATHS=()
+while read -r label pid tid out || [[ -n "${label:-}${pid:-}${tid:-}${out:-}" ]]; do
+  [[ -z "${label:-}" || "$label" =~ ^# ]] && continue
+  if [[ -z "${pid:-}" || -z "${tid:-}" || -z "${out:-}" ]]; then
+    echo "invalid manifest row for label=$label" >&2
+    exit 2
+  fi
+  LABELS+=("$label")
+  PIDS+=("$pid")
+  TASK_IDS+=("$tid")
+  OUT_PATHS+=("$out")
+done <"$MANIFEST"
+
+if [[ ${#LABELS[@]} -eq 0 ]]; then
+  echo "manifest contains no seats" >&2
+  exit 2
+fi
+
+START=$(date +%s)
+STABLE=0
+
+while true; do
+  NOW=$(date +%s)
+  ELAPSED=$((NOW - START))
+  if [[ $ELAPSED -ge $MAX_WAIT ]]; then
+    echo "=== $BANNER TIMEOUT after ${MAX_WAIT}s ==="
+    for ((i=0; i<${#LABELS[@]}; i++)); do
+      label=${LABELS[$i]}; pid=${PIDS[$i]}; tid=${TASK_IDS[$i]}; out=${OUT_PATHS[$i]}
+      st=$(task_state "$tid")
+      sz=0; [[ -f "$out" ]] && sz=$(wc -c <"$out" | tr -d ' ')
+      alive=no; kill -0 "$pid" 2>/dev/null && alive=yes
+      echo "$label pid=$pid alive=$alive state=$st out_bytes=$sz"
+    done
+    echo "=== END ==="
+    exit 124
+  fi
+
+  all=1
+  for ((i=0; i<${#LABELS[@]}; i++)); do
+    label=${LABELS[$i]}; pid=${PIDS[$i]}; tid=${TASK_IDS[$i]}; out=${OUT_PATHS[$i]}
+    if [[ $ELAPSED -lt $MIN_WAIT ]]; then
+      all=0
+      continue
+    fi
+    set +e
+    seat_done "$tid" "$out"
+    rc=$?
+    set -e
+    if [[ $rc -eq 2 ]]; then
+      echo "=== $BANNER FAILED ==="
+      echo "$label state=$(task_state "$tid") out_bytes=$(wc -c <"$out" | tr -d ' ') ok=$(reply_ok "$out")"
+      echo "=== END ==="
+      exit 1
+    fi
+    [[ $rc -eq 0 ]] || all=0
+  done
+
+  if [[ $all -eq 1 ]]; then
+    STABLE=$((STABLE + 1))
+  else
+    STABLE=0
+  fi
+
+  # two consecutive green polls after MIN_WAIT
+  if [[ $STABLE -ge 2 ]]; then
+    break
+  fi
+
+  sleep "$SLEEP"
+done
+
+# --- single banner (only stdout for success path) ---
+echo "=== $BANNER ==="
+ok_count=0
+for ((i=0; i<${#LABELS[@]}; i++)); do
+  label=${LABELS[$i]}; pid=${PIDS[$i]}; tid=${TASK_IDS[$i]}; out=${OUT_PATHS[$i]}
+  st=$(task_state "$tid")
+  sz=0; [[ -f "$out" ]] && sz=$(wc -c <"$out" | tr -d ' ')
+  vote=""
+  if [[ -f "$out" && "$sz" -gt 0 ]]; then
+    vote=$(python3 -c "
+import json,re,sys
+p=sys.argv[1]
+try:
+  d=json.load(open(p))
+  r=d.get('result') or ''
+  m=re.search(r'\\{\"stance\"[^\\{\\}]*\\}', r)
+  print(m.group(0) if m else '')
+except Exception:
+  pass
+" "$out" 2>/dev/null || true)
+  fi
+  rok=$(reply_ok "$out")
+  [[ "$rok" == true ]] && ok_count=$((ok_count + 1))
+  echo "$label state=${st:-?} out_bytes=$sz ok=$([[ "$rok" == true ]] && echo 1 || echo 0) ${vote}"
+done
+echo "ok=$ok_count"
+echo "=== END ==="
+exit 0

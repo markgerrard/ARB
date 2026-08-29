@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+INSTANCE=${1:?instance name required}
+ENGINE=${AGENT_BRIDGE_ENGINE:-codex}
+WORKSPACE_ROLE=$INSTANCE
+
+# NOTE: gemini-acp removed 2026-07-03 — Google deprecated the gemini CLI, the engine is dead.
+for known_engine in pi-rpc pi-sdk grok-acp devin-acp agy-tmux agy-print codex; do
+  prefix="${known_engine}-"
+  if [[ "$INSTANCE" == "$prefix"* ]]; then
+    ENGINE=$known_engine
+    WORKSPACE_ROLE=${INSTANCE#"$prefix"}
+    break
+  fi
+done
+
+WORKSPACE=$WORKSPACE_ROLE
+ROLE=
+
+for node_bin in "$HOME"/.nvm/versions/node/*/bin; do
+  if [ -d "$node_bin" ]; then
+    PATH="$node_bin:$PATH"
+  fi
+done
+export PATH
+
+if [[ "$WORKSPACE_ROLE" == *-* ]]; then
+  WORKSPACE=${WORKSPACE_ROLE%%-*}
+  ROLE=${WORKSPACE_ROLE#*-}
+fi
+
+# Resolve project + workdir + sender-policy from environment variables
+# first (so a clone-anywhere setup can drive everything via a single
+# .env or systemd Environment= directives) and fall back to the legacy
+# project-c defaults if unset. See example-bridge/.env.example for the
+# canonical knob list.
+PROJECT=${AGENT_PROJECT:-project-c}
+PROJECT_ROOT=${AGENT_WORKDIR:-/srv/projects/${PROJECT}-${WORKSPACE}}
+ENV_FILE=${AGENT_ENV_FILE:-${PROJECT_ROOT}/.env}
+
+# AGENT_TRUSTED_SENDERS is a comma-separated list of `agent-id=role`
+# pairs (role: trusted|human). Empty falls back to the legacy project-c
+# trio so existing bridges keep working unchanged.
+TRUSTED_SENDERS=${AGENT_TRUSTED_SENDERS:-claude-project-c-dev=trusted,claude-project-c-staging=trusted,human-codexctl=human}
+
+args=(
+  --engine "$ENGINE"
+  --workspace "$WORKSPACE"
+  --project "$PROJECT"
+  --workdir "$PROJECT_ROOT"
+  --env-file "$ENV_FILE"
+)
+IFS=',' read -ra _SENDERS <<< "$TRUSTED_SENDERS"
+for _sender in "${_SENDERS[@]}"; do
+  _sender=${_sender// /}
+  [ -z "$_sender" ] && continue
+  args+=(--sender-policy "$_sender")
+done
+
+if [ -n "$ROLE" ]; then
+  args+=(--role "$ROLE")
+fi
+
+# Optional: override the DERIVED agent_id. Needed for shared-bus seats, whose inbox key must fall
+# inside the per-host worker grant (~agent_scratch:agent:worker-<host-slug>-*:inbox) — the daemon's
+# derive_agent_id(tool, project, workspace, role) can never produce a `worker-` prefix, so without
+# this a seat comes up on its derived id, NOPERMs on its own inbox, and dispatches hang silently.
+# Deliberately NOT named AGENT_ID: that name is exported by agent-inbox-watcher / agent-bridge-ping
+# / dispatch-dev, so a seat launched from such a shell would silently inherit the WRONG identity.
+# Unset => derived id, behaviour unchanged. See docs/self-hosted-bus.md.
+if [ -n "${AGENT_BRIDGE_AGENT_ID:-}" ]; then
+  args+=(--agent-id "$AGENT_BRIDGE_AGENT_ID")
+fi
+
+# Forward AGENT_MODEL to --model. Required for pi-rpc per-model daemons
+# (instance pins a single model — no per-dispatch override). Other engines
+# ignore it unless set, so safe to forward unconditionally when present.
+if [ -n "${AGENT_MODEL:-}" ]; then
+  args+=(--model "$AGENT_MODEL")
+fi
+
+USAGE_SCOPE=${AGENT_USAGE_SCOPE:-${CODEX_USAGE_SCOPE:-}}
+if [ -n "$USAGE_SCOPE" ]; then
+  args+=(--usage-scope "$USAGE_SCOPE")
+fi
+
+# Optional: cap the per-turn timeout (seconds). Lower it for engines whose CLI can hang
+# after producing output (e.g. agy --print) so a stuck turn frees the slot in minutes
+# instead of the 1h default.
+if [ -n "${AGENT_TURN_TIMEOUT:-}" ]; then
+  args+=(--turn-timeout "$AGENT_TURN_TIMEOUT")
+fi
+
+# Optional: launch Codex App Server with --dangerously-bypass-approvals-and-sandbox
+# so tasks can write to .git and outside the workspace-write sandbox. Only meaningful
+# for --engine codex; passing it for gemini is silently ignored by the daemon.
+if [ "${AGENT_BRIDGE_CODEX_BYPASS:-0}" = "1" ]; then
+  args+=(--codex-bypass-approvals-and-sandbox)
+fi
+
+if [ "${AGENT_FRESH_CONTEXT_DEFAULT:-0}" = "1" ]; then
+  args+=(--fresh-context-default)
+fi
+
+# Optional: local ARB Memory read MCP. When ARB_MEMORY_LOCAL_MCP names a tier (dev|prod) AND the
+# host's secret file exists, load the read-only reader DSN + OPENAI_API_KEY from it (secrets stay in
+# ~/.arb-memory-local/readers.env, mode 600 — never in plists/config), put the venv's console-script
+# dir on PATH so the engine-injected `arb-memory-local-mcp` resolves, and normalise the flag to "1"
+# so the engine injection (codex -c / ACP mcpServers / agent-sdk) activates. No-op + safe on hosts
+# without the secret file or without the var set.
+case "${ARB_MEMORY_LOCAL_MCP:-}" in
+  dev|prod)
+    _arb_tier="$ARB_MEMORY_LOCAL_MCP"
+    unset ARB_MEMORY_LOCAL_MCP
+    _arb_readers="$HOME/.arb-memory-local/readers.env"
+    if [ -f "$_arb_readers" ]; then
+      # shellcheck disable=SC1090
+      . "$_arb_readers"
+      if [ "$_arb_tier" = "prod" ]; then
+        export ARB_MEMORY_LOCAL_DSN="${ARB_MEMORY_LOCAL_DSN_PROD:-}"
+      else
+        export ARB_MEMORY_LOCAL_DSN="${ARB_MEMORY_LOCAL_DSN_DEV:-}"
+      fi
+      if [ -n "${ARB_MEMORY_LOCAL_DSN:-}" ]; then
+        export ARB_MEMORY_LOCAL_MCP=1
+        [ -n "${OPENAI_API_KEY:-}" ] && export OPENAI_API_KEY
+        _arb_venv_bin="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/.venv/bin"
+        [ -d "$_arb_venv_bin" ] && export PATH="$_arb_venv_bin:$PATH"
+      fi
+    fi
+    ;;
+esac
+
+# Pick a python that has the agent_redis_bridge module available.
+#   1. AGENT_BRIDGE_PYTHON env override always wins.
+#   2. Else, prefer a .venv adjacent to the repo checkout — the script lives at
+#      <repo>/scripts/agent-redis-bridge-systemd, so its parent's parent is the
+#      repo root. This works on macOS (where /usr/bin/python3 is Xcode's shim
+#      and lacks the bridge module) and any Linux deploy that uses a venv.
+#   3. Else, fall back to whatever python3 resolves to on PATH.
+#   4. Final fallback /usr/bin/python3 preserves legacy Linux systemd behaviour.
+if [ -z "${AGENT_BRIDGE_PYTHON:-}" ]; then
+  _bridge_script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+  _bridge_repo_root=$(cd "$_bridge_script_dir/.." && pwd)
+  if [ -x "$_bridge_repo_root/.venv/bin/python3" ]; then
+    AGENT_BRIDGE_PYTHON="$_bridge_repo_root/.venv/bin/python3"
+  elif command -v python3 >/dev/null 2>&1; then
+    AGENT_BRIDGE_PYTHON=$(command -v python3)
+  else
+    AGENT_BRIDGE_PYTHON=/usr/bin/python3
+  fi
+fi
+exec "$AGENT_BRIDGE_PYTHON" -m agent_redis_bridge "${args[@]}"

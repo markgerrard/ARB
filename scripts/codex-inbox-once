@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+# Consume exactly one Workflow 2 envelope for an interactive Codex peer.
+# Exiting after the envelope is printed triggers Codex's background-terminal
+# wake. Liveness is owned separately by codex-peer-heartbeat.
+
+set -euo pipefail
+umask 077
+
+HOST=${AGENT_REDIS_HOST:-127.0.0.1}
+PORT=${AGENT_REDIS_PORT:-6390}
+DB=${AGENT_REDIS_DB:-12}
+PREFIX=${AGENT_REDIS_PREFIX:-agent_scratch:}
+REDIS_USER=${AGENT_REDIS_USER:-}
+REDIS_TLS=${AGENT_REDIS_TLS:-0}
+REDIS_PASSWORD=${AGENT_REDIS_PASSWORD:-}
+AGENT=${AGENT_ID:?AGENT_ID env var required}
+BLPOP_TIMEOUT=${AGENT_BLPOP_TIMEOUT:-25}
+REJECT_DIR=${CODEX_INBOX_REJECT_DIR:-${XDG_STATE_HOME:-${HOME}/.local/state}/arb-peer/${AGENT}/inbox-rejects}
+# Normalise to an unambiguously non-option path. BSD chmod (macOS) does NOT
+# accept `--` as end-of-options, so guard the operand shape instead.
+case "${REJECT_DIR}" in /*) ;; *) REJECT_DIR="./${REJECT_DIR}" ;; esac
+
+INBOX="${PREFIX}agent:${AGENT}:inbox"
+REDIS_FLAGS=(-h "${HOST}" -p "${PORT}" -n "${DB}" --no-auth-warning --json -e)
+case "${REDIS_TLS}" in 1|true|True|yes) REDIS_FLAGS+=(--tls) ;; esac
+[ -n "${REDIS_USER}" ] && REDIS_FLAGS+=(--user "${REDIS_USER}")
+[ -n "${REDIS_PASSWORD}" ] && export REDISCLI_AUTH="${REDIS_PASSWORD}"
+
+TMP_DIR=$(mktemp -d)
+trap 'rm -rf -- "${TMP_DIR}"' EXIT
+
+spool_reject() {
+    local kind=$1
+    local source=$2
+    local suffix=$3
+    local digest bytes destination temporary
+
+    mkdir -p -- "${REJECT_DIR}"
+    chmod 700 "${REJECT_DIR}"
+    if command -v shasum >/dev/null 2>&1; then
+        digest=$(shasum -a 256 "${source}" | awk '{print $1}')
+    elif command -v sha256sum >/dev/null 2>&1; then
+        digest=$(sha256sum "${source}" | awk '{print $1}')
+    else
+        digest=$(openssl dgst -sha256 "${source}" | awk '{print $NF}')
+    fi
+    bytes=$(wc -c < "${source}" | tr -d '[:space:]')
+    destination="${REJECT_DIR}/${kind}-${digest}.${suffix}"
+    if [ ! -e "${destination}" ]; then
+        temporary=$(mktemp "${REJECT_DIR}/.${kind}.XXXXXX")
+        cp -- "${source}" "${temporary}"
+        chmod 600 "${temporary}"
+        # Hard-link publication is atomic and no-clobber. Duplicate content deliberately
+        # converges on one file rather than fabricating several phantom messages.
+        ln -- "${temporary}" "${destination}" 2>/dev/null || true
+        rm -f -- "${temporary}"
+    fi
+    SPOOL_PATH=${destination}
+    SPOOL_SHA256=${digest}
+    SPOOL_BYTES=${bytes}
+}
+
+while true; do
+    redis_output="${TMP_DIR}/redis-output.json"
+    redis_error="${TMP_DIR}/redis-error.txt"
+    : > "${redis_output}"
+    : > "${redis_error}"
+    set +e
+    redis-cli "${REDIS_FLAGS[@]}" BLPOP "${INBOX}" "${BLPOP_TIMEOUT}" \
+        >"${redis_output}" 2>"${redis_error}"
+    redis_status=$?
+    set -e
+
+    if [ "${redis_status}" -ne 0 ]; then
+        # A connection/command failure is NOT an inbox item. Preserve the diagnostic, then
+        # reconnect internally; never render it as a corrupt peer envelope and wake Codex.
+        if [ -s "${redis_error}" ]; then
+            spool_reject transport "${redis_error}" txt
+            printf '[watcher-transport] redis-cli rc=%s preserved=%s sha256=%s bytes=%s\n' \
+                "${redis_status}" "${SPOOL_PATH}" "${SPOOL_SHA256}" "${SPOOL_BYTES}" >&2
+        else
+            printf '[watcher-transport] redis-cli rc=%s no diagnostic bytes\n' \
+                "${redis_status}" >&2
+        fi
+        sleep 1
+        continue
+    fi
+
+    # RESP timeout is JSON null. A successful BLPOP is unambiguously [key, value]. Using
+    # tail(1) on --raw output used to turn any single stdout line into an empty "message".
+    if jq -e '. == null' "${redis_output}" >/dev/null 2>&1; then
+        continue
+    fi
+    if ! jq -e \
+        'type == "array" and length == 2 and (.[0] | type == "string") and (.[1] | type == "string")' \
+        "${redis_output}" >/dev/null 2>&1; then
+        spool_reject transport-shape "${redis_output}" json
+        printf '[watcher-transport] invalid redis-cli response preserved=%s sha256=%s bytes=%s\n' \
+            "${SPOOL_PATH}" "${SPOOL_SHA256}" "${SPOOL_BYTES}" >&2
+        sleep 1
+        continue
+    fi
+
+    popped_key=$(jq -r '.[0]' "${redis_output}")
+    body_file="${TMP_DIR}/body.json"
+    jq -j '.[1]' "${redis_output}" > "${body_file}"
+    if [ "${popped_key}" != "${INBOX}" ]; then
+        spool_reject rejected-body "${body_file}" bin
+        body_path=${SPOOL_PATH}
+        spool_reject rejected-redis "${redis_output}" json
+        printf '[watcher-error] BLPOP key mismatch expected=%s actual=%s body=%s raw=%s\n' \
+            "${INBOX}" "${popped_key}" "${body_path}" "${SPOOL_PATH}" >&2
+        exit 65
+    fi
+
+    compact=$(jq -ce --arg agent "${AGENT}" \
+        'if .to == $agent then . else error("envelope recipient mismatch") end' \
+        "${body_file}") || {
+        spool_reject rejected-body "${body_file}" bin
+        body_path=${SPOOL_PATH}
+        body_sha=${SPOOL_SHA256}
+        body_bytes=${SPOOL_BYTES}
+        spool_reject rejected-redis "${redis_output}" json
+        printf '[watcher-error] invalid envelope for %s body=%s body_sha256=%s body_bytes=%s raw=%s\n' \
+            "${AGENT}" "${body_path}" "${body_sha}" "${body_bytes}" "${SPOOL_PATH}" >&2
+        exit 65
+    }
+    printf '%s\n' "${compact}"
+    exit 0
+done

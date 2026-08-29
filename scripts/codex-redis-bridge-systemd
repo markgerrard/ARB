@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+exec /srv/projects/example-bridge/scripts/agent-redis-bridge-systemd "$@"

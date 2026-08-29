@@ -1,0 +1,64 @@
+# Doctrine gate — the fast subset that encodes the repo's own discipline:
+#   * tests/defect_hunts/        the executable hunts derived from docs/defect-classes/
+#   * AST guards                 spawn-env and gate-assertion guards, each with a vacuity control
+#   * engine parity              every engine adapter honours the same dispatch contract
+#   * check-doc-index            docs/index.json must name every tracked markdown file
+#   * no-credential-store-reads  README § Authentication guarantee, as a test
+#   * gitleaks (secrets job)     full-history secret scan, allowlist in .gitleaks.toml
+# Target: under two minutes on a fresh clone. The full 500s+ suite (Postgres, Redis, tmux)
+# lives in ci-full.yml.disabled and is run locally via scripts/suite-gate.
+name: doctrine-gate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      redis:
+        image: redis:7
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e . pytest anyio defusedxml
+      - name: Doc index is complete and fresh
+        run: python scripts/check-doc-index
+      - name: Doctrine gate
+        env:
+          PYTHONPATH: src
+          AGENT_REDIS_URL: redis://127.0.0.1:6379/15
+        run: |
+          python -m pytest -q -p no:cacheprovider \
+            tests/defect_hunts \
+            tests/test_engine_spawn_env_ast_guard.py \
+            tests/test_dispatch_engine_parity.py \
+            tests/test_doc_index.py \
+            tests/test_redact.py \
+            tests/test_daemon_import_graph.py \
+            tests/test_no_vendor_credential_store_reads.py
+
+  secrets:
+    # README § Authentication: no credential ever enters this repo. Full history, .gitleaks.toml
+    # allowlists the classified placeholder shapes.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_CONFIG: .gitleaks.toml

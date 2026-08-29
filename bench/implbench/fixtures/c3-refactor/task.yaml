@@ -1,0 +1,14 @@
+task_id: c3-refactor
+cluster: C3
+brief: |
+  Refactor calculator.py without changing baseline behavior. Add worker tests separately.
+tdd: true
+battery_id: c3-refactor
+worker_test_command: "python -m pytest tests -q --junitxml=report.xml"
+worker_test_report: report.xml
+expected_artifacts: ["calculator.py"]
+allowed_paths: ["calculator.py", "tests/**"]
+baseline_test_paths: ["tests/test_baseline.py"]
+worker_test_paths: ["tests/test_worker.py"]
+prohibitions: []
+timeout_s: 900

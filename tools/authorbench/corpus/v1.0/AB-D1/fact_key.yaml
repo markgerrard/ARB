@@ -1,0 +1,26 @@
+version: 1
+brief_id: AB-D1
+base_sha: 9de2850
+facts:
+- id: F1
+  claim: ok is in the eval tee allowlist
+  file: src/agent_redis_bridge/eval_tee.py
+  line: 10
+  pattern: EVAL_ALLOWLIST
+- id: F2
+  claim: extract_eval_payload builds a copied allowlist payload
+  file: src/agent_redis_bridge/eval_tee.py
+  line: 22
+  pattern: def extract_eval_payload
+- id: F3
+  claim: bridge has an _emit_vote seam at base
+  file: src/agent_redis_bridge/bridge.py
+  line: 2072
+  pattern: def _emit_vote
+traps:
+- id: T1
+  name: dead-vote-branch
+  precondition: a vote path bypasses push_task_event/eval_event_raw
+  file: src/agent_redis_bridge/bridge.py
+  symbol: _emit_vote
+  historical_catch: docs/superpowers/reviews/2026-07-03-arb-watch-history-design-panel-codex.md:34

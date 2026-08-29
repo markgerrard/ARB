@@ -1,0 +1,90 @@
+{
+  "coverage_ack": {
+    "file": "skills/defect_hunts/h2_assumptions.py",
+    "locator": "and coverage_acknowledgment.get(\"acknowledged\") is True",
+    "recipe": "delete-line",
+    "paired_case_id": "is_complete/coverage_ack"
+  },
+  "derived_nonempty": {
+    "file": "skills/defect_hunts/h2_assumptions.py",
+    "locator": "and len(derived) >= 1",
+    "recipe": "delete-line",
+    "paired_case_id": "is_complete/derived_nonempty"
+  },
+  "validity": {
+    "file": "skills/defect_hunts/h2_assumptions.py",
+    "locator": "and validate_h2_section(section, repo_root=repo_root)[0]",
+    "recipe": "delete-line",
+    "paired_case_id": "is_complete/validity"
+  },
+  "rows_subset": {
+    "file": "skills/defect_hunts/h2_assumptions.py",
+    "locator": "and all(isinstance(row, Mapping) and row.get(\"candidate_id\") in derived for row in rows)",
+    "recipe": "delete-line",
+    "paired_case_id": "is_complete/rows_subset"
+  },
+  "uniqueness": {
+    "file": "skills/defect_hunts/h2_assumptions.py",
+    "locator": "and len({row.get(\"candidate_id\") for row in rows}) == len(rows)",
+    "recipe": "delete-line",
+    "paired_case_id": "discovered/duplicate-id"
+  },
+  "every_derived_has_row": {
+    "file": "skills/defect_hunts/h2_assumptions.py",
+    "locator": "any(isinstance(row, Mapping) and row.get(\"candidate_id\") == candidate_id for row in rows)",
+    "recipe": "replace",
+    "replacement": "True",
+    "paired_case_id": "is_complete/every_derived_has_row"
+  },
+  "min_runs": {
+    "file": "skills/defect_hunts/h2_graduation.py",
+    "locator": "\"min_runs\": len(window) >= 10,",
+    "recipe": "delete-line",
+    "paired_case_id": "graduation/min_runs"
+  },
+  "min_disposed": {
+    "file": "skills/defect_hunts/h2_graduation.py",
+    "locator": "\"min_disposed\": disposed >= 20,",
+    "recipe": "delete-line",
+    "paired_case_id": "graduation/min_disposed"
+  },
+  "discrimination": {
+    "file": "skills/defect_hunts/h2_graduation.py",
+    "locator": "\"discrimination\": counts[\"not_load_bearing\"] >= 1 and (counts[\"answered\"] + counts[\"flag\"]) >= 1,",
+    "recipe": "delete-line",
+    "paired_case_id": "graduation/discrimination"
+  },
+  "fp_threshold": {
+    "file": "skills/defect_hunts/h2_graduation.py",
+    "locator": "\"fp_threshold\": disposed > 0 and (counts[\"not_load_bearing\"] / disposed) < 0.10,",
+    "recipe": "delete-line",
+    "paired_case_id": "graduation/fp_threshold"
+  },
+  "complete_only": {
+    "file": "skills/defect_hunts/h2_graduation.py",
+    "locator": "window = records_list if \"complete_only\" in disabled_guards else _complete_records(records_list)",
+    "recipe": "replace",
+    "replacement": "window = records_list",
+    "paired_case_id": "graduation/complete_only"
+  },
+  "runner_canary": {
+    "file": "tests/e2e/runner.py",
+    "locator": "h2_harness.assert_real_boundary_symbols()",
+    "recipe": "delete-line",
+    "paired_case_id": "deny-proof-1/mocked-boundary"
+  },
+  "spine_zero_case": {
+    "file": "tests/e2e/spine.py",
+    "locator": "if case_count == 0 or block_unrun > 0:",
+    "recipe": "replace",
+    "replacement": "if block_unrun > 0:",
+    "paired_case_id": "deny-proof-2/zero-case"
+  },
+  "runner_block_fail": {
+    "file": "tests/e2e/runner.py",
+    "locator": "block_fail += 1",
+    "recipe": "replace",
+    "replacement": "block_unrun += 1",
+    "paired_case_id": "deny-proof-3/surface-breakage"
+  }
+}

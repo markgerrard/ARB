@@ -1,0 +1,196 @@
+#!/usr/bin/env python3
+"""Live close-condition canary for the audit+eval spine. Mirrors arb-memory-artefact-audit-e2e.
+
+Drives one synthetic panel: mint run_id, emit dispatch+vote+verdict to the audit bus, XADD
+task_started/task_finished eval events per task to eval:events, run both consumers, then assert
+the 7 cardinality checks + the run_id-stripped deny-proof + the drain barrier. Run-isolated by run_tag.
+"""
+import json, os, sys, time, uuid
+
+import psycopg
+import redis as _redis
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+from arb_memory.audit import AuditConsumer, AuditRun           # noqa: E402
+from arb_memory.eval import EvalConsumer                       # noqa: E402
+
+
+def _connect(dsn):
+    return psycopg.connect(dsn, autocommit=True)
+
+
+def wait_until(fn, timeout_s, what):
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if fn():
+            return
+        time.sleep(0.1)
+    raise RuntimeError(f"timeout waiting for {what}")
+
+
+def main(argv=None):
+    dsn = os.environ["ARB_MEMORY_DSN"]
+    audit_url = os.environ["ARB_MEMORY_REDIS_URL"]
+    eval_url = os.environ["ARB_EVAL_REDIS_URL"]
+    eval_db = int(os.environ.get("ARB_EVAL_REDIS_DB", "4"))
+
+    run_tag = f"arb-eval-e2e-{uuid.uuid4().hex}"
+    prefix = f"{run_tag}:"
+    seats = [f"{run_tag}-codex", f"{run_tag}-m3"]      # 2 terminal seats
+    tasks = {seat: f"{run_tag}-task-{i}" for i, seat in enumerate(seats)}
+    orphan_task = f"{run_tag}-orphan"
+
+    ar = _redis.from_url(audit_url, decode_responses=True)
+    er = _redis.from_url(eval_url, db=eval_db, decode_responses=True)
+    conn = _connect(dsn)
+
+    audit = AuditConsumer(ar, lambda: _connect(dsn), prefix=prefix)
+    ev = EvalConsumer(er, lambda: _connect(dsn), prefix=prefix)
+
+    def cleanup():
+        conn.execute("DELETE FROM audit_events WHERE run_id = %s", (run_tag,))
+        conn.execute("DELETE FROM eval_event_raw WHERE run_id = %s", (run_tag,))
+        conn.execute(
+            "DELETE FROM eval_deadletter WHERE run_id = %s OR task_id = %s",
+            (run_tag, orphan_task),
+        )
+
+    try:
+        cleanup()
+        audit.start(); ev.start()
+
+        # --- emit the panel ---
+        run = AuditRun(ar, run_tag, prefix=prefix)
+        for seat in seats:
+            run.emit("orchestrator", "dispatch", {"actor": seat, "task_id": tasks[seat], "kind": "dispatch"})
+        for seat in seats:
+            run.emit("orchestrator", "vote", {"actor": seat, "task_id": tasks[seat], "kind": "vote", "vote": "approve"})
+        run.emit("orchestrator", "verdict", {"kind": "verdict", "verdict": "approve"})
+
+        stream = f"{prefix}eval:events"
+        for seat in seats:
+            for etype, data in (("task_started", {}), ("task_finished", {"ok": True})):
+                er.xadd(stream, {"run_id": run_tag, "task_id": tasks[seat], "seat_id": seat,
+                                 "event_type": etype, "sent_at": "2026-06-23T00:00:00+00:00",
+                                 "payload": json.dumps(data)})
+
+        # negative deny-proof: a run_id-stripped event must dead-letter, not insert
+        er.xadd(stream, {"task_id": orphan_task, "seat_id": "x", "event_type": "task_started",
+                         "sent_at": "2026-06-23T00:00:00+00:00", "payload": "{}"})
+
+        # --- wait for the spine to land ---
+        wait_until(lambda: conn.execute(
+            "SELECT count(*) FROM audit_events WHERE run_id=%s", (run_tag,)).fetchone()[0] >= 5, 60, "audit rows")
+        wait_until(lambda: conn.execute(
+            "SELECT count(*) FROM eval_event_raw WHERE run_id=%s", (run_tag,)).fetchone()[0] >= 4, 60, "eval rows")
+        wait_until(lambda: conn.execute(
+            "SELECT count(*) FROM eval_deadletter WHERE task_id=%s AND run_id IS NULL",
+            (orphan_task,),
+        ).fetchone()[0] == 1, 30, "deadletter")
+
+        # --- 7 cardinality assertions ---
+        n_runids = conn.execute(
+            "SELECT count(*) FROM ("
+            " SELECT run_id FROM audit_events WHERE run_id=%s UNION SELECT run_id FROM eval_event_raw WHERE run_id=%s"
+            ") u", (run_tag, run_tag)).fetchone()[0]
+        assert n_runids == 1, f"expected 1 run_id, got {n_runids}"
+
+        n_dispatch = conn.execute(
+            "SELECT count(*) FROM audit_events WHERE run_id=%s AND kind='dispatch'", (run_tag,)).fetchone()[0]
+        assert n_dispatch == len(seats), f"dispatch rows {n_dispatch} != {len(seats)}"
+
+        n_votes = conn.execute(
+            "SELECT count(*) FROM audit_events WHERE run_id=%s AND kind='vote'", (run_tag,)).fetchone()[0]
+        assert n_votes == len(seats), f"vote rows {n_votes} != {len(seats)}"
+
+        n_verdict = conn.execute(
+            "SELECT count(*) FROM audit_events WHERE run_id=%s AND kind='verdict'", (run_tag,)).fetchone()[0]
+        assert n_verdict == 1, f"verdict rows {n_verdict} != 1"
+
+        tasks_with_eval = conn.execute(
+            "SELECT count(DISTINCT task_id) FROM eval_event_raw WHERE run_id=%s", (run_tag,)).fetchone()[0]
+        assert tasks_with_eval == len(seats), f"tasks with eval {tasks_with_eval} != {len(seats)}"
+
+        # terminal predicate normalized (plan-panel M3 P1): accept the bridge's real terminal names.
+        # Bridge emits task_started (start) + task_finished (terminal). The IN-set tolerates a future
+        # rename to task_succeeded/task_failed without a canary edit.
+        bad_pairs = conn.execute(
+            "SELECT count(*) FROM (SELECT task_id, "
+            " count(*) FILTER (WHERE event_type='task_started') s, "
+            " count(*) FILTER (WHERE event_type IN ('task_finished','task_succeeded','task_failed')) f "
+            " FROM eval_event_raw WHERE run_id=%s GROUP BY task_id) t WHERE s<1 OR f<1", (run_tag,)).fetchone()[0]
+        assert bad_pairs == 0, f"{bad_pairs} task(s) missing start/terminal"
+
+        # run-isolation (plan-panel codex P1 / M3 P0): do NOT use a global `run_id <> run_tag` — the
+        # shared DO Postgres holds OTHER runs' rows (incl. live audit). Scope the foreign check to THIS
+        # run's task ids: every eval row for our task ids must carry our run_tag (never NULL/foreign),
+        # and every row carrying our run_tag must belong to one of our task ids.
+        our_tasks = list(tasks.values())
+        foreign = conn.execute(
+            "SELECT count(*) FROM eval_event_raw "
+            "WHERE task_id = ANY(%s) AND (run_id IS NULL OR run_id <> %s)", (our_tasks, run_tag)).fetchone()[0]
+        assert foreign == 0, f"{foreign} eval rows for our tasks with a foreign/missing run_id"
+        stray = conn.execute(
+            "SELECT count(*) FROM eval_event_raw WHERE run_id = %s AND NOT (task_id = ANY(%s))",
+            (run_tag, our_tasks)).fetchone()[0]
+        assert stray == 0, f"{stray} rows carry our run_tag but an unexpected task_id"
+
+        # negative confirmed: orphan went to deadletter, NOT eval_event_raw
+        assert conn.execute(
+            "SELECT count(*) FROM eval_event_raw WHERE task_id=%s", (orphan_task,)).fetchone()[0] == 0
+
+        # both-direction join (audit <-> eval on run_id)
+        joined = conn.execute(
+            "SELECT count(DISTINCT a.run_id) FROM audit_events a JOIN eval_event_raw e ON a.run_id=e.run_id "
+            "WHERE a.run_id=%s", (run_tag,)).fetchone()[0]
+        assert joined == 1, "audit<->eval join failed"
+
+        print(json.dumps({"ok": True, "run_tag": run_tag, "dispatch": n_dispatch,
+                          "votes": n_votes, "tasks_with_eval": tasks_with_eval}))
+
+        # --- drain barrier (plan-panel codex+M3 P1): a bare "stop, sleep, counts unchanged" is
+        # VACUOUS — stopped consumers can't insert, so it passes even with work still queued. First
+        # prove BOTH streams are fully consumed (pending==0 AND lag==0), THEN stop, THEN assert the
+        # writer committed nothing past the stop boundary. Counts are sampled AFTER quiesce+stop. ---
+        def _group_pending(r, stream, group):
+            try:
+                info = r.xpending(stream, group)
+                return int(info["pending"]) if isinstance(info, dict) else int(info[0])
+            except Exception:
+                return -1  # group/stream absent -> treat as not-yet-drained
+
+        def _group_lag(r, stream, group):
+            try:
+                info = next((item for item in r.xinfo_groups(stream) if item.get("name") == group), None)
+                return -1 if info is None or info.get("lag") is None else int(info["lag"])
+            except Exception:
+                return -1  # group/stream absent -> treat as not-yet-drained
+
+        wait_until(lambda: _group_pending(ar, f"{prefix}arbmem:audit", "arbmem-audit") == 0
+                   and _group_lag(ar, f"{prefix}arbmem:audit", "arbmem-audit") == 0,
+                   30, "audit stream drained")
+        wait_until(lambda: _group_pending(er, f"{prefix}eval:events", "arbmem-eval") == 0
+                   and _group_lag(er, f"{prefix}eval:events", "arbmem-eval") == 0,
+                   30, "eval stream drained")
+
+        audit.stop(); ev.stop()
+        time.sleep(2)
+        n_after_stop_a = conn.execute("SELECT count(*) FROM audit_events WHERE run_id=%s", (run_tag,)).fetchone()[0]
+        n_after_stop_e = conn.execute("SELECT count(*) FROM eval_event_raw WHERE run_id=%s", (run_tag,)).fetchone()[0]
+        time.sleep(2)  # second observation window: nothing may commit after the writer is quiesced
+        n_recheck_a = conn.execute("SELECT count(*) FROM audit_events WHERE run_id=%s", (run_tag,)).fetchone()[0]
+        n_recheck_e = conn.execute("SELECT count(*) FROM eval_event_raw WHERE run_id=%s", (run_tag,)).fetchone()[0]
+        if (n_recheck_a, n_recheck_e) != (n_after_stop_a, n_after_stop_e):
+            raise RuntimeError(f"drain-barrier violation a:{n_after_stop_a}->{n_recheck_a} e:{n_after_stop_e}->{n_recheck_e}")
+        return 0
+    finally:
+        try:
+            audit.stop(); ev.stop()
+        except Exception:
+            pass
+        cleanup()
+        conn.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

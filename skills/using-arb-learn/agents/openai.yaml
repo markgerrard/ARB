@@ -1,0 +1,4 @@
+interface:
+  display_name: "ARB Learn"
+  short_description: "Gate external techniques through ARB Learn"
+  default_prompt: "Use $using-arb-learn to evaluate an external technique through the ARB Learn gate."

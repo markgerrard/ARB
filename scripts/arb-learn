@@ -1,0 +1,10 @@
+#!/usr/bin/env python3
+"""ARB /learn intake CLI."""
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+from agent_redis_bridge.learn_intake import main  # noqa: E402
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

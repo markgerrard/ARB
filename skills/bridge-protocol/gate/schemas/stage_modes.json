@@ -1,0 +1,5 @@
+{
+  "name": "stage_modes",
+  "type": "object",
+  "required": ["stages"]
+}

@@ -1,0 +1,32 @@
+{
+  "id": "floor-001",
+  "description": "Example floor scenario — illustrates the schema; NOT a real fixture yet (seeds need >= I_min distinct instances per class for class-level claims).",
+  "subject": {
+    "repo": "../fixtures/webapp",
+    "base": "<sha>",
+    "head": "<sha>",
+    "spec": "fixtures/webapp/spec.md"
+  },
+  "seeded_defects": [
+    {"id": "D1", "class": "secrets-in-logs", "legible": true, "consensus_severity": "P1",
+     "location": {"file": "src/auth/session.py", "line": 88, "symbol": "log_request"},
+     "description": "bearer token written to request log"},
+    {"id": "D2", "class": "input-trust", "legible": true, "consensus_severity": "P0",
+     "location": {"file": "src/api/upload.py", "line": 42, "symbol": "handle_upload"},
+     "description": "deserializes untrusted multipart body without size/type guard"}
+  ],
+  "control_loci": [
+    {"id": "C1", "class": "secrets-in-logs",
+     "location": {"file": "src/auth/session.py", "line": 120, "symbol": "log_request_metadata"},
+     "description": "request metadata logging path that does not include bearer tokens"},
+    {"id": "C2", "class": "input-trust",
+     "location": {"file": "src/api/upload.py", "line": 77, "symbol": "validate_upload_metadata"},
+     "description": "upload metadata validation path with size/type checks already applied"}
+  ],
+  "panel": [
+    {"seat": "codex", "model": "gpt-5.5", "harness": "codex"},
+    {"seat": "agy", "model": "gemini", "harness": "agy-print"},
+    {"seat": "cold-opus", "model": "opus", "harness": "claude-subagent"}
+  ],
+  "power": {"V": 0.4, "nu": 0.1, "alpha": 0.05, "I_min": 5, "R_min": 3, "matcher_gate": 0.85}
+}

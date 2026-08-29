@@ -1,0 +1,27 @@
+{
+  "files": {
+    "tests/test_example.py": "def test_example():\n    assert True\n"
+  },
+  "diff": "diff --git a/tests/test_example.py b/tests/test_example.py\n--- a/tests/test_example.py\n+++ b/tests/test_example.py\n@@ -0,0 +1,2 @@\n+def test_example():\n+    assert True\n",
+  "changed_paths": [
+    "tests/test_example.py"
+  ],
+  "phase_input": {},
+  "expected": {
+    "derived": [],
+    "status": "enforced",
+    "record": {
+      "complete": false,
+      "dispositions": []
+    },
+    "graduation": {
+      "counted": false,
+      "disposition_counts": {
+        "answered": 0,
+        "not_load_bearing": 0,
+        "flag": 0
+      }
+    }
+  },
+  "notes": "Clean test-only diff; no H2 candidates."
+}

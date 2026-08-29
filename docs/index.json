@@ -1,0 +1,1388 @@
+[
+  {
+    "path": "AGENTS.md",
+    "purpose": "Agent discipline and bridge-worker role instructions.",
+    "status": "current",
+    "audience": "worker"
+  },
+  {
+    "path": "CHANGELOG.md",
+    "purpose": "Date-based release history and provenance links.",
+    "status": "current",
+    "audience": "any"
+  },
+  {
+    "path": "CLAUDE.md",
+    "purpose": "Orchestrator-role instructions for Claude Code sessions.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "README.md",
+    "purpose": "Install, run, and operate the bridge from a fresh clone.",
+    "status": "current",
+    "audience": "any"
+  },
+  {
+    "path": "SPEC.md",
+    "purpose": "Bridge protocol and implementation specification.",
+    "status": "current",
+    "audience": "any"
+  },
+  {
+    "path": "docs/BACKLOG.md",
+    "purpose": "Tracked future work not yet specced (cold-Opus run-id label; OAuth token refresh; seat re-roling).",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/INDEX.md",
+    "purpose": "Generated human-readable documentation routing table.",
+    "status": "current",
+    "audience": "any"
+  },
+  {
+    "path": "docs/agent-memory-seeds/README.md",
+    "purpose": "Seeds corpus overview: portable agent-memory starting points per harness.",
+    "status": "current",
+    "audience": "any"
+  },
+  {
+    "path": "docs/agent-memory-seeds/arb-dispatch-recipe.md",
+    "purpose": "Seed: canonical audited dispatch recipe for ARB panel seats.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/agent-memory-seeds/arb-overview.md",
+    "purpose": "Seed: what the ARB is and how its panels adjudicate.",
+    "status": "current",
+    "audience": "any"
+  },
+  {
+    "path": "docs/agent-memory-seeds/arb-panel-protocol.md",
+    "purpose": "Seed: panel protocol \u2014 roster manifest, votes, verdict close.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/agent-memory-seeds/arb-round-convergence.md",
+    "purpose": "Seed: round budgets, trajectories, and terminal rules.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/agent-memory-seeds/arb-verify-dont-trust.md",
+    "purpose": "Seed: verify-don't-trust \u2014 evidence checks before honoring claims.",
+    "status": "current",
+    "audience": "any"
+  },
+  {
+    "path": "docs/agent-memory-seeds/claude-harness/README.md",
+    "purpose": "Seed mirror: run Claude Code as ARB orchestrator on any host.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/agent-memory-seeds/claude-harness/author-round-input-mutation.md",
+    "purpose": "Seed (claude-harness): author rounds can mutate staged inputs; hash-verify them after any author round.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/agent-memory-seeds/claude-harness/bakeoff-execution-preference.md",
+    "purpose": "Seed mirror: parallel TDD implementors in worktrees, wall-time measured, then fused.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/agent-memory-seeds/claude-harness/benchmark-harness-destroys-its-own-data.md",
+    "purpose": "Seed (claude-harness): benchmark dispatches \u2014 stagger 2-3, freeze the seat workdir, stdout is the only copy.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/agent-memory-seeds/claude-harness/codex-fork-lockfile-rule.md",
+    "purpose": "Seed mirror: lockfile alignment rule for the codex fork.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/agent-memory-seeds/claude-harness/codex-pipeline-test-cadence.md",
+    "purpose": "Seed mirror: one full gate at the end; targeted suites between.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/agent-memory-seeds/claude-harness/consult-before-retry.md",
+    "purpose": "Seed mirror: convene a consult after two failed solo hypotheses.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/agent-memory-seeds/claude-harness/corrupt-target-dir-mimics-host-degradation.md",
+    "purpose": "Seed mirror: ABAB attribution before blaming the host for timeouts.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/agent-memory-seeds/claude-harness/devin-acp-seat-calibration.md",
+    "purpose": "Seed (claude-harness): devin-acp (SWE-1.7) roster calibration from its first live review cycle.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/agent-memory-seeds/claude-harness/harness-kills-long-waiters.md",
+    "purpose": "Seed (claude-harness): the harness kills long background shells; recovery pattern for dispatch waiters.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/agent-memory-seeds/claude-harness/headless-dispatch-continuation.md",
+    "purpose": "Seed mirror: own sender identity; every phase boundary needs a driver.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/agent-memory-seeds/claude-harness/mac-checkouts-https-with-insteadof.md",
+    "purpose": "Seed (claude-harness): Macs write HTTPS origins, transport SSH via insteadOf; never trust remote-URL text.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/agent-memory-seeds/claude-harness/panel-chain-fold-verify-loop.md",
+    "purpose": "Seed mirror: every fold is new authored surface \u2014 delta-verify it each round.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/agent-memory-seeds/claude-harness/seat-calibration-agy-soft-approve.md",
+    "purpose": "Seed mirror: agy approve is weak signal on design/plan reviews.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/agent-memory-seeds/claude-harness/seat-calibration-rogue-and-tallies.md",
+    "purpose": "Seed mirror: forbid rogue orchestration explicitly; verify tallies by diff, not report.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/agent-memory-seeds/claude-harness/seat-worktree-python-env-gap.md",
+    "purpose": "Seed (claude-harness): worktrees mirror the base .venv; briefs still name .venv/bin/python -m.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/agent-memory-seeds/claude-harness/verification-pinning-experiment.md",
+    "purpose": "Seed (claude-harness): CLAUDE.md acceptance block is an instrumented experiment; don't unpin casually.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/agent-memory-seeds/claude-harness/verify-remote-at-milestones.md",
+    "purpose": "Seed mirror: sweep unpushed commits per branch at every milestone.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/agent-memory-seeds/claude-harness/vote-fence-show-literal-json.md",
+    "purpose": "Seed (claude-harness): briefs must show the vote fence as literal JSON \u2014 described-only dropped a vote.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/agent-memory-seeds/claude-harness/wave1-ref-required-live.md",
+    "purpose": "Seed (claude-harness): wave-1 ref-required live on 7 shell-capable seats; 6 shell-less stay flag=0.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/agent-memory-seeds/claude-harness/worktree-flag-cannot-resume.md",
+    "purpose": "Seed (claude-harness): --worktree always creates; re-dispatch into one needs the prose pattern.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/agent-memory-seeds/codex-fork-work.md",
+    "purpose": "Seed: codex fork workflow and standing constraints.",
+    "status": "current",
+    "audience": "worker"
+  },
+  {
+    "path": "docs/agent-memory-seeds/faba-bounded-rounds.md",
+    "purpose": "Seed: FABA bounded-rounds contract and budget discipline.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/agent-memory-seeds/faba-subject-scope-discipline.md",
+    "purpose": "Seed: FABA subject scope \u2014 review the pinned subject, nothing else.",
+    "status": "current",
+    "audience": "worker"
+  },
+  {
+    "path": "docs/agent-memory-seeds/faba-worktree-recovery.md",
+    "purpose": "Seed: recovering FABA worktrees and leases after failures.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/agent-memory-seeds/mac-mini-quirks.md",
+    "purpose": "Seed: this Mac's host quirks (launchd, TCC, volumes, timeouts).",
+    "status": "current",
+    "audience": "any"
+  },
+  {
+    "path": "docs/agent-memory-seeds/operator-rules.md",
+    "purpose": "Seed: standing operator rules and authorization boundaries.",
+    "status": "current",
+    "audience": "any"
+  },
+  {
+    "path": "docs/agent-memory-seeds/orch-doctrine-imperatives.md",
+    "purpose": "Seed: orchestration doctrine imperatives (closure, drivers, terminals).",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/agent-memory-seeds/pi-organic/README.md",
+    "purpose": "Seed set: organic pi-harness memory starting points.",
+    "status": "current",
+    "audience": "any"
+  },
+  {
+    "path": "docs/agent-memory-seeds/pi-organic/aggressive-pi-memory-capture.md",
+    "purpose": "Seed: capture pi memories aggressively during sessions.",
+    "status": "current",
+    "audience": "worker"
+  },
+  {
+    "path": "docs/agent-memory-seeds/pi-organic/pi-memory-retrieval-heuristic.md",
+    "purpose": "Seed: when and how pi should retrieve stored memories.",
+    "status": "current",
+    "audience": "worker"
+  },
+  {
+    "path": "docs/agent-memory-seeds/zsh-panel-wrapper-recovery.md",
+    "purpose": "Seed: recovering zsh panel wrapper sessions after breakage.",
+    "status": "current",
+    "audience": "operator"
+  },
+  {
+    "path": "docs/agent-role-routing.md",
+    "purpose": "Default routing policy for assigning jobs to engines and reviewer seats.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/agent-sdk-probe-results.md",
+    "purpose": "agent-sdk mutation-probe per-model verdict (M3/Kimi/GLM held-out-verified).",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/always-up-seats.md",
+    "purpose": "Design for persistent Claude peer seats using systemd, tmux, and heartbeat supervision.",
+    "status": "current",
+    "audience": "operator"
+  },
+  {
+    "path": "docs/arb-comms-fork-plan.md",
+    "purpose": "ARB Comms fork plan: buzz as base, licence position, patch set, sequencing.",
+    "status": "design",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/architecture-overview.md",
+    "purpose": "Whole-system orientation for comms, engines, workflow, and ops layers.",
+    "status": "current",
+    "audience": "any"
+  },
+  {
+    "path": "docs/audit-close-1-design.md",
+    "purpose": "Design \u2014 orchestrator verdict-close path to the prod audit trail (audit-close verb + structural backstop; shipped).",
+    "status": "design",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/audit-close-2-design.md",
+    "purpose": "Design \u2014 bus-driven verdict close via the audit-close-consumer (no per-orchestrator ssh); builds on AUDIT-CLOSE-1.",
+    "status": "design",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/bridge-parallelism.md",
+    "purpose": "Engine pool design, max-parallel behavior, and control envelope semantics.",
+    "status": "current",
+    "audience": "any"
+  },
+  {
+    "path": "docs/bus-tap-logging.md",
+    "purpose": "Optional envelope tap logging convention for bus observability.",
+    "status": "runbook",
+    "audience": "operator"
+  },
+  {
+    "path": "docs/bus-trust-model.md",
+    "purpose": "Bus write-access as the trust boundary; accepted B6-F1 reflector, revisit trigger, ARB-B24 pointer.",
+    "status": "current",
+    "audience": "any"
+  },
+  {
+    "path": "docs/calibration-loop.md",
+    "purpose": "Report-only loop for calibrating reviewer and decision quality over time.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/claude-code-alt-model-providers.md",
+    "purpose": "Run the interactive Claude Code CLI against Kimi/GLM/MiniMax-M3 (env files + ~/.local/bin wrappers + aliases).",
+    "status": "current",
+    "audience": "operator"
+  },
+  {
+    "path": "docs/claude-code-provider-launchers.md",
+    "purpose": "Env-file launcher wrappers retargeting interactive Claude Code to glm/kimi/minimax, with an opus escape hatch.",
+    "status": "current",
+    "audience": "operator"
+  },
+  {
+    "path": "docs/claude-peer-coordination.md",
+    "purpose": "Claude-to-Claude peer coordination over Redis without bridge engines.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/decisions/agent-sdk-trusted-continuation.md",
+    "purpose": "Security design for trusted agent-sdk same-cwd continuation.",
+    "status": "design",
+    "audience": "any"
+  },
+  {
+    "path": "docs/decisions/arb-memory-architecture.md",
+    "purpose": "ARB Memory: hint-cache + versioned artefacts + audit in one pgvector DB; bus transport, single-writer, two doors.",
+    "status": "design",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/decisions/arb-threat-model-recalibration.md",
+    "purpose": "ARB threat = mistakes, not an adversary (solo infra). #6/#14 productization-era; #5/#10 minor polish.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/decisions/autonomous-mode-hardening-plan.md",
+    "purpose": "Autonomous-mode skill hardening: review disposition and execution plan.",
+    "status": "design",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/decisions/eval-dispatch-pipeline.md",
+    "purpose": "Decision log for the eval dispatch pipeline (autonomous run).",
+    "status": "design",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/decisions/m3-judgment-seat.md",
+    "purpose": "M3 non-quorum judgment-tier bridge seat: spec, plan, decision log.",
+    "status": "design",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/decisions/python-314-coincurve-daemon-hosts.md",
+    "purpose": "Python 3.14 on the deployed clones is accepted (daemon hosts only); the import guard that keeps it safe.",
+    "status": "current",
+    "audience": "any"
+  },
+  {
+    "path": "docs/defect-classes/README.md",
+    "purpose": "Defect-classes corpus index: reusable code-review detection moves.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/defect-classes/bug-lives-on-the-held-axis.md",
+    "purpose": "Defect class (meta): a bug hidden on an env/config axis the unit suite holds constant.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/defect-classes/claim-scope-exceeds-evidence-scope.md",
+    "purpose": "Defect class: evidence silently generalized past the population that produced it (first logged occurrence).",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/defect-classes/deny-proofs-need-adversarial-verification.md",
+    "purpose": "Defect class: a green deny-proof can be fixture-masked; inject-revert it.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/defect-classes/eval-manifest.md",
+    "purpose": "Defect-hunt eval manifest: precision set, baited traps, HARD GATE B suspect closeout.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/defect-classes/fake-cheaper-than-real.md",
+    "purpose": "Defect class (umbrella): a test double cheaper than real along the dimension that matters.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/defect-classes/fixture-supplies-what-code-lacks.md",
+    "purpose": "Defect class: a fixture provides a property the production code fails to supply.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/defect-classes/mocked-subprocess-shape-never-matched-live.md",
+    "purpose": "Defect class: mocked subprocess output shapes never exercised live; four seat-registration instances.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/defect-classes/prediction-written-as-result.md",
+    "purpose": "Defect class: an expected outcome written in the grammar of an observation, before the run.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/defect-classes/primary-path-was-the-unreviewed-path.md",
+    "purpose": "Defect class: the high-frequency primary path was deferred and unreviewed.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/defect-classes/readiness-flag-consumed-without-its-predicate.md",
+    "purpose": "Defect class: a readiness flag consumed as proof of a predicate its producer never measured.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/defect-classes/refusal-is-ambient-assert-the-code.md",
+    "purpose": "Defect class: in default-deny systems refusal is ambient; assert the code, not the bare refusal.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/defect-classes/residual-remedy-is-also-a-claim.md",
+    "purpose": "Defect class: a named residual's prescribed remedy is an untested claim \u2014 deny-proof the rejected one.",
+    "status": "current",
+    "audience": "any"
+  },
+  {
+    "path": "docs/defect-classes/run-id-silently-rewritten.md",
+    "purpose": "A tool that rewrites a supplied run_id per seat, producing records individually perfect and collectively absent.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/defect-classes/test-behind-framework-drive-directly.md",
+    "purpose": "Defect class: a framework rejects the violation before the test reaches your code.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/defect-classes/verification-inspected-the-wrong-object.md",
+    "purpose": "Defect class: a correct check bound to the wrong subject (failed swap, OR-count, truncated extraction).",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/defect-classes/verification-is-context-triggered-not-risk-triggered.md",
+    "purpose": "Defect class (reviewer): verification fires on pattern familiarity, not consequence.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/defect-classes/workdir-mutated-while-run-in-flight.md",
+    "purpose": "Defect class: a run in a tree mutated mid-flight is void whatever its color (tree-provenance-run is the mechanism).",
+    "status": "current",
+    "audience": "any"
+  },
+  {
+    "path": "docs/disagreement-corpus.md",
+    "purpose": "ARB disagreement corpus: recorded model-vs-model review divergences.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/dispatching-implementation-briefs.md",
+    "purpose": "How to write implementation briefs that satisfy completion gates and artifact checks.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/enginepool-admission-thread-flaw.md",
+    "purpose": "Latent EnginePool flaw: engine start() under lock serializes concurrent dispatch; deferred panelled fix.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/eval-instrument1-build-review.md",
+    "purpose": "Instrument 1 build: execution-primary panel review.",
+    "status": "design",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/eval-instrument1-live-dispatch-scope.md",
+    "purpose": "Scope for the Instrument 1 live-dispatch increment.",
+    "status": "design",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/eval-instrument1-v0-schema-review.md",
+    "purpose": "Instrument 1 v0 schema: panel review synthesis.",
+    "status": "design",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/eval-instrument1-v0-schema.md",
+    "purpose": "Instrument 1 v0.2 schema for the seeded floor-capability suite.",
+    "status": "design",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/eval-p3-fixture-corpus-design.md",
+    "purpose": "P-3 fixture corpus: design and distinctness assessment (3-class).",
+    "status": "design",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/eval-seat-confinement.md",
+    "purpose": "Eval seat read-confinement: design and decision.",
+    "status": "design",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/eval-suite-design-review-v2.md",
+    "purpose": "ARB eval-suite design v2: panel review synthesis.",
+    "status": "design",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/eval-suite-design-review.md",
+    "purpose": "ARB eval-suite design: panel review synthesis.",
+    "status": "design",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/eval-suite-design.md",
+    "purpose": "ARB eval suite design (v3, the forced decision).",
+    "status": "design",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/evidence-first-remediation.md",
+    "purpose": "Evidence-first workflow for scoping remediation from observed mechanisms.",
+    "status": "current",
+    "audience": "any"
+  },
+  {
+    "path": "docs/fragments/agents-base.md",
+    "purpose": "Canonical universal AGENTS.md base fragment.",
+    "status": "current",
+    "audience": "any"
+  },
+  {
+    "path": "docs/fragments/coding.md",
+    "purpose": "Canonical generic coding-layer AGENTS.md fragment.",
+    "status": "current",
+    "audience": "any"
+  },
+  {
+    "path": "docs/fragments/dispatch-recipe.md",
+    "purpose": "Shared canonical agent-dispatch command block for README and bridge skill.",
+    "status": "current",
+    "audience": "any"
+  },
+  {
+    "path": "docs/fragments/env-overrides.md",
+    "purpose": "Shared environment override table for README and bridge skill.",
+    "status": "current",
+    "audience": "any"
+  },
+  {
+    "path": "docs/fragments/failure-shapes.md",
+    "purpose": "Shared common bridge failure-shapes table for README and bridge skill.",
+    "status": "current",
+    "audience": "any"
+  },
+  {
+    "path": "docs/fragments/vote-fence.md",
+    "purpose": "Canonical audit vote-fence stance vocabulary and verdict mapping.",
+    "status": "current",
+    "audience": "any"
+  },
+  {
+    "path": "docs/gotcha-lint.md",
+    "purpose": "Gotcha registry and lint workflow for recurring review findings.",
+    "status": "current",
+    "audience": "any"
+  },
+  {
+    "path": "docs/implementor-routing.md",
+    "purpose": "Evidence-backed implementor routing ladder and model selection policy.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/learn-candidates.md",
+    "purpose": "/learn intake-gate audit trail: candidate lessons, gate outcomes, empty-until-real verdicts.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/macos-launchd-seats.md",
+    "purpose": "Stand up and operate launchd-managed bridge seats on macOS.",
+    "status": "current",
+    "audience": "operator"
+  },
+  {
+    "path": "docs/measurement-principles.md",
+    "purpose": "Measurement principles for the ARB eval and review system.",
+    "status": "design",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/multi-model-consensus.md",
+    "purpose": "Review panel mechanics, independence rules, and consensus hygiene.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/orchestrating-claude-peers.md",
+    "purpose": "Workflow for coordinating multiple Claude peer sessions over the bus.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/orchestrator-patterns.md",
+    "purpose": "Bridge operations quick reference and orchestrator dispatch patterns.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/persistent-connection-refactor.md",
+    "purpose": "Deferred design for persistent Redis connections in shell tooling.",
+    "status": "design",
+    "audience": "operator"
+  },
+  {
+    "path": "docs/phase-workflow.template.md",
+    "purpose": "Template for declaring per-phase workflow choices in adopter repos.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/pi-orchestrator-operating-guide.md",
+    "purpose": "Orchestration-role discipline for pi warm-orchestrator ARB runs (panel roster, vote gaps, auto-synthesis, integration).",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/pipeline-operating-manual.md",
+    "purpose": "End-to-end multi-agent A/B workflow manual for project delivery.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/probe-relanding-convention.md",
+    "purpose": "Co-signed convention (2026-08-01): relanded probes as pytest modules with AST-readable PROBE_PROVENANCE.",
+    "status": "current",
+    "audience": "any"
+  },
+  {
+    "path": "docs/prompting-claude-fable-5.md",
+    "purpose": "Repo mirror of Anthropic's Fable 5 prompting guide; keeps Fable dispatches independent of ARB Memory.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/quorum-decision-taxonomy.md",
+    "purpose": "Closed taxonomy and override discipline for quorum decisions.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/qwen-worker-seats.md",
+    "purpose": "Qwen worker-seat setup, routing, and evaluation notes.",
+    "status": "current",
+    "audience": "operator"
+  },
+  {
+    "path": "docs/repo-agnostic-worker-pool.md",
+    "purpose": "Proposed design for repo-agnostic reusable worker pools.",
+    "status": "design",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/runbooks/agentbridge-seat-setup.md",
+    "purpose": "Runbook for provisioning an AgentRedisBridge seat host.",
+    "status": "runbook",
+    "audience": "operator"
+  },
+  {
+    "path": "docs/runbooks/arb-control-relay-operations.md",
+    "purpose": "ARB Control relay scars: community-host boundary, archived-channel deafness, live shape facts.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/runbooks/arb-memory-artefact-audit-e2e.md",
+    "purpose": "ARB Memory artefact-fidelity + audit e2e: store, retrieve, verify.",
+    "status": "runbook",
+    "audience": "operator"
+  },
+  {
+    "path": "docs/runbooks/arb-memory-door-client-access.md",
+    "purpose": "ARB Memory access for clients without the claude.ai connector: DCR + OOB login + PKCE + streamable-HTTP.",
+    "status": "runbook",
+    "audience": "operator"
+  },
+  {
+    "path": "docs/runbooks/arb-memory-seat-e2e.md",
+    "purpose": "ARB Memory cross-seat ingest/recall e2e over the Valkey bus.",
+    "status": "runbook",
+    "audience": "operator"
+  },
+  {
+    "path": "docs/runbooks/arb-secrets-bootstrap.md",
+    "purpose": "Runbook for initializing an ARB Secrets peer keypair and publishing its public key.",
+    "status": "runbook",
+    "audience": "operator"
+  },
+  {
+    "path": "docs/runbooks/bridge-dispatch-completion-generic.md",
+    "purpose": "Runbook \u2014 harness-neutral dispatch-completion contract (persistent watcher + watchdog) for Codex/generic orchestrators.",
+    "status": "runbook",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/runbooks/bridge-seat-catalogue.md",
+    "purpose": "Runbook \u2014 every bridge engine family and how to stand a seat up.",
+    "status": "runbook",
+    "audience": "operator"
+  },
+  {
+    "path": "docs/runbooks/bus-registrar-operations.md",
+    "purpose": "Running the fleet self-provisioning bus registrar: ack-in, operator approval, sealed credential delivery.",
+    "status": "current",
+    "audience": "operator"
+  },
+  {
+    "path": "docs/runbooks/cc-channel-corruption.md",
+    "purpose": "Runbook for diagnosing and recovering from Claude Code channel corruption.",
+    "status": "runbook",
+    "audience": "operator"
+  },
+  {
+    "path": "docs/runbooks/codex-model-pin-seat-setup.md",
+    "purpose": "Runbook \u2014 stand up a model-pinned Codex seat (e.g. gpt-5.6-luna @ high).",
+    "status": "runbook",
+    "audience": "operator"
+  },
+  {
+    "path": "docs/runbooks/codex-workflow2-peer.md",
+    "purpose": "Runbook for an interactive Codex session acting as an ARB Workflow 2 peer.",
+    "status": "runbook",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/runbooks/exempt-seat-machine-user.md",
+    "purpose": "One-time owner provisioning of the arb-exempt-bot read-only machine user for the exempt lane (Slice 1d-iii).",
+    "status": "runbook",
+    "audience": "operator"
+  },
+  {
+    "path": "docs/runbooks/fleet-restart.md",
+    "purpose": "Runbook for safely restarting live bridge seats on a shared bus.",
+    "status": "runbook",
+    "audience": "operator"
+  },
+  {
+    "path": "docs/runbooks/generic-full-pipeline-orchestration.md",
+    "purpose": "Generic dogfood runbook for full-rigor ARB orchestration with evidence-bearing completion gates.",
+    "status": "runbook",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/runbooks/h2-graduation.md",
+    "purpose": "Runbook for querying H2 shadow logs and flipping H2 from shadow to block mode.",
+    "status": "runbook",
+    "audience": "operator"
+  },
+  {
+    "path": "docs/runbooks/host-config-and-session-leakage.md",
+    "purpose": "Runbook \u2014 host config knobs and session-leakage fixes for the bridge-dev setup.",
+    "status": "runbook",
+    "audience": "operator"
+  },
+  {
+    "path": "docs/seat-self-registration.md",
+    "purpose": "Runbook for one-time, Mark-approved Buzz seat self-registration and cleanup.",
+    "status": "runbook",
+    "audience": "operator"
+  },
+  {
+    "path": "docs/self-hosted-bus.md",
+    "purpose": "Operating the self-hosted ARB bus: which-bus check, credential model, dead managed idioms, onboarding.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/superpowers/2026-07-12-audit-close-1-backstop-brief.md",
+    "purpose": "Build brief \u2014 AUDIT-CLOSE-1 structural one-verdict backstop (codex-luna).",
+    "status": "current",
+    "audience": "worker"
+  },
+  {
+    "path": "docs/superpowers/2026-07-12-audit-close-1-fix-brief.md",
+    "purpose": "Fix brief \u2014 AUDIT-CLOSE-1 review remediation (codex-luna).",
+    "status": "current",
+    "audience": "worker"
+  },
+  {
+    "path": "docs/superpowers/2026-07-12-audit-close-1-fix2-brief.md",
+    "purpose": "Fix-2 brief \u2014 AUDIT-CLOSE-1 durable one-verdict guard restore (codex-luna).",
+    "status": "current",
+    "audience": "worker"
+  },
+  {
+    "path": "docs/superpowers/2026-07-12-audit-close-1-luna-build-brief.md",
+    "purpose": "Build brief \u2014 AUDIT-CLOSE-1 (codex-luna).",
+    "status": "current",
+    "audience": "worker"
+  },
+  {
+    "path": "docs/superpowers/2026-07-12-audit-close-2-build-brief.md",
+    "purpose": "Build brief \u2014 AUDIT-CLOSE-2 bus-driven verdict close (codex-luna).",
+    "status": "current",
+    "audience": "worker"
+  },
+  {
+    "path": "docs/superpowers/2026-07-12-audit-close-2-fix-brief.md",
+    "purpose": "Fix brief \u2014 AUDIT-CLOSE-2 panel remediation (codex-luna).",
+    "status": "current",
+    "audience": "worker"
+  },
+  {
+    "path": "docs/superpowers/dispatch/2026-08-17-dsh-live-gate-brief.md",
+    "purpose": "Dispatch brief \u2014 dsh-acp live gate, the four-layer probe run against a real seat.",
+    "status": "current",
+    "audience": "worker"
+  },
+  {
+    "path": "docs/superpowers/notes/2026-06-05-session-handoff.md",
+    "purpose": "Archived session handoff notes from the pi-rpc/completion-gate work.",
+    "status": "archive",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/superpowers/notes/2026-07-13-openinterpreter-pi-bakeoff-handoff.md",
+    "purpose": "Session handoff \u2014 Open Interpreter vs Pi bake-off state and next steps.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/superpowers/notes/2026-08-03-omp-opencode-seat-handoff.md",
+    "purpose": "Session handoff \u2014 omp-acp/opencode-acp seats, readonly gate, backlog fixes.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/superpowers/notes/2026-08-17-arb-files-force-followups.md",
+    "purpose": "Deferred: parser drift, weak ETag errors, force-create TOCTOU, guarded recovery copy/audit, historic events.",
+    "status": "design",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/superpowers/plans",
+    "purpose": "Collection of dated implementation plans for superpowers-tracked work.",
+    "status": "archive",
+    "audience": "any"
+  },
+  {
+    "path": "docs/superpowers/plans/2026-06-04-pi-rpc-engine.md",
+    "purpose": "Archived implementation plan for the pi-rpc engine.",
+    "status": "archive",
+    "audience": "worker"
+  },
+  {
+    "path": "docs/superpowers/plans/2026-06-18-agent-sdk-engine.md",
+    "purpose": "Implementation plan for the agent-sdk bridge engine.",
+    "status": "current",
+    "audience": "worker"
+  },
+  {
+    "path": "docs/superpowers/plans/2026-06-18-agent-sdk-mutation-probe.md",
+    "purpose": "Implementation plan for the agent-sdk mutation-probe bridge work.",
+    "status": "design",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/superpowers/plans/2026-06-19-bridge-protocol-skill-plan.md",
+    "purpose": "TDD plan: bridge-protocol gate (bootstrap split, self-cert base case).",
+    "status": "design",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/superpowers/plans/2026-06-19-diagnose-live-dispatch-plan.md",
+    "purpose": "Implementation plan (8 TDD tasks, deny-proofs first) for the diagnose live-panel orchestrator-forwarded dispatch [#13].",
+    "status": "current",
+    "audience": "worker"
+  },
+  {
+    "path": "docs/superpowers/plans/2026-06-19-diagnose-live-panel-plan.md",
+    "purpose": "TDD plan: diagnose live panel (containment spike, skill-authors-and-seals, gate-recompute, noisy-OR).",
+    "status": "design",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/superpowers/plans/2026-06-19-diagnose-skills-plan.md",
+    "purpose": "TDD plan: diagnose + diagnose-steer (two-gate arch, _diagnose_common freeze, END-TO-END dogfood mandate).",
+    "status": "design",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/superpowers/plans/2026-06-20-arb-memory-phase0-plan.md",
+    "purpose": "ARB Memory Phase 0 plan: 9 TDD tasks \u2014 schema, content_hash, embed, store dual-write, two-step.",
+    "status": "current",
+    "audience": "worker"
+  },
+  {
+    "path": "docs/superpowers/plans/2026-06-20-arb-memory-phase1-plan.md",
+    "purpose": "ARB Memory Phase 1 plan: 7 TDD tasks \u2014 bus consumer (dual-loop), timeout->grep, atomic write, PEL.",
+    "status": "current",
+    "audience": "worker"
+  },
+  {
+    "path": "docs/superpowers/plans/2026-06-21-arb-memory-phase2-plan.md",
+    "purpose": "ARB Memory Phase 2 plan: 5 TDD tasks \u2014 audit consumer, Valkey-INCR seq, fail-loud collision, lag alarm.",
+    "status": "current",
+    "audience": "worker"
+  },
+  {
+    "path": "docs/superpowers/plans/2026-06-21-arb-memory-phase3-plan.md",
+    "purpose": "ARB Memory Phase 3 implementation plan: public read-only MCP-OAuth door.",
+    "status": "design",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/superpowers/plans/2026-06-21-defect-detection-skill-plan.md",
+    "purpose": "Defect-detection skill (held-axis hunts) implementation plan.",
+    "status": "design",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/superpowers/plans/2026-06-21-h2-producer-plan.md",
+    "purpose": "H2 producer implementation plan: derive candidates, forced disposition, shadow-mode graduation (10 TDD tasks).",
+    "status": "design",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/superpowers/plans/2026-06-22-e2e-verify-plan.md",
+    "purpose": "e2e-verify implementation plan: H2 Level-B surface + spine + 3 deny-proofs + -m e2e marker (11 TDD tasks).",
+    "status": "design",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/superpowers/plans/2026-06-23-arb-audit-emit-wiring.md",
+    "purpose": "Implementation plan \u2014 wire arb-audit-emit into real panel dispatch.",
+    "status": "current",
+    "audience": "worker"
+  },
+  {
+    "path": "docs/superpowers/plans/2026-06-23-arb-audit-eval-slice1.md",
+    "purpose": "Implementation plan \u2014 audit-emit + eval-trace slice 1 (correlation spine).",
+    "status": "current",
+    "audience": "worker"
+  },
+  {
+    "path": "docs/superpowers/plans/2026-06-24-arb-dispatch-queue.md",
+    "purpose": "Implementation plan \u2014 capacity-gated dispatch queue + control lane + FIFO.",
+    "status": "current",
+    "audience": "worker"
+  },
+  {
+    "path": "docs/superpowers/plans/2026-06-24-mcp-write-paths.md",
+    "purpose": "Implementation plan for public MCP memory write tools via a publish-proxy.",
+    "status": "current",
+    "audience": "worker"
+  },
+  {
+    "path": "docs/superpowers/plans/2026-06-25-arb-fullfidelity-capture.md",
+    "purpose": "Implementation plan for full-fidelity live and durable transcript capture.",
+    "status": "current",
+    "audience": "worker"
+  },
+  {
+    "path": "docs/superpowers/plans/2026-06-25-arb-observability-slice1.md",
+    "purpose": "Implementation plan for wiring eval traces into prod ARB observability.",
+    "status": "current",
+    "audience": "worker"
+  },
+  {
+    "path": "docs/superpowers/plans/2026-06-25-arb-observability-slice3.md",
+    "purpose": "Implementation plan for panel audit manifest, votes, and reconcile-gated verdicts.",
+    "status": "current",
+    "audience": "worker"
+  },
+  {
+    "path": "docs/superpowers/plans/2026-06-25-arb-observability-slice4a.md",
+    "purpose": "Implementation plan for the OAuth-gated ARB Visibility SSE backend.",
+    "status": "current",
+    "audience": "worker"
+  },
+  {
+    "path": "docs/superpowers/plans/2026-06-25-arb-visibility-slice4b-tui.md",
+    "purpose": "Implementation plan for the terminal arb-watch visibility pane.",
+    "status": "current",
+    "audience": "worker"
+  },
+  {
+    "path": "docs/superpowers/plans/2026-06-25-arb-visibility-slice4b-web.md",
+    "purpose": "Implementation plan for the browser ARB Visibility pane.",
+    "status": "current",
+    "audience": "worker"
+  },
+  {
+    "path": "docs/superpowers/plans/2026-06-26-arb-memory-local-read-mcp.md",
+    "purpose": "Implementation plan for the local read-side ARB Memory MCP server.",
+    "status": "current",
+    "audience": "worker"
+  },
+  {
+    "path": "docs/superpowers/plans/2026-06-26-arb-watch-go-spike.md",
+    "purpose": "Implementation plan for the Go/Bubble Tea arb-watch comparison spike.",
+    "status": "current",
+    "audience": "worker"
+  },
+  {
+    "path": "docs/superpowers/plans/2026-06-26-pi-mcp-client.md",
+    "purpose": "Implementation plan for pi-sdk stdio MCP-client support.",
+    "status": "current",
+    "audience": "worker"
+  },
+  {
+    "path": "docs/superpowers/plans/2026-06-27-arb-visibility-fleet-wide-slice1.md",
+    "purpose": "Implementation plan for fleet-wide ARB Visibility seat-watch slice 1.",
+    "status": "current",
+    "audience": "worker"
+  },
+  {
+    "path": "docs/superpowers/plans/2026-06-28-claude-layer-visibility.md",
+    "purpose": "TDD plan (12 tasks) for Claude-layer visibility: claude-tail daemon, hooks, mapper/lifecycle/identity, arb-watch.",
+    "status": "current",
+    "audience": "worker"
+  },
+  {
+    "path": "docs/superpowers/plans/2026-08-12-mac-smoke-run.md",
+    "purpose": "Plan: build the macOS behavioural corpus and bind it to the scripts.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/superpowers/probes/2026-07-08-cdx1-v1-probe/README.md",
+    "purpose": "CDX-1 V1 protocol probe record: approval wire shapes + error=>no-execution pinned on codex-cli 0.142.5.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/superpowers/probes/2026-07-10-grok1-v1-probe/README.md",
+    "purpose": "GROK-1 V1 protocol probe record for permission callback and approval outcome wire shapes.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/superpowers/runbooks/2026-06-27-arb-audit-votes-deploy.md",
+    "purpose": "Operator activation runbook for the ARB audit/votes grading plane (bridge tee + panel-run).",
+    "status": "runbook",
+    "audience": "operator"
+  },
+  {
+    "path": "docs/superpowers/runbooks/2026-06-27-arb-visibility-slice1-deploy.md",
+    "purpose": "Operator deploy runbook for ARB Visibility fleet-wide slice 1.",
+    "status": "runbook",
+    "audience": "operator"
+  },
+  {
+    "path": "docs/superpowers/specs",
+    "purpose": "Collection of dated design specs for superpowers-tracked work.",
+    "status": "archive",
+    "audience": "any"
+  },
+  {
+    "path": "docs/superpowers/specs/2026-06-04-pi-rpc-engine-design.md",
+    "purpose": "Archived design spec for the pi-rpc engine.",
+    "status": "archive",
+    "audience": "worker"
+  },
+  {
+    "path": "docs/superpowers/specs/2026-06-18-agent-sdk-engine-design.md",
+    "purpose": "Design spec for the agent-sdk bridge engine.",
+    "status": "design",
+    "audience": "worker"
+  },
+  {
+    "path": "docs/superpowers/specs/2026-06-18-agent-sdk-mutation-probe-design.md",
+    "purpose": "Design spec for the agent-sdk mutation-probe bridge work.",
+    "status": "design",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/superpowers/specs/2026-06-18-bridge-protocol-skill-SPEC.md",
+    "purpose": "Spec: bridge-protocol gate \u2014 correctness-basis, trust-root, cheap-fake manifest, layer registry, BLOCK conditions.",
+    "status": "design",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/superpowers/specs/2026-06-18-bridge-protocol-skill-design.md",
+    "purpose": "Design: bridge-protocol meta-skill (executable fail-closed build-pipeline gate).",
+    "status": "design",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/superpowers/specs/2026-06-18-diagnose-skill-design.md",
+    "purpose": "Design: diagnose skill (read-only tri-model root-cause, contamination boundary).",
+    "status": "design",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/superpowers/specs/2026-06-18-diagnose-steer-skill-design.md",
+    "purpose": "Design: diagnose-steer (declared-attributed-bar-raising steer variant).",
+    "status": "design",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/superpowers/specs/2026-06-19-diagnose-live-dispatch-design.md",
+    "purpose": "Design: diagnose live-panel orchestrator-forwarded dispatch (corrects #7 self-dispatch; scribe=Agent-tool Haiku).",
+    "status": "design",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/superpowers/specs/2026-06-19-diagnose-live-panel-design.md",
+    "purpose": "Design: diagnose/diagnose-steer LIVE PANEL (contamination-proof skill-authors-and-seals dispatch + execution envelope).",
+    "status": "design",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/superpowers/specs/2026-06-19-diagnose-skill-SPEC.md",
+    "purpose": "Spec: diagnose \u2014 contamination boundary, exclusive-predicate synthesis bar, dogfood gates.",
+    "status": "design",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/superpowers/specs/2026-06-19-diagnose-steer-skill-SPEC.md",
+    "purpose": "Spec: diagnose-steer \u2014 labelled steer channel, staged double-blind barrier, corrected confidence (P_max*Q).",
+    "status": "design",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/superpowers/specs/2026-06-20-arb-memory-phase0-store-design.md",
+    "purpose": "ARB Memory Phase 0 spec: two-lane schema + scoped write-library (dual-write, versioning, two-step).",
+    "status": "design",
+    "audience": "worker"
+  },
+  {
+    "path": "docs/superpowers/specs/2026-06-20-arb-memory-phase1-bus-design.md",
+    "purpose": "ARB Memory Phase 1 spec: Valkey-bus transport \u2014 single consumer, write-intents, read req/reply, timeout->grep.",
+    "status": "design",
+    "audience": "worker"
+  },
+  {
+    "path": "docs/superpowers/specs/2026-06-21-arb-memory-phase2-audit-design.md",
+    "purpose": "ARB Memory Phase 2 spec: audit consumer (separate group, decision-grain, run-id+seq, sink-seam).",
+    "status": "design",
+    "audience": "worker"
+  },
+  {
+    "path": "docs/superpowers/specs/2026-06-21-arb-memory-phase3-design.md",
+    "purpose": "ARB Memory Phase 3 design: read-only MCP door + OAuth 2.1 AS.",
+    "status": "design",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/superpowers/specs/2026-06-21-arb-memory-seat-e2e-design.md",
+    "purpose": "ARB Memory cross-seat seat-integration e2e design.",
+    "status": "design",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/superpowers/specs/2026-06-21-defect-detection-skill-promotion-design.md",
+    "purpose": "Defect-detection skill design: held-axis hunts as operative panel procedures.",
+    "status": "design",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/superpowers/specs/2026-06-21-h2-producer-design.md",
+    "purpose": "H2 producer design: gate-derived candidate assumptions + forced disposition + shadow\u2192block graduation.",
+    "status": "design",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/superpowers/specs/2026-06-22-e2e-verify-design.md",
+    "purpose": "e2e-verify design: real-boundary empirical gate after tri-model review; fail-closed three-state; H2 first surface.",
+    "status": "design",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/superpowers/specs/2026-06-23-arb-audit-emit-wiring-design.md",
+    "purpose": "Design spec \u2014 wire arb-audit-emit into real panel dispatch (manifest + reconcile guard).",
+    "status": "design",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/superpowers/specs/2026-06-23-arb-audit-eval-design.md",
+    "purpose": "Design spec \u2014 audit-emit + eval-trace (eval data class; orchestrator-writes-votes).",
+    "status": "design",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/superpowers/specs/2026-06-24-arb-dispatch-queue-design.md",
+    "purpose": "Design spec \u2014 bridge dispatch queue (capacity-gated BLPOP, control lane, FIFO).",
+    "status": "design",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/superpowers/specs/2026-06-24-mcp-write-paths-design.md",
+    "purpose": "Design spec for MCP memory write paths through a publish-proxy.",
+    "status": "design",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/superpowers/specs/2026-06-25-arb-fullfidelity-capture-design.md",
+    "purpose": "Design spec for full-fidelity live and durable transcript capture.",
+    "status": "design",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/superpowers/specs/2026-06-25-arb-observability-design.md",
+    "purpose": "Design spec for ARB observability audit and eval/trace to prod.",
+    "status": "design",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/superpowers/specs/2026-06-25-arb-observability-slice3-design.md",
+    "purpose": "Design spec for panel audit manifest, votes, and reconcile-gated verdicts.",
+    "status": "design",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/superpowers/specs/2026-06-25-arb-observability-slice4-design.md",
+    "purpose": "Design spec for ARB Visibility per-orchestrator live seat-watch.",
+    "status": "design",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/superpowers/specs/2026-06-25-arb-observability-slice4b-design.md",
+    "purpose": "Design spec for ARB Visibility web and TUI agent-pane front ends.",
+    "status": "design",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/superpowers/specs/2026-06-26-arb-memory-local-read-mcp-design.md",
+    "purpose": "Design spec for the local read-side ARB Memory MCP server.",
+    "status": "design",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/superpowers/specs/2026-06-26-arb-watch-go-spike-design.md",
+    "purpose": "Design spec for the Go/Bubble Tea arb-watch comparison spike.",
+    "status": "design",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/superpowers/specs/2026-06-26-pi-mcp-client-design.md",
+    "purpose": "Design spec for pi-sdk stdio MCP-client support.",
+    "status": "design",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/superpowers/specs/2026-06-27-agy-print-granular-sqlite-design.md",
+    "purpose": "Design: agy-print granular live transcript via SQLite-poll + protobuf parse (no tmux); keep agy-tmux until proven.",
+    "status": "design",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/superpowers/specs/2026-06-27-agy-tmux-streaming-design.md",
+    "purpose": "Design v2: watch agy live via interactive tmux driving + tailing its structured transcript.jsonl (not pane-scrape).",
+    "status": "design",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/superpowers/specs/2026-06-27-arb-files-mcp-backlog.md",
+    "purpose": "Backlog: ARB Files MCP \u2014 companion to ARB Memory for agent file transfer via DO Spaces (arb-files bucket).",
+    "status": "design",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/superpowers/specs/2026-06-27-arb-visibility-fleet-wide-slice1-design.md",
+    "purpose": "Design spec for fleet-wide ARB Visibility seat-watch slice 1.",
+    "status": "design",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/superpowers/specs/2026-06-27-go-client-edge-and-seat-host-container-design.md",
+    "purpose": "Design: Go client-edge dispatcher + seat-host container; why distribution never justifies a Go bridge-spine port.",
+    "status": "design",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/superpowers/specs/2026-06-27-visibility-worktrack-followups.md",
+    "purpose": "Visibility worktrack backlog: watcher live/durable transcript-source toggle + non-codex seat transcript fidelity.",
+    "status": "design",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/superpowers/specs/2026-06-28-agy-print-heartbeat-design.md",
+    "purpose": "Design: agy-print turn-active heartbeat so bursty engines stay fresh (not stale) in arb-watch during model-wait.",
+    "status": "design",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/superpowers/specs/2026-06-28-claude-layer-visibility-design.md",
+    "purpose": "Design: warm orchestrator + cold-Opus seats visible in ARB Visibility via a standalone claude-tail daemon.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/superpowers/specs/2026-08-12-mac-smoke-run-design.md",
+    "purpose": "Design: macOS behavioural corpus for shell primitives the Mac seat depends on.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/upstream/pi-rpc-minimax-wedge.md",
+    "purpose": "Upstream pi-rpc/minimax wedge investigation and mitigation record.",
+    "status": "incident",
+    "audience": "operator"
+  },
+  {
+    "path": "docs/worktree-isolated-dispatch.md",
+    "purpose": "Shipped worktree-isolated dispatch behavior and completion gate notes.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/runbooks/grok-orchestrator-gotchas.md",
+    "purpose": "Operational gotchas when running Grok as an orchestrator seat.",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/agent-memory-seeds/arb-seat-roster.md",
+    "purpose": "Standing panel seat roster and operational calibration (seed).",
+    "status": "current",
+    "audience": "orchestrator"
+  },
+  {
+    "path": "docs/README.md",
+    "purpose": "How docs/ is organised, the generated index and its gates, and the question-to-document map.",
+    "status": "current",
+    "audience": "any"
+  }
+]

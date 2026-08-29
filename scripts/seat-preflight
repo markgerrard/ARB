@@ -1,0 +1,1502 @@
+#!/usr/bin/env python3
+"""seat-preflight — check seat files and runtime invariants before standup.
+
+Usage:
+    scripts/seat-preflight <plist-or-env-path> [--strict]
+    scripts/seat-preflight <plist-or-env-path> --checklist {claim-gate|ref-required|legacy-removal} [--strict]
+
+Exit 0 means all checks hold, 1 means a seat violation was found, and 2 means
+the command was misused. Warnings are retained by default and become failures
+with --strict.
+
+Checklist modes (Slice 1d-vi / Task 7) are operator-owned enablement gates:
+they do not flip BRIDGE_CLAIM_GATE or BRIDGE_TASK_REF_REQUIRED; they only prove
+prerequisites before an owner sets those flags.
+"""
+from __future__ import annotations
+
+import os
+import json
+import plistlib
+import re
+import shutil
+import stat
+import subprocess
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from urllib.parse import urlparse
+
+
+_SRC = Path(__file__).resolve().parent.parent / "src"
+if str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
+_BENCH = Path(__file__).resolve().parent.parent / "bench"
+if str(_BENCH) not in sys.path:
+    sys.path.insert(0, str(_BENCH))
+
+
+REDIS_REQUIRED = (
+    "AGENT_REDIS_HOST",
+    "AGENT_REDIS_PORT",
+    "AGENT_REDIS_DB",
+    "AGENT_REDIS_PREFIX",
+)
+LOCAL_MCP = "ARB_MEMORY_LOCAL_MCP"
+LOCAL_DSN = "ARB_MEMORY_LOCAL_DSN"
+WRITER_DSN = "ARB_MEMORY_DSN"
+ALLOW_CROSS_STORE = "ARB_MEMORY_LOCAL_ALLOW_CROSS_STORE"
+RUNTIME_ERROR = "ARB_MEMORY_LOCAL_DSN is missing/empty"
+
+WORKER_VANTAGE = "BRIDGE_WORKER_VANTAGE"
+CLAIM_GATE = "BRIDGE_CLAIM_GATE"
+TASK_REF_REQUIRED = "BRIDGE_TASK_REF_REQUIRED"
+GATE_READER_DSN = "ARB_GATE_READER_DSN"
+GATE_READER_ROLE = "ARB_GATE_READER_ROLE"
+LANE_WRITER_DSN = "ARB_GATE_LANE_WRITER_DSN"
+LANE_WRITER_ROLE = "ARB_GATE_LANE_WRITER_ROLE"
+LANE_WRITER_CONSUMER = "ARB_GATE_LANE_WRITER_CONSUMER_ID"
+LANE_WRITER_LANE = "ARB_GATE_LANE_WRITER_LANE"
+WORKTREE_LANE = "BRIDGE_WORKTREE_LANE"
+
+CHECKLIST_MODES = ("claim-gate", "ref-required", "legacy-removal")
+TASK_WIRE_DUAL = "legacy-or-ref-v1"
+BRIEF_HYDRATE_V1 = "v1"
+EVIDENCE_TARGET_REGISTRY = "BRIDGE_PREFLIGHT_TARGET_REGISTRY"
+EVIDENCE_SENDER_MIGRATION = "BRIDGE_PREFLIGHT_SENDER_MIGRATION"
+EVIDENCE_REF_HYDRATION = "BRIDGE_PREFLIGHT_REF_HYDRATION"
+EVIDENCE_PARSE_ONLY = "BRIDGE_PREFLIGHT_PARSE_ONLY"
+EVIDENCE_LEGACY_OBSERVATION = "BRIDGE_PREFLIGHT_LEGACY_OBSERVATION"
+DIRECT_REF_ERROR = "brief_hydration_unavailable"
+# bridge.py:513 — exact membership only
+WORKTREE_LANE_ALLOWED = frozenset({"gated", "exempt"})
+# Keys the bridge reads from process env only (not --env-file).
+# Driven by call sites of _process_env_attestation (membership is enforced there).
+# ARB_MEMORY_REDIS_URL is deliberately NOT a member: bridge.py resolve_audit_redis
+# (bridge.py:205-212) supports process-env OR --env-file fallback.
+PROCESS_ENV_ONLY_KEYS = frozenset(
+    {
+        WORKER_VANTAGE,
+        WORKTREE_LANE,
+        LANE_WRITER_DSN,
+        LOCAL_DSN,
+    }
+)
+MEMORY_REDIS_URL = "ARB_MEMORY_REDIS_URL"
+# Legacy-removal observation window floors (documented in deploy/README.md).
+LEGACY_WINDOW_MIN_DURATION = timedelta(hours=24)
+LEGACY_WINDOW_MAX_STALENESS = timedelta(days=7)
+# Allow tiny clock skew so wall-clock jitter does not false-FAIL a just-closed window.
+LEGACY_WINDOW_FUTURE_SKEW = timedelta(seconds=60)
+
+BAKEOFF_ARM_IDS = ("glm-pi", "glm-zcode", "kimi-pi", "kimi-cli")
+BAKEOFF_EXTENSIONS = ("role_profiles", "project_instruction_files", "optional_skill_packs", "memory_mcps", "unrelated_extensions")
+BAKEOFF_CONTROL_NAMES = ("reasoning", "temperature", "top_p", "top_k", "seed", "penalties", "maximum_output", "stop_behavior", "tool_choice", "parallel_tool_behavior", "retry", "backoff", "timeouts")
+_BAKEOFF_ARM_PINS = {
+    "glm-pi": ("GLM", "pi-sdk", "zai", "glm-5.2", "Pi", "pi-sdk-agentredisbridge-bake-glm52", "PI_CODING_AGENT_DIR", "BRIDGE_PI_RETIRE_AFTER_TURN"),
+    "glm-zcode": ("GLM", "openinterpreter", "zai-coding-plan", "glm-5.2", "zcode", "interpreter-agentredisbridge-bake-glm52-zcode", "INTERPRETER_HOME", "BRIDGE_INTERPRETER_RETIRE_AFTER_TURN"),
+    "kimi-pi": ("Kimi", "pi-sdk", "kimi-coding", "k2p7", "Pi", "pi-sdk-agentredisbridge-bake-k2p7", "PI_CODING_AGENT_DIR", "BRIDGE_PI_RETIRE_AFTER_TURN"),
+    "kimi-cli": ("Kimi", "openinterpreter", "kimi-for-coding", "k2p7", "kimi-cli", "interpreter-agentredisbridge-bake-k2p7-kimicli", "INTERPRETER_HOME", "BRIDGE_INTERPRETER_RETIRE_AFTER_TURN"),
+}
+
+
+def read_env_file(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for line in path.read_text().splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        key = re.sub(r"^export\s+", "", key.strip())
+        values[key.strip()] = value
+    return values
+
+
+def check_env_file(path: Path) -> tuple[bool, str]:
+    try:
+        readable = path.is_file() and os.access(path, os.R_OK)
+    except OSError:
+        readable = False
+    if not readable:
+        return False, f"env file is missing or unreadable: {path}"
+    return True, f"env file readable: {path}"
+
+
+def check_redis_required(env: dict[str, str]) -> tuple[bool, str]:
+    missing = [key for key in REDIS_REQUIRED if not env.get(key)]
+    if missing:
+        return False, "missing required Redis key(s): " + ", ".join(missing)
+    return True, f"all {len(REDIS_REQUIRED)} required Redis keys present"
+
+
+def check_local_mcp_dsn(env: dict[str, str], home: Path) -> tuple[bool, str]:
+    mcp = env.get(LOCAL_MCP, "")
+    if not mcp:
+        return True, "local MCP disabled"
+    if env.get(LOCAL_DSN):
+        return True, "local MCP DSN present"
+
+    if mcp in {"dev", "prod"}:
+        readers = home / ".arb-memory-local" / "readers.env"
+        if readers.is_file():
+            try:
+                reader_env = read_env_file(readers)
+            except OSError:
+                reader_env = {}
+            tier_key = f"{LOCAL_DSN}_{mcp.upper()}"
+            if reader_env.get(tier_key):
+                return True, f"local MCP DSN derivable from {tier_key}"
+
+    return False, RUNTIME_ERROR
+
+
+def _fallback_fingerprint(dsn: str) -> tuple[str, ...]:
+    parsed = urlparse(dsn)
+    if not parsed.hostname or not parsed.path.strip("/"):
+        raise ValueError(f"invalid DSN: {dsn}")
+    return (parsed.hostname, str(parsed.port or 5432), parsed.path.strip("/"))
+
+
+def _store_fingerprint(dsn: str) -> tuple[str, ...]:
+    try:
+        from arb_memory.local_read_policy import _store_fingerprint as fingerprint
+    except (ImportError, ModuleNotFoundError):
+        return _fallback_fingerprint(dsn)
+    try:
+        return tuple(fingerprint(dsn))
+    except RuntimeError as exc:
+        # The real helper imports psycopg INSIDE the function and fails closed as
+        # RuntimeError; when the cause is the optional psycopg being absent, the
+        # port-aware fallback is the intended path. Any other cause stays fatal.
+        if isinstance(exc.__cause__, (ImportError, ModuleNotFoundError)):
+            return _fallback_fingerprint(dsn)
+        raise
+
+
+def check_cross_store(env: dict[str, str]) -> tuple[bool, str]:
+    local_dsn = env.get(LOCAL_DSN, "")
+    writer_dsn = env.get(WRITER_DSN, "")
+    if not local_dsn or not writer_dsn:
+        return True, "cross-store comparison not applicable"
+    try:
+        same_store = _store_fingerprint(local_dsn) == _store_fingerprint(writer_dsn)
+    except Exception as exc:  # noqa: BLE001 - a pre-flight must fail closed
+        return False, f"could not parse local/writer DSN: {exc}"
+    if same_store:
+        return True, "local and writer DSNs point at the same store"
+    if env.get(ALLOW_CROSS_STORE) == "1":
+        return True, "[seat-preflight] WARNING: cross-store read override is enabled"
+    return False, "ARB_MEMORY_LOCAL_DSN store does not match ARB_MEMORY_DSN"
+
+
+def check_workdir(env: dict[str, str]) -> tuple[bool, str]:
+    workdir = env.get("AGENT_WORKDIR", "")
+    if not workdir:
+        return True, "AGENT_WORKDIR not set"
+    path = Path(workdir).expanduser()
+    if not path.is_dir():
+        return False, f"AGENT_WORKDIR is not an existing directory: {path}"
+    return True, f"AGENT_WORKDIR exists: {path}"
+
+
+def check_program(plist: dict, resolved_workdir: str | None = None) -> tuple[bool, str]:
+    arguments = plist.get("ProgramArguments")
+    if not isinstance(arguments, list) or not arguments or not isinstance(arguments[0], str):
+        return False, "plist ProgramArguments[0] is missing"
+    program = Path(arguments[0]).expanduser()
+    if not program.exists() or not os.access(program, os.X_OK):
+        return False, f"plist ProgramArguments[0] is not executable: {program}"
+    working = resolved_workdir or plist.get("WorkingDirectory")
+    if working and not Path(working).expanduser().is_dir():
+        return False, f"plist WorkingDirectory is not an existing directory: {working}"
+    return True, "plist program and working directory valid"
+
+
+def _is_scratch_seat(env: dict[str, str]) -> bool:
+    return env.get("AGENT_SCRATCH") == "1" or "scratch" in env.get("AGENT_ID", "").lower()
+
+
+def check_trusted_senders(env: dict[str, str]) -> tuple[bool, str]:
+    raw = env.get("AGENT_TRUSTED_SENDERS", "").strip()
+    if not raw:
+        if _is_scratch_seat(env):
+            return True, "trusted senders empty for scratch seat"
+        return True, "[seat-preflight] WARNING: AGENT_TRUSTED_SENDERS is empty"
+    malformed = []
+    for pair in raw.split(","):
+        pair = pair.strip()
+        if pair.count("=") != 1:
+            malformed.append(pair)
+            continue
+        sender, role = (part.strip() for part in pair.split("=", 1))
+        if not sender or not role:
+            malformed.append(pair)
+    if malformed:
+        return False, "invalid AGENT_TRUSTED_SENDERS pair(s): " + ", ".join(malformed)
+    return True, f"{len(raw.split(','))} trusted-sender pair(s) valid"
+
+
+def check_env_scrub_capability(env: dict[str, str]) -> tuple[bool, str]:
+    """Run the same scrub self-check the bridge executes before register().
+
+    A declarative registry string without this executed check is not sufficient
+    (Stage 1d-i). Uses the installed package when available.
+    """
+    try:
+        from agent_redis_bridge.engines._stdio import (
+            ENV_SCRUB_CAPABILITY,
+            prove_env_scrub_capability,
+        )
+    except ImportError as exc:
+        return False, f"env scrub capability unavailable: {exc}"
+    try:
+        cap = prove_env_scrub_capability(env)
+    except RuntimeError as exc:
+        return False, f"env scrub self-check failed: {exc}"
+    if cap != ENV_SCRUB_CAPABILITY:
+        return False, f"env scrub capability mismatch: {cap!r} != {ENV_SCRUB_CAPABILITY!r}"
+    return True, f"env scrub self-check passed ({cap})"
+
+
+def check_worker_vantage(
+    env: dict[str, str],
+    *,
+    process_env: dict[str, str] | None = None,
+    mode: str | None = None,
+) -> tuple[bool, str]:
+    """Supervisor-owned nonblank vantage (E25 forced-ordering; E26 live shape).
+
+    bridge.py reads BRIDGE_WORKER_VANTAGE from process env only. Env-file mode:
+    file-only values PASS with an attested-limitation message. Plist mode: file-only
+    values FAIL closed (key must be in EnvironmentVariables / launchd process env).
+    """
+    vantage = (env.get(WORKER_VANTAGE) or "").strip()
+    if not vantage:
+        return False, f"worker-vantage: {WORKER_VANTAGE} is missing or blank"
+    fail, limit = _process_env_attestation(
+        WORKER_VANTAGE, env, process_env=process_env, mode=mode
+    )
+    if fail:
+        return False, f"worker-vantage: {fail}"
+    if limit:
+        return True, f"worker-vantage: {WORKER_VANTAGE}={vantage} ({limit})"
+    if process_env is not None and (process_env.get(WORKER_VANTAGE) or "").strip():
+        return True, f"worker-vantage: {WORKER_VANTAGE}={vantage} (process env)"
+    return True, f"worker-vantage: {WORKER_VANTAGE}={vantage}"
+
+
+def check_flag_posture(
+    env: dict[str, str],
+    *,
+    cli_claim_gate: bool | None = None,
+) -> tuple[bool, str]:
+    """Validate claim-gate / ref-required env posture; default-off is BRIDGE_*=0.
+
+    Optional cli_claim_gate comes from plist ProgramArguments --claim-gate /
+    --no-claim-gate. The message always labels env posture; when a CLI override is
+    present it is noted (CLI is not re-read as authority here).
+    """
+    allowed = {"", "0", "1"}
+    claim = (env.get(CLAIM_GATE) or "").strip()
+    ref = (env.get(TASK_REF_REQUIRED) or "").strip()
+    if claim not in allowed:
+        return False, f"flag-posture: {CLAIM_GATE} must be 0|1, got {claim!r}"
+    if ref not in allowed:
+        return False, f"flag-posture: {TASK_REF_REQUIRED} must be 0|1, got {ref!r}"
+    claim_v = claim or "0"
+    ref_v = ref or "0"
+    msg = f"flag-posture: env posture {CLAIM_GATE}={claim_v} {TASK_REF_REQUIRED}={ref_v}"
+    if cli_claim_gate is not None:
+        msg += f" (ProgramArguments --claim-gate={'true' if cli_claim_gate else 'false'})"
+    return True, msg
+
+
+def _flag_on(env: dict[str, str], key: str) -> bool:
+    # Match envelope.py / bridge.py BooleanOptionalAction: case-insensitive truthy set.
+    return (env.get(key) or "").strip().lower() in {"1", "true", "yes"}
+
+
+def _process_env_attestation(
+    key: str,
+    env: dict[str, str],
+    *,
+    process_env: dict[str, str] | None,
+    mode: str | None = None,
+) -> tuple[str | None, str | None]:
+    """Return (fail_message, limitation_suffix) for process-env-only provenance.
+
+    ``key`` MUST be a member of PROCESS_ENV_ONLY_KEYS (membership is the wiring
+    that keeps that constant from being dead). bridge.py reads these keys from
+    process env only. Env-file mode cannot attest that provenance and returns a
+    limitation suffix (caller PASS-labels). Plist mode fails closed when the key
+    is file-only (caller FAIL-labels). Returns (None, None) when process
+    provenance is satisfied or the key is not under scrutiny.
+    """
+    if key not in PROCESS_ENV_ONLY_KEYS:
+        raise ValueError(
+            f"_process_env_attestation key {key!r} is not in PROCESS_ENV_ONLY_KEYS"
+        )
+    if process_env is None:
+        return None, None
+    pe_val = (process_env.get(key) or "").strip()
+    if pe_val:
+        return None, None
+    merged_val = (env.get(key) or "").strip()
+    if not merged_val:
+        return None, None
+    limit = (
+        f"attested from env file only; bridge.py reads process env — "
+        f"{key} would be blank at runtime unless also in plist "
+        f"EnvironmentVariables"
+    )
+    if mode == "plist":
+        # _load_input inspects only plist EnvironmentVariables (not ambient launchd).
+        return (
+            f"process-env-only key {key} is file-only; "
+            f"plist EnvironmentVariables must carry it "
+            f"(bridge.py reads process env, not --env-file)",
+            None,
+        )
+    return None, limit
+
+
+def check_gate_reader(env: dict[str, str], *, required: bool = False) -> tuple[bool, str]:
+    """Reader DSN/role when claim-gate readiness is required or DSN is partial."""
+    dsn = (env.get(GATE_READER_DSN) or "").strip()
+    role = (env.get(GATE_READER_ROLE) or "").strip()
+    need = required or bool(dsn) or bool(role)
+    if not need:
+        return True, "gate-reader: not required (claim gate off / DSN unset)"
+    if not dsn:
+        return False, f"gate-reader: {GATE_READER_DSN} is missing"
+    if not role:
+        return False, f"gate-reader: {GATE_READER_ROLE} is missing"
+    return True, f"gate-reader: {GATE_READER_ROLE} present with DSN"
+
+
+def check_lane_writer(
+    env: dict[str, str],
+    *,
+    required: bool = False,
+    process_env: dict[str, str] | None = None,
+    mode: str | None = None,
+) -> tuple[bool, str]:
+    """Per-seat lane writer DSN/role (symmetric need: ROLE-without-DSN fails too).
+
+    ARB_GATE_LANE_WRITER_DSN is process-env-only at runtime (bridge.py); provenance
+    is attested when a DSN value is present.
+    """
+    dsn = (env.get(LANE_WRITER_DSN) or "").strip()
+    role = (env.get(LANE_WRITER_ROLE) or "").strip()
+    need = required or bool(dsn) or bool(role)
+    if not need:
+        return True, "lane-writer: not required (claim gate off / DSN unset)"
+    if not dsn:
+        return False, f"lane-writer: {LANE_WRITER_DSN} is missing"
+    if not role:
+        return False, f"lane-writer: {LANE_WRITER_ROLE} is missing"
+    fail, limit = _process_env_attestation(
+        LANE_WRITER_DSN, env, process_env=process_env, mode=mode
+    )
+    if fail:
+        return False, f"lane-writer: {fail}"
+    base = f"lane-writer: {LANE_WRITER_ROLE} present with DSN"
+    if limit:
+        return True, f"{base} ({limit})"
+    if process_env is not None and (process_env.get(LANE_WRITER_DSN) or "").strip():
+        return True, f"{base} (process env)"
+    return True, base
+
+
+def check_lane_binding_keys(
+    env: dict[str, str], *, required: bool = False
+) -> tuple[bool, str]:
+    """Binding-key presence for lane writer (not live DB reconcile readiness).
+
+    Attests DSN/ROLE/consumer/lane string keys and lane-string match only — no DB
+    probe, no grant check, no reconcile execution. Name/message claim key presence.
+    """
+    if not required:
+        return True, "lane-binding-keys: not required"
+    dsn = (env.get(LANE_WRITER_DSN) or "").strip()
+    role = (env.get(LANE_WRITER_ROLE) or "").strip()
+    consumer = (env.get(LANE_WRITER_CONSUMER) or "").strip()
+    writer_lane = (env.get(LANE_WRITER_LANE) or "").strip()
+    seat_lane = (env.get(WORKTREE_LANE) or "gated").strip()
+    if not dsn or not role:
+        return (
+            False,
+            "lane-binding-keys: requires lane-writer DSN and ROLE binding keys",
+        )
+    if not consumer:
+        return False, f"lane-binding-keys: {LANE_WRITER_CONSUMER} is missing"
+    if not writer_lane:
+        return False, f"lane-binding-keys: {LANE_WRITER_LANE} is missing"
+    if writer_lane != seat_lane:
+        return (
+            False,
+            f"lane-binding-keys: {LANE_WRITER_LANE}={writer_lane!r} does not match "
+            f"{WORKTREE_LANE}={seat_lane!r}",
+        )
+    return (
+        True,
+        f"lane-binding-keys: binding keys present consumer={consumer} lane={writer_lane}",
+    )
+
+
+# Back-compat alias for unit tests that still import the old name.
+check_lane_reconcile_readiness = check_lane_binding_keys
+
+
+def check_worktree_lane(
+    env: dict[str, str],
+    *,
+    process_env: dict[str, str] | None = None,
+    mode: str | None = None,
+) -> tuple[bool, str]:
+    """BRIDGE_WORKTREE_LANE must be exactly gated|exempt (bridge.py:513).
+
+    Runtime reads the lane from process env only; file-only values are attested
+    (env-file limitation PASS / plist FAIL closed) when the key is present.
+    """
+    raw = (env.get(WORKTREE_LANE) or "gated").strip()
+    if raw not in WORKTREE_LANE_ALLOWED:
+        return (
+            False,
+            f"worktree-lane: {WORKTREE_LANE} must be exactly gated|exempt, got {raw!r}",
+        )
+    # Attest only when the key is explicitly present (default gated has no provenance).
+    if (env.get(WORKTREE_LANE) or "").strip():
+        fail, limit = _process_env_attestation(
+            WORKTREE_LANE, env, process_env=process_env, mode=mode
+        )
+        if fail:
+            return False, f"worktree-lane: {fail}"
+        if limit:
+            return True, f"worktree-lane: {WORKTREE_LANE}={raw} ({limit})"
+        if process_env is not None and (process_env.get(WORKTREE_LANE) or "").strip():
+            return True, f"worktree-lane: {WORKTREE_LANE}={raw} (process env)"
+    return True, f"worktree-lane: {WORKTREE_LANE}={raw}"
+
+
+def check_local_hydration(
+    env: dict[str, str],
+    *,
+    required: bool = False,
+    process_env: dict[str, str] | None = None,
+    mode: str | None = None,
+) -> tuple[bool, str]:
+    """Executed brief_hydrate readiness via prove_brief_hydrate_readiness (1d-v)."""
+    dsn = (env.get(LOCAL_DSN) or "").strip()
+    if not dsn and not required:
+        return True, "local-hydration: not configured (skipped)"
+    if not dsn and required:
+        return False, f"local-hydration: {LOCAL_DSN} is required for hydration readiness"
+    try:
+        from agent_redis_bridge.brief_hydrate_ready import prove_brief_hydrate_readiness
+    except ImportError as exc:
+        return False, f"local-hydration: brief_hydrate_ready unavailable: {exc}"
+    # Preflight merges checked input over the invoking process env so the probe
+    # sees the seat's DSN/keys. Runtime construction (bridge.py:492-495) merges
+    # --env-file into the prove env; reassert_liveness (bridge.py:927-930) calls
+    # prove with env=os.environ only. LOCAL_DSN remains process-env-attested.
+    merged = {**os.environ, **env}
+    try:
+        ready = prove_brief_hydrate_readiness(env=merged)
+    except Exception as exc:  # noqa: BLE001 - preflight fails closed
+        return False, f"local-hydration: prove_brief_hydrate_readiness raised {type(exc).__name__}: {exc}"
+    if not ready:
+        return False, "local-hydration: prove_brief_hydrate_readiness returned False (brief_hydrate not ready)"
+    fail, limit = _process_env_attestation(
+        LOCAL_DSN, env, process_env=process_env, mode=mode
+    )
+    base = "local-hydration: prove_brief_hydrate_readiness passed (brief_hydrate=v1 eligible)"
+    if fail:
+        return False, f"local-hydration: {fail}"
+    if limit:
+        return True, f"{base} ({limit})"
+    return True, base
+
+
+def check_memory_redis_url(
+    env: dict[str, str],
+    *,
+    process_env: dict[str, str] | None = None,
+    mode: str | None = None,
+) -> tuple[bool, str]:
+    """Report ARB_MEMORY_REDIS_URL presence; never FAIL on file vs process placement.
+
+    bridge.py resolve_audit_redis (bridge.py:205-212) takes process env first with
+    --env-file fallback — a deliberate Slice-1 mistake-prevention fix. Seat
+    preflight therefore must not hard-FAIL the env-file-only shape documented in
+    deploy/.env.example. Short-lived FABA/driver publishers may still place the
+    publish credential in process env (deploy/README.md); that is out of band for
+    this check. process_env/mode are accepted for call-shape stability only.
+    """
+    _ = process_env, mode  # placement is not enforced (see bridge.py:210)
+    val = (env.get(MEMORY_REDIS_URL) or "").strip()
+    if not val:
+        return True, f"memory-redis-url: {MEMORY_REDIS_URL} not set"
+    return True, (
+        f"memory-redis-url: {MEMORY_REDIS_URL} set "
+        f"(process env or env-file; bridge.py:210)"
+    )
+
+
+def check_supervisor_interpreter(env: dict[str, str]) -> tuple[bool, str]:
+    """E25(a): bare python3 on the *checked input's* PATH must import redis.
+
+    Optional pin: BRIDGE_SUPERVISOR_PYTHON absolute path (faithful; unchanged).
+    When unset and the checked input supplies PATH, resolve python3 against that
+    PATH and probe with a constructed env naming which PATH was used. When the
+    input carries no PATH, fall back to the operator shell PATH with an explicit
+    limitation message.
+    """
+    pinned = (env.get("BRIDGE_SUPERVISOR_PYTHON") or "").strip()
+    seat_path = env.get("PATH")
+    path_note = ""
+    probe_env: dict[str, str] | None = None
+    if pinned:
+        python = pinned
+        if not Path(python).is_file() or not os.access(python, os.X_OK):
+            return False, f"supervisor-interpreter: pinned python not executable: {python}"
+        path_note = f"pinned BRIDGE_SUPERVISOR_PYTHON={python}"
+    elif seat_path:
+        python = shutil.which("python3", path=seat_path)
+        if not python:
+            return (
+                False,
+                "supervisor-interpreter: python3 not found on checked input PATH",
+            )
+        path_note = f"probed checked input PATH"
+        # Construct a minimal probe env so import resolution uses the seat PATH,
+        # not the operator's activated venv.
+        probe_env = {**os.environ, "PATH": seat_path}
+    else:
+        python = shutil.which("python3")
+        if not python:
+            return False, "supervisor-interpreter: python3 not found on PATH"
+        path_note = (
+            "resolved against the invoking shell's PATH, not the seat's — pin "
+            "BRIDGE_SUPERVISOR_PYTHON to make this check faithful"
+        )
+    try:
+        run_kwargs: dict = {
+            "capture_output": True,
+            "text": True,
+            "timeout": 15,
+            "check": False,
+        }
+        if probe_env is not None:
+            run_kwargs["env"] = probe_env
+        completed = subprocess.run([python, "-c", "import redis"], **run_kwargs)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, f"supervisor-interpreter: could not exec {python}: {exc}"
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "").strip()[:200]
+        return (
+            False,
+            f"supervisor-interpreter: {python} cannot import redis"
+            + (f" ({detail})" if detail else "")
+            + f" ({path_note})",
+        )
+    return True, f"supervisor-interpreter: {python} imports redis ({path_note})"
+
+
+def _load_json_evidence(path_key: str, env: dict[str, str]) -> tuple[dict | None, str | None]:
+    raw = (env.get(path_key) or "").strip()
+    if not raw:
+        return None, f"{path_key} is missing"
+    path = Path(raw).expanduser()
+    if not path.is_file():
+        return None, f"{path_key} is not a readable file: {path}"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        return None, f"{path_key} could not be parsed: {type(exc).__name__}: {exc}"
+    if not isinstance(data, dict):
+        return None, f"{path_key} root must be a JSON object"
+    return data, None
+
+
+def _registry_roster(data: dict) -> tuple[list[str] | None, str | None]:
+    """Extract the selected-target roster from registry evidence.
+
+    Required shape: top-level ``roster`` — a non-empty JSON array of agent_id
+    strings declaring every selected dual-parse/hydrate target. Also requires
+    top-level ``parse_only`` — a JSON array of agent_id strings (may be empty)
+    declaring the parse-only complement so empty parse-only evidence is never
+    a vacuous pass. roster and parse_only must be disjoint; neither may contain
+    duplicate agent_ids.
+    """
+    roster = data.get("roster")
+    if not isinstance(roster, list):
+        return None, "registry evidence missing top-level roster array of agent_id strings"
+    if not roster:
+        return None, "registry evidence roster is empty"
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in roster:
+        if not isinstance(item, str) or not item.strip():
+            return None, "registry evidence roster entries must be non-empty agent_id strings"
+        agent = item.strip()
+        if agent in seen:
+            return None, f"registry evidence roster has duplicate agent_id: {agent}"
+        seen.add(agent)
+        out.append(agent)
+    if "parse_only" not in data:
+        return None, "registry evidence missing top-level parse_only array (use [] for zero parse-only seats)"
+    parse_only = data.get("parse_only")
+    if not isinstance(parse_only, list):
+        return None, "registry evidence parse_only must be an array of agent_id strings"
+    parse_seen: set[str] = set()
+    for item in parse_only:
+        if not isinstance(item, str) or not item.strip():
+            return None, "registry evidence parse_only entries must be non-empty agent_id strings"
+        agent = item.strip()
+        if agent in parse_seen:
+            return None, f"registry evidence parse_only has duplicate agent_id: {agent}"
+        parse_seen.add(agent)
+    overlap = sorted(seen & parse_seen)
+    if overlap:
+        return (
+            None,
+            "registry evidence roster and parse_only overlap: " + ", ".join(overlap),
+        )
+    return out, None
+
+
+def _registry_parse_only(data: dict) -> list[str]:
+    raw = data.get("parse_only")
+    if not isinstance(raw, list):
+        return []
+    return [str(x).strip() for x in raw if isinstance(x, str) and str(x).strip()]
+
+
+def _target_entries_by_id(targets: object) -> tuple[dict[str, dict] | None, str | None]:
+    if not isinstance(targets, list):
+        return None, "targets must be a list"
+    by_id: dict[str, dict] = {}
+    for entry in targets:
+        if not isinstance(entry, dict):
+            return None, "targets entries must be objects"
+        agent = entry.get("agent_id")
+        if not isinstance(agent, str) or not agent.strip():
+            return None, "targets entries require non-empty agent_id"
+        key = agent.strip()
+        if key in by_id:
+            return None, f"targets has duplicate agent_id: {key}"
+        by_id[key] = entry
+    return by_id, None
+
+
+def _extraneous_targets_warning(
+    by_id: dict[str, dict], roster: list[str]
+) -> str | None:
+    """Named warning for evidence targets outside the roster (not a FAIL)."""
+    roster_set = set(roster)
+    extras = sorted(a for a in by_id if a not in roster_set)
+    if not extras:
+        return None
+    return "WARNING: evidence target(s) not in roster: " + ", ".join(extras)
+
+
+def check_target_dual_parse(env: dict[str, str]) -> tuple[bool, str]:
+    data, err = _load_json_evidence(EVIDENCE_TARGET_REGISTRY, env)
+    if err:
+        return False, f"target-dual-parse: {err}"
+    roster, rerr = _registry_roster(data)
+    if rerr:
+        return False, f"target-dual-parse: {rerr}"
+    assert roster is not None
+    by_id, terr = _target_entries_by_id(data.get("targets"))
+    if terr:
+        return False, f"target-dual-parse: {terr}"
+    assert by_id is not None
+    uncovered = [a for a in roster if a not in by_id]
+    if uncovered:
+        return (
+            False,
+            "target-dual-parse: roster target(s) missing from dual-parse entries: "
+            + ", ".join(uncovered),
+        )
+    bad = []
+    for agent in roster:
+        entry = by_id[agent]
+        wv = entry.get("worker_vantage")
+        if not isinstance(wv, str) or not wv.strip():
+            bad.append(f"{agent} worker_vantage missing or blank")
+        if entry.get("task_wire") != TASK_WIRE_DUAL:
+            bad.append(f"{agent} task_wire={entry.get('task_wire')!r}")
+    if bad:
+        return False, "target-dual-parse: not dual-parse capable: " + ", ".join(bad)
+    msg = (
+        f"target-dual-parse: evidence file reports {len(roster)} roster target(s) "
+        f"advertise task_wire={TASK_WIRE_DUAL}"
+    )
+    extra = _extraneous_targets_warning(by_id, roster)
+    if extra:
+        return True, f"{extra}; {msg}"
+    return True, msg
+
+
+def check_target_advertises_hydrate(env: dict[str, str]) -> tuple[bool, str]:
+    """Every roster target ADVERTISES brief_hydrate=v1 in the supplied evidence.
+
+    Named for what it proves, not for what a reader hopes it proves. The registry
+    flag is set from prove_brief_hydrate_readiness (brief_hydrate_ready.py:156-166),
+    which attests that the HOST's hydrate console script is locatable and exits 0.
+    Hydration on a live dispatch is performed by the ENGINE on its turn, and the
+    bridge refuses the turn outright when the receipt is absent (bridge.py:3804-3808,
+    brief_hydration_receipt_missing) — so a seat whose engine has no shell can
+    advertise v1 and still fail every dispatch.
+
+    This check therefore does NOT establish that any target can hydrate, and a PASS
+    must not be read as "hydration prerequisite satisfied". Formerly named
+    `target-hydration`, which invited exactly that reading; renamed 2026-08-11.
+    See docs/defect-classes/readiness-flag-consumed-without-its-predicate.md.
+    """
+    data, err = _load_json_evidence(EVIDENCE_TARGET_REGISTRY, env)
+    if err:
+        return False, f"target-advertises-hydrate: {err}"
+    roster, rerr = _registry_roster(data)
+    if rerr:
+        return False, f"target-advertises-hydrate: {rerr}"
+    assert roster is not None
+    by_id, terr = _target_entries_by_id(data.get("targets"))
+    if terr:
+        return False, f"target-advertises-hydrate: {terr}"
+    assert by_id is not None
+    uncovered = [a for a in roster if a not in by_id]
+    if uncovered:
+        return (
+            False,
+            "target-advertises-hydrate: roster target(s) missing from hydration entries: "
+            + ", ".join(uncovered),
+        )
+    bad = []
+    for agent in roster:
+        entry = by_id[agent]
+        if entry.get("brief_hydrate") != BRIEF_HYDRATE_V1:
+            bad.append(f"{agent} brief_hydrate={entry.get('brief_hydrate')!r}")
+    if bad:
+        return False, "target-advertises-hydrate: missing brief_hydrate=v1: " + ", ".join(bad)
+    msg = (
+        f"target-advertises-hydrate: evidence file reports {len(roster)} roster target(s) "
+        f"advertise brief_hydrate={BRIEF_HYDRATE_V1}"
+    )
+    extra = _extraneous_targets_warning(by_id, roster)
+    if extra:
+        return True, f"{extra}; {msg}"
+    return True, msg
+
+
+def check_sender_migration(env: dict[str, str]) -> tuple[bool, str]:
+    data, err = _load_json_evidence(EVIDENCE_SENDER_MIGRATION, env)
+    if err:
+        return False, f"sender-migration: {err}"
+    if data.get("all_senders_migrated") is not True:
+        remaining = data.get("remaining") or []
+        detail = ", ".join(str(x) for x in remaining) if remaining else "all_senders_migrated is not true"
+        return False, f"sender-migration: incomplete ({detail})"
+    return True, "sender-migration: evidence file reports all_senders_migrated=true"
+
+
+def check_ref_hydration_success(env: dict[str, str]) -> tuple[bool, str]:
+    reg, rerr = _load_json_evidence(EVIDENCE_TARGET_REGISTRY, env)
+    if rerr:
+        return False, f"ref-hydration-success: roster source {rerr}"
+    roster, roster_err = _registry_roster(reg)
+    if roster_err:
+        return False, f"ref-hydration-success: {roster_err}"
+    assert roster is not None
+    data, err = _load_json_evidence(EVIDENCE_REF_HYDRATION, env)
+    if err:
+        return False, f"ref-hydration-success: {err}"
+    by_id, terr = _target_entries_by_id(data.get("targets"))
+    if terr:
+        return False, f"ref-hydration-success: {terr}"
+    assert by_id is not None
+    uncovered = [a for a in roster if a not in by_id]
+    if uncovered:
+        return (
+            False,
+            "ref-hydration-success: roster target(s) missing from hydration evidence: "
+            + ", ".join(uncovered),
+        )
+    bad = []
+    for agent in roster:
+        entry = by_id[agent]
+        err_field = entry.get("error")
+        err_nonempty = isinstance(err_field, str) and err_field.strip()
+        if entry.get("ok") is True and err_nonempty:
+            bad.append(
+                f"{agent} ok=true contradicts error={err_field!r}"
+            )
+            continue
+        if entry.get("ok") is not True:
+            err_s = err_field or "ok!=true"
+            bad.append(f"{agent} ({err_s})")
+    if bad:
+        return False, "ref-hydration-success: failed target(s): " + ", ".join(bad)
+    msg = (
+        f"ref-hydration-success: evidence file reports {len(roster)} roster "
+        f"target(s) hydrated ok=true"
+    )
+    extra = _extraneous_targets_warning(by_id, roster)
+    if extra:
+        return True, f"{extra}; {msg}"
+    return True, msg
+
+
+def _parse_only_against_registry(
+    env: dict[str, str],
+    *,
+    check_name: str,
+) -> tuple[list[dict] | None, str | None]:
+    reg, rerr = _load_json_evidence(EVIDENCE_TARGET_REGISTRY, env)
+    if rerr:
+        return None, f"{check_name}: roster source {rerr}"
+    _, roster_err = _registry_roster(reg)
+    if roster_err:
+        return None, f"{check_name}: {roster_err}"
+    declared = _registry_parse_only(reg)
+    data, err = _load_json_evidence(EVIDENCE_PARSE_ONLY, env)
+    if err:
+        return None, f"{check_name}: {err}"
+    targets = data.get("targets")
+    if not isinstance(targets, list):
+        return None, f"{check_name}: targets must be a list"
+    if not targets:
+        if declared:
+            return (
+                None,
+                f"{check_name}: parse-only evidence is empty but registry parse_only "
+                f"declares: {', '.join(declared)}",
+            )
+        return [], None
+    by_id, terr = _target_entries_by_id(targets)
+    if terr:
+        return None, f"{check_name}: {terr}"
+    assert by_id is not None
+    missing = [a for a in declared if a not in by_id]
+    if missing:
+        return (
+            None,
+            f"{check_name}: registry parse_only target(s) missing from evidence: "
+            + ", ".join(missing),
+        )
+    extra = [a for a in by_id if a not in declared]
+    if extra:
+        return (
+            None,
+            f"{check_name}: evidence has undeclared parse-only target(s) "
+            f"(not in registry parse_only): " + ", ".join(extra),
+        )
+    return [by_id[a] for a in declared], None
+
+
+def check_parse_only_legacy_emission(env: dict[str, str]) -> tuple[bool, str]:
+    targets, err = _parse_only_against_registry(env, check_name="parse-only-legacy")
+    if err:
+        return False, err
+    assert targets is not None
+    if not targets:
+        return (
+            True,
+            "parse-only-legacy: evidence file reports zero parse-only seats "
+            "(registry parse_only=[])",
+        )
+    bad = []
+    for entry in targets:
+        agent = entry.get("agent_id") or "<unknown>"
+        hydrate = entry.get("brief_hydrate") or ""
+        emits = entry.get("authority_emits")
+        if hydrate == BRIEF_HYDRATE_V1 or emits != "legacy":
+            bad.append(
+                f"{agent} brief_hydrate={hydrate!r} authority_emits={emits!r}"
+            )
+    if bad:
+        return False, "parse-only-legacy: must stay legacy-emitting: " + ", ".join(bad)
+    return (
+        True,
+        f"parse-only-legacy: evidence file reports {len(targets)} parse-only "
+        f"target(s) legacy-emitting",
+    )
+
+
+def check_parse_only_ref_refusal(env: dict[str, str]) -> tuple[bool, str]:
+    targets, err = _parse_only_against_registry(env, check_name="parse-only-ref-refusal")
+    if err:
+        return False, err
+    assert targets is not None
+    if not targets:
+        return (
+            True,
+            "parse-only-ref-refusal: evidence file reports zero parse-only seats "
+            "(registry parse_only=[])",
+        )
+    bad = []
+    for entry in targets:
+        agent = entry.get("agent_id") or "<unknown>"
+        if entry.get("direct_ref_error") != DIRECT_REF_ERROR:
+            bad.append(
+                f"{agent} direct_ref_error={entry.get('direct_ref_error')!r} "
+                f"(want {DIRECT_REF_ERROR})"
+            )
+    if bad:
+        return False, "parse-only-ref-refusal: " + ", ".join(bad)
+    return (
+        True,
+        f"parse-only-ref-refusal: evidence file reports {len(targets)} target(s) "
+        f"refuse with {DIRECT_REF_ERROR}",
+    )
+
+
+def _parse_iso8601(value: object, *, field: str) -> tuple[datetime | None, str | None]:
+    if not isinstance(value, str) or not value.strip():
+        return None, f"zero-legacy-observation: {field} is missing or empty"
+    raw = value.strip()
+    try:
+        # Accept trailing Z as UTC.
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        dt = datetime.fromisoformat(raw)
+    except ValueError:
+        return None, f"zero-legacy-observation: {field} is not parseable ISO-8601: {value!r}"
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc), None
+
+
+def check_zero_legacy_observation(
+    env: dict[str, str],
+    *,
+    now: datetime | None = None,
+) -> tuple[bool, str]:
+    data, err = _load_json_evidence(EVIDENCE_LEGACY_OBSERVATION, env)
+    if err:
+        return False, f"zero-legacy-observation: {err}"
+    start, serr = _parse_iso8601(data.get("window_start"), field="window_start")
+    if serr:
+        return False, serr
+    end, eerr = _parse_iso8601(data.get("window_end"), field="window_end")
+    if eerr:
+        return False, eerr
+    assert start is not None and end is not None
+    if end <= start:
+        return (
+            False,
+            f"zero-legacy-observation: window_end <= window_start "
+            f"({end.isoformat()} <= {start.isoformat()})",
+        )
+    duration = end - start
+    if duration < LEGACY_WINDOW_MIN_DURATION:
+        return (
+            False,
+            f"zero-legacy-observation: window duration {duration} below floor "
+            f"{LEGACY_WINDOW_MIN_DURATION}",
+        )
+    clock = now if now is not None else datetime.now(timezone.utc)
+    if clock.tzinfo is None:
+        clock = clock.replace(tzinfo=timezone.utc)
+    # Reject wholly future windows (negative staleness was previously unbounded).
+    future_delta = end - clock
+    if future_delta > LEGACY_WINDOW_FUTURE_SKEW:
+        return (
+            False,
+            f"zero-legacy-observation: window_end is in the future "
+            f"(end - now = {future_delta}; allowed skew {LEGACY_WINDOW_FUTURE_SKEW})",
+        )
+    staleness = clock - end
+    if staleness > LEGACY_WINDOW_MAX_STALENESS:
+        return (
+            False,
+            f"zero-legacy-observation: window_end is stale "
+            f"(now - end = {staleness} > bound {LEGACY_WINDOW_MAX_STALENESS})",
+        )
+    if data.get("zero_authority_legacy") is not True:
+        count = data.get("legacy_count", "unknown")
+        return (
+            False,
+            f"zero-legacy-observation: zero_authority_legacy is not true "
+            f"(legacy_count={count})",
+        )
+    window = f"{start.isoformat()}..{end.isoformat()}"
+    return (
+        True,
+        f"zero-legacy-observation: evidence file reports zero authority legacy "
+        f"over {window}",
+    )
+
+
+def check_exempt_git(env: dict[str, str]) -> tuple[bool, str]:
+    """Slice 1d-iii: for exempt seats, prove push-less machine-user credential.
+
+    Derives the target from the seat's actual checkout (AGENT_WORKDIR), never from
+    BRIDGE_EXEMPT_GIT_REMOTE_URL. Gated seats skip this check.
+
+    Preflight is a check, not a mutation (R9): resolution/identity/ledger run
+    against AGENT_WORKDIR read-only; configure + push-deny proof run against a
+    throwaway local clone that is deleted afterward. AGENT_WORKDIR end-state is
+    unchanged (no extensions.worktreeConfig flip, no origin/sshCommand rewrite).
+    """
+    import shutil
+    import subprocess
+    import tempfile
+
+    lane = (env.get("BRIDGE_WORKTREE_LANE") or "gated").strip()
+    if lane != "exempt":
+        return True, f"exempt Git proof not required for lane={lane!r}"
+    try:
+        from agent_redis_bridge.exempt_git import (
+            EXEMPT_BOT_FINGERPRINT,
+            ExemptGitError,
+            _bind_probe_env,
+            _default_run_git,
+            build_probe_env,
+            prepare_exempt_worktree,
+            proof_covers_target,
+            resolve_target_remote,
+            validate_ssh_command,
+        )
+    except ImportError as exc:
+        return False, f"exempt_git unavailable: {exc}"
+
+    workdir = (env.get("AGENT_WORKDIR") or "").strip()
+    if not workdir:
+        return False, "exempt seat requires AGENT_WORKDIR to resolve target origin"
+    worktree = Path(workdir).expanduser()
+    if not worktree.is_dir():
+        return False, f"AGENT_WORKDIR is not a directory: {worktree}"
+
+    ssh_command = env.get("BRIDGE_EXEMPT_GIT_SSH_COMMAND")
+    fingerprint = env.get("BRIDGE_EXEMPT_GIT_KEY_FINGERPRINT") or EXEMPT_BOT_FINGERPRINT
+    ledger = env.get("BRIDGE_EXEMPT_PROVISIONING_LEDGER")
+    ledger_path = Path(ledger).expanduser() if ledger else None
+    if ledger_path is None:
+        return False, "exempt seat requires BRIDGE_EXEMPT_PROVISIONING_LEDGER"
+
+    # Validate SSH command BEFORE live resolution so every git subprocess
+    # (resolve, clone, set-url, prepare) runs under the same sanitized env as arm.
+    try:
+        validated_command, _key_path = validate_ssh_command(ssh_command)
+    except ExemptGitError as exc:
+        return False, f"{exc.code}: {exc.detail or exc}"
+    except Exception as exc:  # noqa: BLE001 - preflight fails closed
+        return False, f"exempt ssh validate raised {type(exc).__name__}: {exc}"
+
+    probe_env = build_probe_env(validated_command)
+    bound_run = _bind_probe_env(_default_run_git, validated_command)
+
+    # BRIDGE_EXEMPT_GIT_REMOTE_URL is never authority — mention it only as a warning
+    # if set, so operators do not think it redirects the proof.
+    singleton = env.get("BRIDGE_EXEMPT_GIT_REMOTE_URL")
+    note = ""
+    if singleton:
+        note = (
+            " (BRIDGE_EXEMPT_GIT_REMOTE_URL is set but not authoritative; "
+            "proof uses checkout origin)"
+        )
+
+    # Resolve from the live checkout without writing config (hermetic env).
+    try:
+        target = resolve_target_remote(worktree, run_git=bound_run)
+    except ExemptGitError as exc:
+        return False, f"{exc.code}: {exc.detail or exc}"
+    except Exception as exc:  # noqa: BLE001 - preflight fails closed
+        return False, f"exempt resolve raised {type(exc).__name__}: {exc}"
+
+    tmp_root = Path(tempfile.mkdtemp(prefix="seat-preflight-exempt-"))
+    probe_clone = tmp_root / "probe"
+    try:
+        clone = subprocess.run(
+            [
+                "git",
+                "clone",
+                "--local",
+                "--no-hardlinks",
+                str(worktree),
+                str(probe_clone),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=120,
+            env=probe_env,
+        )
+        if clone.returncode != 0:
+            return (
+                False,
+                f"exempt preflight could not create throwaway clone: "
+                f"{(clone.stderr or clone.stdout or '').strip()[:200]}",
+            )
+        # Point the clone's origin at the resolved SSH target so prepare
+        # re-resolves the same URL and only mutates the throwaway tree.
+        set_url = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(probe_clone),
+                "remote",
+                "set-url",
+                "origin",
+                target.ssh_url,
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+            env=probe_env,
+        )
+        if set_url.returncode != 0:
+            return (
+                False,
+                f"exempt preflight could not set probe origin: "
+                f"{(set_url.stderr or '').strip()[:200]}",
+            )
+        proof = prepare_exempt_worktree(
+            probe_clone,
+            lane="exempt",
+            ssh_command=validated_command,
+            expected_fingerprint=fingerprint,
+            ledger_path=ledger_path,
+        )
+    except ExemptGitError as exc:
+        return False, f"{exc.code}: {exc.detail or exc}"
+    except Exception as exc:  # noqa: BLE001 - preflight fails closed
+        return False, f"exempt proof raised {type(exc).__name__}: {exc}"
+    finally:
+        shutil.rmtree(tmp_root, ignore_errors=True)
+
+    if proof is None:
+        return False, "exempt proof returned no result"
+    # proof_covers_target: preflight must prove the same repo arm would resolve.
+    if not proof_covers_target(proof, target):
+        return (
+            False,
+            f"exempt proof target {proof.target_url!r} does not cover "
+            f"resolved checkout origin {target.ssh_url!r}",
+        )
+    return (
+        True,
+        f"exempt push-denied for {proof.target.ssh_url} "
+        f"(ledger={proof.ledger_repo}; class={proof.classification}){note}",
+    )
+
+
+def _program_options(arguments: object) -> dict[str, str]:
+    if not isinstance(arguments, list):
+        return {}
+    options: dict[str, str] = {}
+    names = ("--env-file", "--workdir", "--project")
+    for index, argument in enumerate(arguments):
+        if not isinstance(argument, str):
+            continue
+        # BooleanOptionalAction-style claim-gate CLI (bridge.py argparse).
+        if argument == "--claim-gate":
+            options["--claim-gate"] = "1"
+            continue
+        if argument == "--no-claim-gate":
+            options["--claim-gate"] = "0"
+            continue
+        for name in names:
+            if argument == name:
+                if index + 1 >= len(arguments) or not isinstance(arguments[index + 1], str):
+                    raise ValueError(f"plist ProgramArguments {name} is missing a value")
+                options[name] = arguments[index + 1]
+            elif argument.startswith(name + "="):
+                options[name] = argument[len(name) + 1 :]
+    return options
+
+
+def _load_input(path: Path) -> tuple[dict, Path, dict[str, str], str]:
+    if path.suffix.lower() != ".plist":
+        return {}, path, {}, "env"
+    with path.open("rb") as handle:
+        plist = plistlib.load(handle)
+    if not isinstance(plist, dict):
+        raise ValueError("plist root must be a dictionary")
+    variables = plist.get("EnvironmentVariables", {})
+    if not isinstance(variables, dict):
+        raise ValueError("plist EnvironmentVariables must be a dictionary")
+    process_env = {
+        str(key): str(value)
+        for key, value in variables.items()
+        if value is not None
+    }
+    cli_options = _program_options(plist.get("ProgramArguments"))
+    for option, env_key in {
+        "--env-file": "AGENT_ENV_FILE",
+        "--workdir": "AGENT_WORKDIR",
+        "--project": "AGENT_PROJECT",
+    }.items():
+        if option in cli_options:
+            process_env[env_key] = cli_options[option]
+    workdir = process_env.get("AGENT_WORKDIR", "")
+    env_file = process_env.get("AGENT_ENV_FILE", "")
+    env_path = Path(env_file) if env_file else Path(workdir or ".") / ".env"
+    return plist, env_path.expanduser(), process_env, "plist"
+
+
+def _warning(message: str) -> bool:
+    return "WARNING" in message
+
+
+def check_bakeoff_manifest(manifest: object) -> tuple[bool, str]:
+    """Check the redacted, frozen seat manifest without returning secret/dynamic values."""
+
+    allowed_fields = {"schema_version", "arms", "extensions", "design", "spec", "plan", "source", "base_sha", "corpus_sha", "tasks", "controls", "runtime", "pins", "git_rpc", "digest_versions", "capabilities", "budgets", "seed", "schedule", "planned_cells", "evidence", "ref_namespace", "stop_rules", "rerun_rules", "analysis_rules"}
+    if not isinstance(manifest, dict) or manifest.get("schema_version") != "manifest-v2" or set(manifest) - allowed_fields:
+        return False, "bakeoff manifest schema mismatch"
+    arms = manifest.get("arms")
+    if not isinstance(arms, list) or [arm.get("arm") for arm in arms if isinstance(arm, dict)] != list(BAKEOFF_ARM_IDS):
+        return False, "bakeoff manifest arms mismatch"
+    extensions = manifest.get("extensions")
+    if not isinstance(extensions, dict) or set(extensions) != set(BAKEOFF_EXTENSIONS) or any(extensions[name] for name in BAKEOFF_EXTENSIONS):
+        return False, "bakeoff manifest extensions must be explicit empty allowlists"
+    for arm in arms:
+        if not isinstance(arm, dict) or arm.get("arm") not in _BAKEOFF_ARM_PINS:
+            return False, "bakeoff manifest arm entry is malformed"
+        arm_id = arm["arm"]
+        pair, engine, provider, model, harness, agent_prefix, home, retire_env = _BAKEOFF_ARM_PINS[arm_id]
+        if any(arm.get(key) != value for key, value in (("pair", pair), ("engine", engine), ("provider", provider), ("model", model), ("harness", harness), ("agent_prefix", agent_prefix), ("home", home), ("retire_env", retire_env), ("retire_value", "1"))):
+            return False, f"bakeoff manifest {arm_id} pin mismatch"
+        controls = arm.get("controls")
+        reasoning = controls.get("reasoning") if isinstance(controls, dict) else None
+        if not isinstance(controls, dict) or set(controls) != set(BAKEOFF_CONTROL_NAMES):
+            return False, f"bakeoff manifest {arm_id} control map is not exhaustive"
+        if any(not isinstance(value, dict) or set(value) != {"requested", "effective", "verified_via"} or any(not isinstance(value[field], str) or not value[field] for field in value) for value in controls.values()):
+            return False, f"bakeoff manifest {arm_id} control acknowledgement is malformed"
+        if reasoning.get("requested") != "medium" or reasoning.get("effective") != "medium" or reasoning.get("verified_via") in {None, "request", "request-echo", "config", "config-echo", "echo", "prose", "model-prose"}:
+            return False, f"bakeoff manifest {arm_id} reasoning acknowledgement is not independent"
+    return True, "bakeoff manifest pins and empty extension allowlists valid"
+
+
+def run_scored_path_preflight(path: Path) -> int:
+    """Invoke the controller-owned scored preflight; static validation is never sufficient."""
+
+    try:
+        from implbench.harness.cli import main as implbench_main
+
+        return int(implbench_main(["preflight", "--manifest", str(path)]))
+    except Exception as exc:  # noqa: BLE001 - a seat preflight must fail closed
+        print(f"[seat-preflight] RED — scored preflight unavailable: {type(exc).__name__}", file=sys.stderr)
+        return 1
+
+
+def _run_bakeoff_manifest(path: Path) -> int:
+    if not path.is_file() or path.is_symlink() or stat.S_IMODE(path.stat().st_mode) != 0o600:
+        print(json.dumps({"status": "FAIL", "checks": [{"check": "manifest", "status": "FAIL"}]}))
+        print("[seat-preflight] RED — bakeoff manifest must be a regular mode-0600 file", file=sys.stderr)
+        return 1
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        print(json.dumps({"status": "FAIL", "checks": [{"check": "manifest", "status": "FAIL"}]}))
+        print(f"[seat-preflight] RED — cannot read bakeoff manifest: {type(exc).__name__}", file=sys.stderr)
+        return 1
+    ok, message = check_bakeoff_manifest(data)
+    if not ok:
+        print(json.dumps({"status": "FAIL", "checks": [{"check": "manifest", "status": "FAIL"}]}))
+        print(f"[seat-preflight] RED — {message}", file=sys.stderr)
+        return 1
+    scored_status = run_scored_path_preflight(path)
+    passed = scored_status == 0
+    print(json.dumps({"status": "PASS" if passed else "FAIL", "checks": [
+        {"check": "manifest", "status": "PASS"},
+        {"check": "scored-preflight", "status": "PASS" if passed else "FAIL"},
+    ]}))
+    if not passed:
+        print("[seat-preflight] RED — scored-path preflight did not pass", file=sys.stderr)
+    return 0 if passed else 1
+
+
+def _parse_argv(argv: list[str]) -> tuple[Path | None, bool, str | None, int | None]:
+    """Return (input_path, strict, checklist, usage_exit).
+
+    usage_exit is set when argv is invalid (caller should print doc and return it).
+    """
+    if "--manifest" in argv:
+        return None, False, None, None  # handled by caller
+    strict = "--strict" in argv
+    checklist: str | None = None
+    tokens = [a for a in argv if a != "--strict"]
+    if "--checklist" in tokens:
+        idx = tokens.index("--checklist")
+        if idx + 1 >= len(tokens):
+            return None, strict, None, 2
+        checklist = tokens[idx + 1]
+        if checklist not in CHECKLIST_MODES:
+            return None, strict, None, 2
+        del tokens[idx : idx + 2]
+    if len(tokens) != 1:
+        return None, strict, None, 2
+    return Path(tokens[0]).expanduser(), strict, checklist, None
+
+
+def _assemble_checks(
+    env: dict[str, str],
+    *,
+    home: Path,
+    mode: str,
+    plist: dict,
+    checklist: str | None,
+    process_env: dict[str, str] | None = None,
+) -> list[tuple[str, tuple[bool, str]]]:
+    """Build the ordered check list for default or checklist mode."""
+    claim_on = _flag_on(env, CLAIM_GATE)
+    # claim-gate checklist forces required=True even when BRIDGE_CLAIM_GATE=0.
+    claim_required = checklist == "claim-gate" or claim_on
+    hydration_required = claim_required
+    cli_claim: bool | None = None
+    if mode == "plist" and plist:
+        try:
+            prog_opts = _program_options(plist.get("ProgramArguments"))
+        except ValueError:
+            prog_opts = {}
+        if "--claim-gate" in prog_opts:
+            cli_claim = prog_opts["--claim-gate"] == "1"
+
+    checks: list[tuple[str, tuple[bool, str]]] = [
+        ("redis-required", check_redis_required(env)),
+        ("local-mcp-dsn", check_local_mcp_dsn(env, home)),
+        ("cross-store", check_cross_store(env)),
+        ("workdir", check_workdir(env)),
+        ("trusted-senders", check_trusted_senders(env)),
+        (
+            "worker-vantage",
+            check_worker_vantage(env, process_env=process_env, mode=mode),
+        ),
+        (
+            "worktree-lane",
+            check_worktree_lane(env, process_env=process_env, mode=mode),
+        ),
+        ("flag-posture", check_flag_posture(env, cli_claim_gate=cli_claim)),
+        ("env-scrub-capability", check_env_scrub_capability(env)),
+        ("gate-reader", check_gate_reader(env, required=claim_required)),
+        (
+            "lane-writer",
+            check_lane_writer(
+                env, required=claim_required, process_env=process_env, mode=mode
+            ),
+        ),
+        (
+            "lane-binding-keys",
+            check_lane_binding_keys(env, required=claim_required),
+        ),
+        (
+            "local-hydration",
+            check_local_hydration(
+                env,
+                required=hydration_required,
+                process_env=process_env,
+                mode=mode,
+            ),
+        ),
+        (
+            "memory-redis-url",
+            check_memory_redis_url(env, process_env=process_env, mode=mode),
+        ),
+        ("supervisor-interpreter", check_supervisor_interpreter(env)),
+        ("exempt-git", check_exempt_git(env)),
+    ]
+    if mode == "plist":
+        checks.append(("program", check_program(plist, env.get("AGENT_WORKDIR") or None)))
+
+    if checklist in {"ref-required", "legacy-removal"}:
+        checks.extend(
+            [
+                ("target-dual-parse", check_target_dual_parse(env)),
+                ("target-advertises-hydrate", check_target_advertises_hydrate(env)),
+                ("sender-migration", check_sender_migration(env)),
+                ("ref-hydration-success", check_ref_hydration_success(env)),
+                ("parse-only-legacy", check_parse_only_legacy_emission(env)),
+                ("parse-only-ref-refusal", check_parse_only_ref_refusal(env)),
+            ]
+        )
+    if checklist == "legacy-removal":
+        checks.append(("zero-legacy-observation", check_zero_legacy_observation(env)))
+    return checks
+
+
+def run_main(argv: list[str]) -> int:
+    if "--manifest" in argv:
+        index = argv.index("--manifest")
+        if index + 1 >= len(argv) or any(value not in {"--strict", "--manifest", argv[index + 1]} for value in argv):
+            print(__doc__, file=sys.stderr)
+            return 2
+        return _run_bakeoff_manifest(Path(argv[index + 1]).expanduser())
+
+    input_path, strict, checklist, usage_exit = _parse_argv(argv)
+    if usage_exit is not None:
+        print(__doc__, file=sys.stderr)
+        return usage_exit
+    assert input_path is not None
+
+    try:
+        plist, env_path, process_env, mode = _load_input(input_path)
+    except (OSError, plistlib.InvalidFileException, ValueError) as exc:
+        print(f"[seat-preflight] RED — cannot read {input_path}: {exc}", file=sys.stderr)
+        return 1
+
+    checks: list[tuple[str, tuple[bool, str]]] = []
+    env_ok, env_message = check_env_file(env_path)
+    checks.append(("env-file", (env_ok, env_message)))
+    file_env: dict[str, str] = {}
+    if env_ok:
+        try:
+            file_env = read_env_file(env_path)
+        except OSError as exc:
+            checks[0] = ("env-file", (False, f"env file could not be read: {exc}"))
+    env = {**file_env, **process_env}
+    home = Path(env.get("HOME") or os.environ.get("HOME") or Path.home()).expanduser()
+    checks.extend(
+        _assemble_checks(
+            env,
+            home=home,
+            mode=mode,
+            plist=plist,
+            checklist=checklist,
+            process_env=process_env,
+        )
+    )
+
+    failures = []
+    warnings = []
+    for name, (ok, message) in checks:
+        if ok and _warning(message):
+            warnings.append(name)
+            if strict:
+                failures.append((name, message))
+                print(f"[seat-preflight] FAIL {name}: {message}")
+            else:
+                # Warning branch: message-only (no check name) — V4 option (a) match.
+                print(f"[seat-preflight] {message}")
+        elif ok:
+            # V4 (a): OK lines drop the check name so name-in-output asserts
+            # cannot be satisfied by an unrelated OK line.
+            print(f"[seat-preflight] OK: {message}")
+        else:
+            failures.append((name, message))
+            print(f"[seat-preflight] FAIL {name}: {message}")
+    if failures:
+        print(f"[seat-preflight] RED — {len(failures)} check(s) failed", file=sys.stderr)
+        return 1
+    print(
+        f"[seat-preflight] OK — {len(checks)} check(s) passed"
+        + (f"; {len(warnings)} warning(s)" if warnings else "")
+        + (f" (checklist={checklist})" if checklist else "")
+    )
+    return 0
+
+
+def main() -> int:
+    return run_main(sys.argv[1:])
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

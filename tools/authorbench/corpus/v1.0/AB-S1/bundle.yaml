@@ -1,0 +1,25 @@
+id: AB-S1
+stage: spec
+corpus_version: v1.0
+source: 2026-07-03-arb-visibility-web-spec-authoring-brief.md
+provenance: verbatim
+base_sha: 25213908ef65dfbf992a430526a61b705d874f87
+length_budget: 300
+normalizer_version: 1
+factkey_version: 1
+outcome_globs:
+- docs/superpowers/specs/2026-07-03-arb-visibility-web-spec.md
+- docs/superpowers/**/2026-07-03-arb-visibility-web-spec-*
+steer_blocks:
+- give-the-reason
+- grounded-claims
+- no-reasoning-extraction
+- scope-restraint
+hashes:
+  brief_md: 9f684b5c409e7abb32d65d7b7f41885c92d946dbb93511f968be95e061edc1de
+  fact_key_yaml: 5cf59ded50e41df2d870ee72cd2816ef614eb6e1b9bf5672bce56ef91705b2ff
+  steer:
+    give-the-reason: a5cc7090f3ca9e4a0e75d916fc8bdced6d9b34ace66f7928ebddbdc84a0415bf
+    grounded-claims: a2f4e16d1867f3767c2af5f491a6936c3d9c0738bc12cb83d3c2fa2d88297b79
+    no-reasoning-extraction: 9cde5de956cd9d18cd357cca32f7900e82c8fd6c3e73a2b315390b0034e2e8a6
+    scope-restraint: d1aad126c08b158481f8736827413a74a3bfa4ddec5ebc4626d9af7a0b798396

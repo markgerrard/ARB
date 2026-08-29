@@ -1,0 +1,297 @@
+{
+  "id": "floor-correctness-full",
+  "description": "Full-power correctness floor (a cart/pricing service, deliberately non-security to confirm the suite generalizes past the posture taxonomy): 5 distinct logic-error kinds (off-by-one, inverted boolean, falsy-vs-absent, mutable-default state, lost-remainder numeric) + 19 distinct looks-buggy-but-correct controls spanning those kinds (several share code with a seed but differ by documented intent \u2014 the investigation test). 5 seeds = I_min, 19 controls = T -> CLASS-LEVEL capable. Rebuild with build_floor_correctness_full.sh; regenerate with this script.",
+  "subject": {
+    "repo": "../fixtures/repos/floor-correctness-full",
+    "base": "e4cdd9d939cec3ee375ba0870ed1bedb32d611b2",
+    "head": "ab475d8449b4f974c3ee2b992eec9551624a4d41"
+  },
+  "seeded_defects": [
+    {
+      "id": "K1-off-by-one-drops-last",
+      "class": "correctness",
+      "legible": true,
+      "location": {
+        "file": "tiers.py",
+        "line": 7,
+        "symbol": "total_tiered"
+      },
+      "description": "total_tiered() claims to sum EVERY tier but range(len-1) drops the last amount"
+    },
+    {
+      "id": "K2-inverted-boolean",
+      "class": "correctness",
+      "legible": true,
+      "location": {
+        "file": "pricing.py",
+        "line": 6,
+        "symbol": "is_free_shipping"
+      },
+      "description": "is_free_shipping() docstring says 'over $50 OR member' but uses 'and', excluding non-member big carts"
+    },
+    {
+      "id": "K3-falsy-vs-absent",
+      "class": "correctness",
+      "legible": true,
+      "location": {
+        "file": "cart.py",
+        "line": 6,
+        "symbol": "item_quantity"
+      },
+      "description": "item_quantity() treats a valid quantity of 0 as 'unset' and forces it to 1"
+    },
+    {
+      "id": "K4-mutable-default",
+      "class": "correctness",
+      "legible": true,
+      "location": {
+        "file": "cart.py",
+        "line": 11,
+        "symbol": "add_item"
+      },
+      "description": "add_item() uses a mutable default list, so the cart accumulates across calls"
+    },
+    {
+      "id": "K5-lost-remainder",
+      "class": "correctness",
+      "legible": true,
+      "location": {
+        "file": "money.py",
+        "line": 6,
+        "symbol": "split_evenly"
+      },
+      "description": "split_evenly() must sum back to total but integer floor drops the remainder cents"
+    }
+  ],
+  "control_loci": [
+    {
+      "id": "c01-exclude-last-intentional",
+      "class": "correctness",
+      "cluster": "index-boundary-correct",
+      "location": {
+        "file": "tiers.py",
+        "line": 15,
+        "symbol": "sum_except_last"
+      },
+      "description": "identical range(len-1) to K1 but docstring says EXCLUDE the last (a precomputed total) \u2014 correct"
+    },
+    {
+      "id": "c02-header-skip",
+      "class": "correctness",
+      "cluster": "index-boundary-correct",
+      "location": {
+        "file": "tiers.py",
+        "line": 22,
+        "symbol": "drop_header"
+      },
+      "description": "rows[1:] intentionally drops the header row \u2014 correct"
+    },
+    {
+      "id": "c03-or-default-idiom",
+      "class": "correctness",
+      "cluster": "falsy-fallback",
+      "location": {
+        "file": "pricing.py",
+        "line": 11,
+        "symbol": "apply_or_default"
+      },
+      "description": "'label or default' is correct: empty/None label legitimately means unset"
+    },
+    {
+      "id": "c04-and-required",
+      "class": "correctness",
+      "cluster": "correct-boolean",
+      "location": {
+        "file": "pricing.py",
+        "line": 16,
+        "symbol": "both_required"
+      },
+      "description": "'and' is correct here \u2014 a stacked discount genuinely requires both"
+    },
+    {
+      "id": "c05-de-morgan",
+      "class": "correctness",
+      "cluster": "correct-boolean",
+      "location": {
+        "file": "pricing.py",
+        "line": 21,
+        "symbol": "not_both"
+      },
+      "description": "not(a and b) correctly expresses mutual exclusivity"
+    },
+    {
+      "id": "c06-is-none-distinct",
+      "class": "correctness",
+      "cluster": "is-none-preserves-zero",
+      "location": {
+        "file": "cart.py",
+        "line": 19,
+        "symbol": "quantity_or_zero"
+      },
+      "description": "uses 'is None' so an explicit 0 is preserved (the correct counterpart to K3)"
+    },
+    {
+      "id": "c07-none-sentinel",
+      "class": "correctness",
+      "cluster": "none-sentinel",
+      "location": {
+        "file": "cart.py",
+        "line": 26,
+        "symbol": "add_item_safe"
+      },
+      "description": "None-sentinel default gives a fresh list per call (the correct counterpart to K4)"
+    },
+    {
+      "id": "c08-local-accumulator",
+      "class": "correctness",
+      "cluster": "local-accumulator",
+      "location": {
+        "file": "cart.py",
+        "line": 34,
+        "symbol": "cart_total"
+      },
+      "description": "accumulator is local, so each call starts at 0 \u2014 correct despite looking state-y"
+    },
+    {
+      "id": "c09-rounded-cents",
+      "class": "correctness",
+      "cluster": "rounded-money",
+      "location": {
+        "file": "money.py",
+        "line": 11,
+        "symbol": "to_cents"
+      },
+      "description": "rounds before int() so no truncation error \u2014 correct money conversion"
+    },
+    {
+      "id": "c10-ceiling-div",
+      "class": "correctness",
+      "cluster": "ceiling-division",
+      "location": {
+        "file": "money.py",
+        "line": 16,
+        "symbol": "page_count"
+      },
+      "description": "the +per-1 idiom is correct ceiling division, not an off-by-one"
+    },
+    {
+      "id": "c11-intentional-floor",
+      "class": "correctness",
+      "cluster": "intentional-floor",
+      "location": {
+        "file": "money.py",
+        "line": 21,
+        "symbol": "floor_units"
+      },
+      "description": "integer floor is intentional (whole units only), documented \u2014 correct"
+    },
+    {
+      "id": "c12-remainder-distributed",
+      "class": "correctness",
+      "cluster": "remainder-distributed",
+      "location": {
+        "file": "money.py",
+        "line": 26,
+        "symbol": "split_with_remainder"
+      },
+      "description": "correctly distributes leftover cents (the correct counterpart to K5)"
+    },
+    {
+      "id": "c13-len-zero",
+      "class": "correctness",
+      "cluster": "emptiness-check",
+      "location": {
+        "file": "validate.py",
+        "line": 6,
+        "symbol": "is_empty"
+      },
+      "description": "len==0 is a correct emptiness test"
+    },
+    {
+      "id": "c14-bool-cart",
+      "class": "correctness",
+      "cluster": "emptiness-check",
+      "location": {
+        "file": "validate.py",
+        "line": 11,
+        "symbol": "has_items"
+      },
+      "description": "bool(cart) correctly tests non-emptiness"
+    },
+    {
+      "id": "c15-clamp",
+      "class": "correctness",
+      "cluster": "clamp",
+      "location": {
+        "file": "validate.py",
+        "line": 16,
+        "symbol": "clamp"
+      },
+      "description": "max(lo, min(v, hi)) is the correct clamp despite the nested look"
+    },
+    {
+      "id": "c16-modular-wrap",
+      "class": "correctness",
+      "cluster": "index-boundary-correct",
+      "location": {
+        "file": "schedule.py",
+        "line": 6,
+        "symbol": "next_index"
+      },
+      "description": "(i+1) % n is correct wraparound, not an off-by-one"
+    },
+    {
+      "id": "c17-last-index",
+      "class": "correctness",
+      "cluster": "index-boundary-correct",
+      "location": {
+        "file": "schedule.py",
+        "line": 11,
+        "symbol": "last_index"
+      },
+      "description": "len-1 is the correct final index"
+    },
+    {
+      "id": "c18-bounds-check",
+      "class": "correctness",
+      "cluster": "index-boundary-correct",
+      "location": {
+        "file": "schedule.py",
+        "line": 16,
+        "symbol": "in_range"
+      },
+      "description": "0 <= i < n is the correct half-open bounds test"
+    },
+    {
+      "id": "c19-guarded-float-div",
+      "class": "correctness",
+      "cluster": "guarded-division",
+      "location": {
+        "file": "util.py",
+        "line": 6,
+        "symbol": "safe_div"
+      },
+      "description": "guards the zero divisor and uses float division \u2014 correct"
+    }
+  ],
+  "panel": [
+    {
+      "seat": "codex",
+      "model": "gpt-5.5",
+      "harness": "codex"
+    },
+    {
+      "seat": "agy",
+      "model": "gemini",
+      "harness": "agy-print"
+    }
+  ],
+  "power": {
+    "V": 0.4,
+    "nu": 0.1,
+    "alpha": 0.05,
+    "I_min": 5,
+    "R_min": 3,
+    "matcher_gate": 0.85
+  }
+}

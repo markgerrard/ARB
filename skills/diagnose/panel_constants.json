@@ -1,0 +1,16 @@
+{
+  "roster": [
+    {"role": "blind", "model": "codex", "channel": "bridge", "engine": "codex", "target_id": "codex-bridge-dev-example", "role_profile": "reviewer", "vendor": "gpt"},
+    {"role": "alternative", "model": "agy", "channel": "bridge", "engine": "agy-print", "target_id": "agy-bridge-dev", "role_profile": "reviewer", "vendor": "gemini"},
+    {"role": "open", "model": "minimax/MiniMax-M3", "channel": "bridge", "engine": "pi-sdk", "target_id": "pi-sdk-bridge-dev-minimax-m3", "role_profile": "judgment-oracle", "vendor": "minimax"}
+  ],
+  "scribe": {
+    "model": "claude-haiku",
+    "channel": "agent-tool",
+    "system_prompt": "Describe only observed files, line references, command outputs, and structured facts. Do not infer causes, rank hypotheses, recommend fixes, or evaluate alternatives."
+  },
+  "sender": "claude-bridge-dev",
+  "certifier": {"rule": "model!=author_model and not reciprocal"},
+  "role_assignment": {"rule": "top-candidate-by-fixed-rank", "seed": 19062026},
+  "collation_order": "by-seat-id-asc"
+}

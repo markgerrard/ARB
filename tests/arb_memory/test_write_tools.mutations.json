@@ -1,0 +1,38 @@
+{
+ "schema": 1,
+ "mutations": [
+  {
+   "id": "M1",
+   "kind": "defect",
+   "label": "drop the await_result requirement for expected_version",
+   "file": "src/arb_memory/mcp/tools.py",
+   "find": "            if not await_result:\n                raise ValueError(\"expected_version requires await_result\")\n",
+   "replace": "            if False:\n                raise ValueError(\"expected_version requires await_result\")\n",
+   "expect_failed": [
+    "tests/arb_memory/test_write_tools.py::test_memory_store_expected_version_requires_await_result"
+   ]
+  },
+  {
+   "id": "M2",
+   "kind": "defect",
+   "label": "disable the guard_not_live stored-arm detector",
+   "file": "src/arb_memory/mcp/tools.py",
+   "find": "            if expected_version is not None and outcome == \"stored\" and version != expected_version + 1:",
+   "replace": "            if False and expected_version is not None and outcome == \"stored\" and version != expected_version + 1:",
+   "expect_failed": [
+    "tests/arb_memory/test_write_tools.py::test_memory_store_guard_not_live_on_arithmetic_mismatch"
+   ]
+  },
+  {
+   "id": "M3",
+   "kind": "defect",
+   "label": "disable the guard_not_live deduped-arm detector",
+   "file": "src/arb_memory/mcp/tools.py",
+   "find": "            if expected_version is not None and outcome == \"deduped\" and version != expected_version:",
+   "replace": "            if False and expected_version is not None and outcome == \"deduped\" and version != expected_version:",
+   "expect_failed": [
+    "tests/arb_memory/test_write_tools.py::test_memory_store_guard_not_live_on_deduped_version_mismatch"
+   ]
+  }
+ ]
+}

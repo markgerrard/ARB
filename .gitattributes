@@ -1,0 +1,9 @@
+# The calibration decision log is append-only and committed (so its accumulated
+# record is redundant on the remote, not a lone file on one host). union merge so
+# concurrent appends from different hosts/branches auto-resolve to "keep all
+# lines" instead of conflicting — correct semantics for an append-only log.
+.calibration/log.jsonl merge=union
+
+# implbench encrypted batteries are binary — git must never dump their bytes
+# (the bridge-protocol gate git-inspects diffs and crashed decoding them, 2026-07-09)
+bench/implbench/batteries/*.enc binary

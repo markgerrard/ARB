@@ -1,0 +1,16 @@
+[
+ {
+  "id": "P1",
+  "label": "readable-guard removed from get_env (the original silent death)",
+  "file": "scripts/agent-bridge-ping",
+  "find": "  [ -r \"$ENV_FILE\" ] || return 0\n",
+  "replace": ""
+ },
+ {
+  "id": "P2",
+  "label": "loud config-resolution check disabled",
+  "file": "scripts/agent-bridge-ping",
+  "find": "if [ -n \"$missing\" ]; then",
+  "replace": "if false; then"
+ }
+]

@@ -1,0 +1,14 @@
+[Unit]
+Description=Agent Redis Bridge (%i)
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=/srv/projects/example-bridge
+Environment=PYTHONPATH=/srv/projects/example-bridge/src
+ExecStart=/srv/projects/example-bridge/scripts/agent-redis-bridge-systemd %i
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

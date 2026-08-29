@@ -1,0 +1,144 @@
+#!/usr/bin/env python3
+"""Short-lived FABA-driver harness publish for dispatch briefs (Slice 1d-iv).
+
+Freezes the target registry record, derives worker_vantage from it (never
+caller text), validates the brief with validate_dispatch_brief, publishes as
+the harness via the existing publish_artefact_and_gate path, and emits a
+pointer-only target-bound receipt. **Does not enqueue** an ordinary request
+and never prints body bytes or credentials.
+
+Run only as the short-lived FABA driver with ARB_MEMORY_REDIS_URL injected.
+Bash/Go/ctl/warm callers must not invoke this; they consume its receipt only.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO / "src"))
+sys.path.insert(0, str(REPO / "tools" / "faba"))
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--target-agent-id", required=True)
+    parser.add_argument(
+        "--brief",
+        required=True,
+        type=Path,
+        help="path to the dispatch brief markdown to publish",
+    )
+    parser.add_argument(
+        "--artefact-id",
+        default=None,
+        help="optional pre-minted artefact id; minted when omitted",
+    )
+    parser.add_argument(
+        "--env-file",
+        type=Path,
+        default=None,
+        help="optional bus env file (AGENT_REDIS_*); defaults to process env",
+    )
+    parser.add_argument(
+        "--redis-url",
+        default=None,
+        help="override ARB_MEMORY_REDIS_URL for the harness publish credential",
+    )
+    parser.add_argument(
+        "--author",
+        default="faba-dispatch",
+        help="author string recorded on the published artefact",
+    )
+    parser.add_argument(
+        "--receipt-timeout",
+        type=float,
+        default=60.0,
+    )
+    args = parser.parse_args(argv)
+
+    redis_url = (args.redis_url or os.environ.get("ARB_MEMORY_REDIS_URL") or "").strip()
+    if not redis_url:
+        print(
+            "arb-memory-harness-publish: ARB_MEMORY_REDIS_URL required "
+            "(FABA driver only; never enqueue)",
+            file=sys.stderr,
+        )
+        return 2
+
+    brief_text = args.brief.read_text(encoding="utf-8")
+
+    from agent_redis_bridge.dispatch_authority import (  # noqa: WPS433
+        DispatchAuthorityError,
+        harness_publish,
+    )
+    from agent_redis_bridge.redis_io import RedisCli, RedisConfig, read_env_file  # noqa: WPS433
+
+    if args.env_file is not None:
+        env = read_env_file(args.env_file)
+        config = RedisConfig(
+            host=env["AGENT_REDIS_HOST"],
+            port=env["AGENT_REDIS_PORT"],
+            db=env["AGENT_REDIS_DB"],
+            prefix=env["AGENT_REDIS_PREFIX"],
+            password=env.get("AGENT_REDIS_PASSWORD") or None,
+            user=env.get("AGENT_REDIS_USER") or None,
+            tls=env.get("AGENT_REDIS_TLS", "0") in {"1", "true", "True", "yes"},
+        )
+    else:
+        config = RedisConfig(
+            host=os.environ["AGENT_REDIS_HOST"],
+            port=os.environ["AGENT_REDIS_PORT"],
+            db=os.environ["AGENT_REDIS_DB"],
+            prefix=os.environ["AGENT_REDIS_PREFIX"],
+            password=os.environ.get("AGENT_REDIS_PASSWORD") or None,
+            user=os.environ.get("AGENT_REDIS_USER") or None,
+            tls=os.environ.get("AGENT_REDIS_TLS", "0") in {"1", "true", "True", "yes"},
+        )
+
+    redis_cli = RedisCli(config)
+    try:
+        receipt = harness_publish(
+            brief_text=brief_text,
+            target_agent_id=args.target_agent_id,
+            redis_cli=redis_cli,
+            redis_url=redis_url,
+            artefact_id=args.artefact_id,
+            author=args.author,
+            receipt_timeout=args.receipt_timeout,
+        )
+    except DispatchAuthorityError as exc:
+        print(json.dumps({"ok": False, "error": exc.reason}), file=sys.stderr)
+        return 1
+    except Exception as exc:  # noqa: BLE001
+        print(
+            json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}),
+            file=sys.stderr,
+        )
+        return 1
+
+    # Pointer-only target-bound receipt on stdout (FLAT contract). Errors already
+    # go to stderr as {"ok": false, ...}. Never enqueue. Never body/credentials.
+    # Consumers (wiki_refresh, learn_intake, diagnose panel, seat-e2e, and the
+    # recipe's `jq -r .artefact_id`) parse stdout as the flat receipt dict.
+    print(format_receipt_stdout(receipt))
+    return 0
+
+
+def format_receipt_stdout(receipt) -> str:
+    """Flat receipt stdout contract (Slice 1d-iv rem1 R1).
+
+    Returns ``json.dumps(receipt.to_dict())`` — top-level ``artefact_id`` /
+    ``version`` / … so ``jq -r .artefact_id`` and
+    ``HarnessPublishReceipt.from_dict(json.loads(stdout))`` both work.
+    Must not wrap as ``{"ok": true, "receipt": …}``.
+    """
+    return json.dumps(receipt.to_dict(), indent=2)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

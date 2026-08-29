@@ -1,0 +1,26 @@
+version: 1
+brief_id: AB-S1
+base_sha: 25213908ef65dfbf992a430526a61b705d874f87
+facts:
+- id: F1
+  claim: current index.html uses a calc-based main height
+  file: src/arb_memory/static/index.html
+  line: 54
+  pattern: calc(100vh - 73px)
+- id: F2
+  claim: current app.js has the streamSSE seam
+  file: src/arb_memory/static/app.js
+  line: 210
+  pattern: function streamSSE
+- id: F3
+  claim: visibility.py already exposes seats_history
+  file: src/arb_memory/visibility.py
+  line: 744
+  pattern: async def seats_history
+traps:
+- id: T1
+  name: fatal-stream-retry
+  precondition: 4xx SSE responses keep reconnecting or surface only as timeline text
+  file: src/arb_memory/static/app.js
+  symbol: streamSSE
+  historical_catch: docs/superpowers/reviews/2026-07-03-arb-visibility-web-spec-panel-brief.md:27

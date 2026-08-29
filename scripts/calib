@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Thin wrapper around `python -m agent_redis_bridge.calibration`.
+# Decision-quality calibration loop (REPORT-ONLY — never auto-tunes). See
+# docs/calibration-loop.md.
+#
+#   calib record   --scope phase3-i5b --decision consensus-accept \
+#                  --reviewer codex=APPROVE --reviewer agy="APPROVE WITH NOTES" \
+#                  --finding f1:codex:"null deref" --diff-range A..B
+#   calib annotate --decision <id> --finding f1 --status confirmed \
+#                  --evidence "regression test reproduces; see commit X"
+#   calib annotate --decision <id> --status held --evidence "no regression in 90d, re-checked"
+#   calib report [--strict]
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PY="${AGENT_BRIDGE_PYTHON:-}"
+# venv may sit at the repo root or one level up (this host: /srv/agent-redis-bridge/.venv).
+for cand in "${REPO_ROOT}/.venv/bin/python" "${REPO_ROOT}/../.venv/bin/python"; do
+  [ -z "$PY" ] && [ -x "$cand" ] && PY="$cand"
+done
+[ -z "$PY" ] && PY=python3
+
+PYTHONPATH="${REPO_ROOT}/src${PYTHONPATH:+:$PYTHONPATH}" exec "$PY" -m agent_redis_bridge.calibration "$@"

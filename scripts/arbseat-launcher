@@ -1,0 +1,5 @@
+#!/bin/bash
+# launchd-exec shim (D-4): launchd cannot exec scripts on /Volumes/<workspace>
+# directly (persistent EINTR, exit 126). This internal-disk wrapper execs the
+# repo script — the single source of truth — from a running shell, which works.
+exec /Volumes/<workspace>/repos/ARB/scripts/agent-redis-bridge-systemd "$@"

@@ -1,0 +1,24 @@
+id: AB-D1
+stage: design
+corpus_version: v1.0
+source: arb-watch-history design brief
+provenance: reconstructed(v1)
+base_sha: 9de2850
+length_budget: 300
+normalizer_version: 1
+factkey_version: 1
+outcome_globs:
+- docs/superpowers/**/2026-07-03-arb-watch-history-*
+steer_blocks:
+- give-the-reason
+- grounded-claims
+- no-reasoning-extraction
+- scope-restraint
+hashes:
+  brief_md: 2b56f3a280ce10cec39f6653cb9912b34097a0362841db4743b406fe2e86fca3
+  fact_key_yaml: dfe7b5592a4f016472f2b31ecd6d3841f1580da1376becd5fbad467ce3809188
+  steer:
+    give-the-reason: a5cc7090f3ca9e4a0e75d916fc8bdced6d9b34ace66f7928ebddbdc84a0415bf
+    grounded-claims: a2f4e16d1867f3767c2af5f491a6936c3d9c0738bc12cb83d3c2fa2d88297b79
+    no-reasoning-extraction: 9cde5de956cd9d18cd357cca32f7900e82c8fd6c3e73a2b315390b0034e2e8a6
+    scope-restraint: d1aad126c08b158481f8736827413a74a3bfa4ddec5ebc4626d9af7a0b798396

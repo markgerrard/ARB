@@ -1,0 +1,1 @@
+"""Claude transcript tailing helpers."""

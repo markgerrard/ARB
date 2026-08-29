@@ -1,0 +1,172 @@
+#!/usr/bin/env bash
+# dispatch-dev — orchestrator-side wrapper around the bridge dispatcher for the local dev fleet.
+#
+# Fixes two recurring footguns when paneling/dispatching from the warm-Opus session:
+#   1. envs/agent-redis-bridge-dev.env leaves AGENT_REDIS_* BLANK. The seats' Python bridge defaults
+#      to localhost when unset, but the bash dispatcher uses the blank values literally and tries to
+#      connect to ":0" ("Can't assign requested address"). This sets the known dev-bus coords.
+#   2. zsh (the orchestrator's interactive shell) does NOT word-split an unquoted joined env string,
+#      so inline `env $BUS $COMMON agent-dispatch ...` collapses the whole string into one var. This
+#      wrapper runs under bash and exports each var explicitly, sidestepping that entirely.
+#
+# Dispatcher backend: the Go client edge (tools/go-client) by default — finishing the client-edge
+# port so we exercise it on the real path. Set USE_BASH_DISPATCH=1 to fall back to the Python
+# scripts/agent-dispatch (kept as the escape hatch). The Go binary is auto-built if missing.
+#
+# Run-id labelling: arb-watch shows `run <run_id>` and falls back to the task_id GUID when unset.
+# This wrapper DEFAULTS a meaningful --run-id so the roster shows what the seat was doing, not a GUID:
+#   * if --brief <path> was supplied, the run-id is the brief-path slug
+#     (2026-06-29-arb-files-impl-review-brief.md -> arb-files-impl-review)
+#   * otherwise <target>-<branch>-<HHMMSS>.
+# An explicit --run-id always wins. (No free-form task-prose grep — authority path.)
+#
+# Every value is overridable from the environment, so non-default buses still work:
+#   AGENT_REDIS_DB=3 dispatch-dev --engine codex --target-id codex-bridge-dev-example \
+#     --artefact-id art-… --version 1 --receipt /tmp/r.json --brief /tmp/brief.md
+#
+# Usage: scripts/dispatch-dev <any agent-dispatch args...>
+#   Ordinary request/worktree_run (Slice 1d-iv) require the pre-minted quartet —
+#   free-form positional task strings were removed:
+#   e.g. scripts/dispatch-dev --engine codex --target-id codex-bridge-dev-example \
+#     --timeout 2400 --artefact-id "$(jq -r .artefact_id /tmp/r.json)" \
+#     --version "$(jq -r .version /tmp/r.json)" --receipt /tmp/r.json --brief /tmp/brief.md
+
+set -euo pipefail
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ORIG_ARGS=("$@")
+
+# Orchestrator sender identity + env file (trusted sender per AGENT_TRUSTED_SENDERS).
+export FROM_AGENT_ID="${FROM_AGENT_ID:-claude-bridge-dev}"
+export AGENT_ENV_FILE="${AGENT_ENV_FILE:-$REPO/envs/agent-redis-bridge-dev.env}"
+
+# Bus coordinates. Precedence: explicit shell env > AGENT_ENV_FILE > dev-fleet defaults.
+# The hardcoded fallbacks exist because envs/agent-redis-bridge-dev.env leaves AGENT_REDIS_*
+# blank (footgun #1 in the header). But EXPORTING a default here outranks the env-file lookup
+# inside agent-dispatch, so on a host whose bus is not on 6379 (e.g. agent-bridge-redis on
+# 6390) a caller-supplied AGENT_ENV_FILE was silently ignored and every envelope landed on a
+# redis no bridge watches (2026-07-16 project-b incident: three panel dispatch rounds lost).
+# Read the caller's env file FIRST; hardcode only what neither source provides.
+_envfile_get() {
+  [ -r "$AGENT_ENV_FILE" ] || return 0
+  awk -F= -v key="$1" '$1 == key { sub(/^[^=]*=/, ""); gsub(/^"|"$/, ""); print; exit }' "$AGENT_ENV_FILE" 2>/dev/null || true
+}
+export AGENT_REDIS_HOST="${AGENT_REDIS_HOST:-$(_envfile_get AGENT_REDIS_HOST)}"
+export AGENT_REDIS_PORT="${AGENT_REDIS_PORT:-$(_envfile_get AGENT_REDIS_PORT)}"
+export AGENT_REDIS_DB="${AGENT_REDIS_DB:-$(_envfile_get AGENT_REDIS_DB)}"
+export AGENT_REDIS_PREFIX="${AGENT_REDIS_PREFIX:-$(_envfile_get AGENT_REDIS_PREFIX)}"
+export AGENT_REDIS_HOST="${AGENT_REDIS_HOST:-127.0.0.1}"
+export AGENT_REDIS_PORT="${AGENT_REDIS_PORT:-6379}"
+export AGENT_REDIS_DB="${AGENT_REDIS_DB:-12}"
+export AGENT_REDIS_PREFIX="${AGENT_REDIS_PREFIX:-agent_scratch:}"
+
+# BRANCH must be non-empty (the bridge rejects empty as invalid-branch; detached HEAD → "").
+if [ -z "${BRANCH:-}" ]; then
+  _b="$(git -C "$REPO" branch --show-current 2>/dev/null || true)"
+  export BRANCH="${_b:-dev}"
+fi
+
+# Control-lane abort surface for panel overlays.  This deliberately routes
+# through ctl.py rather than the seat inbox, and requires an explicit task id
+# so max_parallel>1 cannot cancel an arbitrary sibling.
+if [ "${1:-}" = "--cancel" ]; then
+  shift
+  CANCEL_TASK=""
+  CANCEL_TO=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --task-id) CANCEL_TASK="${2:?--task-id requires a value}"; shift 2 ;;
+      --to|--target-id) CANCEL_TO="${2:?--to requires a value}"; shift 2 ;;
+      --env-file) export AGENT_ENV_FILE="${2:?--env-file requires a value}"; shift 2 ;;
+      *) echo "dispatch-dev --cancel: unexpected argument $1" >&2; exit 2 ;;
+    esac
+  done
+  if [ -z "$CANCEL_TASK" ] || [ -z "$CANCEL_TO" ]; then
+    echo "dispatch-dev --cancel requires --task-id ID and --to SEAT" >&2
+    exit 2
+  fi
+  export PYTHONPATH="$REPO/src${PYTHONPATH:+:$PYTHONPATH}"
+  exec python3 -m agent_redis_bridge.ctl \
+    --env-file "$AGENT_ENV_FILE" --sender "$FROM_AGENT_ID" --target "$CANCEL_TO" \
+    cancel --task-id "$CANCEL_TASK"
+fi
+
+# --- Bash escape hatch: USE_BASH_DISPATCH=1 -> original Python dispatcher, untranslated. -----------
+if [ "${USE_BASH_DISPATCH:-0}" = "1" ]; then
+  exec "$REPO/scripts/agent-dispatch" "${ORIG_ARGS[@]}"
+fi
+
+GO_DIR="$REPO/tools/go-client"
+GO_BIN="$GO_DIR/go-client"
+# Rebuild when the binary is missing OR any .go source is newer than it — otherwise a
+# source change (e.g. a new flag) is silently ignored until someone deletes the binary.
+NEEDS_BUILD=0
+if [ ! -x "$GO_BIN" ]; then
+  NEEDS_BUILD=1
+elif [ -n "$(find "$GO_DIR" -name '*.go' -newer "$GO_BIN" -print -quit 2>/dev/null)" ]; then
+  NEEDS_BUILD=1
+fi
+if [ "$NEEDS_BUILD" = "1" ]; then
+  if command -v go >/dev/null 2>&1; then
+    ( cd "$GO_DIR" && go build -o go-client . ) || { echo "[dispatch-dev] go build failed; falling back to bash dispatcher" >&2; exec "$REPO/scripts/agent-dispatch" "${ORIG_ARGS[@]}"; }
+  elif [ ! -x "$GO_BIN" ]; then
+    echo "[dispatch-dev] go toolchain absent; using bash dispatcher" >&2
+    exec "$REPO/scripts/agent-dispatch" "${ORIG_ARGS[@]}"
+  fi
+fi
+
+# --- Translate legacy agent-dispatch flags -> go-client dispatch flags. ----------------------------
+# go-client routes by target inbox (no --engine), uses --to (not --target-id); everything else maps 1:1.
+# Slice 1d-iv: ordinary dispatch uses --artefact-id/--version/--receipt/--brief (no free-form task).
+GO_ARGS=()
+RUN_ID=""
+TARGET=""
+BRIEF_PATH=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --engine)              shift 2 ;;                                  # not needed by the client edge
+    --workspace|--role)    shift 2 ;;                                  # bridge-side only; client ignores
+    --target-id)           TARGET="$2"; GO_ARGS+=(--to "$2"); shift 2 ;;
+    --run-id)              RUN_ID="$2"; GO_ARGS+=(--run-id "$2"); shift 2 ;;
+    --timeout)             GO_ARGS+=(--timeout "$2"); shift 2 ;;
+    --brief)               BRIEF_PATH="$2"; GO_ARGS+=(--brief "$2"); shift 2 ;;
+    --artefact-id|--version|--receipt|--worktree|--worktree-base|--worktree-cleanup|--thread-id|--fork-thread-id|--commit-message|--expected-artifact|--allowed-path|--worktree-lease|--lease-ttl|--operation)
+                           GO_ARGS+=("$1" "$2"); shift 2 ;;
+    --expect-structured|--fresh-context|--audit-panel|--panel-input-locked|--dry-run-envelope|--adhoc|--retry-engine-start)
+                           GO_ARGS+=("$1"); shift ;;
+    --*)                   GO_ARGS+=("$1" "$2"); shift 2 ;;            # passthrough unknown two-arg flags
+    *)
+      echo "dispatch-dev: free-form positional task removed (Slice 1d-iv)." >&2
+      echo "  Use --artefact-id --version --receipt --brief (publish first via arb-memory-harness-publish)." >&2
+      exit 2
+      ;;
+  esac
+done
+
+# Default a meaningful run-id when none was supplied (see header).
+# Prefer the --brief path slug (authority metadata), not grepping free-form prose.
+if [ -z "$RUN_ID" ]; then
+  if [ -n "$BRIEF_PATH" ]; then
+    label="$(basename "$BRIEF_PATH" .md)"
+    label="${label#20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]-}"   # strip YYYY-MM-DD- prefix
+    label="${label%-brief}"
+  else
+    label="${TARGET:-dispatch}-${BRANCH}-$(date +%H%M%S)"
+  fi
+  RUN_ID="$label"
+  GO_ARGS+=(--run-id "$RUN_ID")
+fi
+echo "[dispatch-dev] go-client run-id: $RUN_ID" >&2
+
+# DSP-1: auto-retry the engine-start cold-start flake ONCE (5x observed 07-10..11,
+# retry-once 5/5). The go-client flag is opt-in (Python-parity rule); this wrapper is
+# where the default lives. Opt out with DISPATCH_NO_RETRY=1. Passing the flag twice
+# (user + here) is harmless to Go's flag package.
+if [ "${DISPATCH_NO_RETRY:-0}" != "1" ]; then
+  GO_ARGS+=(--retry-engine-start)
+fi
+
+exec "$GO_BIN" dispatch \
+  "${GO_ARGS[@]}" \
+  --from "$FROM_AGENT_ID" \
+  --branch "$BRANCH" \
+  --env-file "$AGENT_ENV_FILE"

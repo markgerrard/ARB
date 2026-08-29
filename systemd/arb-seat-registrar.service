@@ -1,0 +1,25 @@
+[Unit]
+Description=ARB one-time seat registration consumer
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=arb-registrar
+Group=arb-registrar
+WorkingDirectory=/opt/AgentRedisBridge
+Environment=PYTHONPATH=/opt/AgentRedisBridge/src
+EnvironmentFile=/etc/arb-seat-registrar.env
+ExecStart=/opt/AgentRedisBridge/.venv/bin/python -m arb_registration.registrar_cli
+Restart=always
+RestartSec=5
+StateDirectory=arb-seat-registrar
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/arb-seat-registrar
+
+[Install]
+WantedBy=multi-user.target

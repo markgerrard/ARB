@@ -1,0 +1,41 @@
+[Unit]
+# Templated agent_redis_bridge instance, env-file driven.
+#
+# %i is the bridge agent-id, e.g.
+#   agent-bridge@codex-project-g-laravel-dev   agent-bridge@agy-project-g-laravel-dev
+# Per-instance engine / workspace / extra flags / AGENT_ENV_FILE come from
+#   <envs>/instance-%i.env   (see instance-*.env.example in this dir)
+#
+# This is an alternative to agent-redis-bridge@.service (which shells out to
+# scripts/agent-redis-bridge-systemd with the legacy project-c defaults). This
+# template instead invokes the venv interpreter directly and takes ALL
+# per-instance config from an EnvironmentFile, so a new bridge needs only a new
+# instance-<id>.env — no edits here, no name-parsing.
+#
+# Adjust the absolute paths below for your host (venv, repo checkout, node).
+Description=Agent Redis Bridge - %i
+After=network-online.target
+Wants=network-online.target
+# Crash-loop backstop: give up after 5 starts in 60s (e.g. broken engine auth).
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=/srv/agent-redis-bridge/AgentRedisBridge
+Environment=PYTHONPATH=src
+Environment=PATH=/home/<user>/.nvm/versions/node/v20.20.2/bin:/home/<user>/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+EnvironmentFile=/srv/agent-redis-bridge/envs/instance-%i.env
+# $BRIDGE_EXTRA_FLAGS is unbraced on purpose: systemd splits it on whitespace
+# (empty -> no arg; "--codex-bypass-approvals-and-sandbox" -> one arg).
+ExecStart=/srv/agent-redis-bridge/.venv/bin/python -m agent_redis_bridge --engine ${BRIDGE_ENGINE} --workspace ${BRIDGE_WORKSPACE} $BRIDGE_EXTRA_FLAGS
+# Restart on ANY exit, not just on-failure: systemd treats SIGTERM/SIGHUP/
+# SIGINT/SIGPIPE and exit(0) as "success", so on-failure would NOT respawn the
+# bridge if it died by one of those. The bridge dying unsupervised is the exact
+# failure this unit hardens against, and its signal is not knowable in advance,
+# so cover every death mode. Verified by kill-and-respawn (SIGKILL + SIGTERM).
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

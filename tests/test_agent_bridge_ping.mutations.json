@@ -1,0 +1,52 @@
+{
+  "schema": 1,
+  "mutations": [
+    {
+      "id": "M1",
+      "kind": "defect",
+      "label": "role suffix dropped from the derived agent id (the original bug)",
+      "file": "scripts/agent-bridge-ping",
+      "find": "AGENT_ID=${AGENT_ID:-${TOOL}-${PROJECT}-${WORKSPACE}${ROLE:+-$ROLE}}",
+      "replace": "AGENT_ID=${AGENT_ID:-${TOOL}-${PROJECT}-${WORKSPACE}}",
+      "expect_failed": [
+        "tests/test_agent_bridge_ping.py::test_role_flag_addresses_role_suffixed_seat",
+        "tests/test_agent_bridge_ping.py::test_agent_role_env_addresses_role_suffixed_seat",
+        "tests/test_agent_bridge_ping.py::test_role_flag_with_engine_matches_live_seat_shape"
+      ]
+    },
+    {
+      "id": "M2",
+      "kind": "defect",
+      "label": "--role no longer parsed, so it falls through to the workspace positional",
+      "file": "scripts/agent-bridge-ping",
+      "find": "    --role) ROLE=${2:?--role requires a value}; shift 2 ;;\n",
+      "replace": "",
+      "expect_failed": [
+        "tests/test_agent_bridge_ping.py::test_role_flag_addresses_role_suffixed_seat",
+        "tests/test_agent_bridge_ping.py::test_role_flag_overrides_agent_role_env"
+      ]
+    },
+    {
+      "id": "M3",
+      "kind": "defect",
+      "label": "precedence inverted: AGENT_ROLE overrides an explicit --role",
+      "file": "scripts/agent-bridge-ping",
+      "find": "if [ -z \"$ROLE\" ]; then\n  ROLE=${AGENT_ROLE:-}\nfi",
+      "replace": "if [ -n \"${AGENT_ROLE:-}\" ]; then\n  ROLE=${AGENT_ROLE}\nfi",
+      "expect_failed": [
+        "tests/test_agent_bridge_ping.py::test_role_flag_overrides_agent_role_env"
+      ]
+    },
+    {
+      "id": "M4",
+      "kind": "defect",
+      "label": "usage text stops advertising --role",
+      "file": "scripts/agent-bridge-ping",
+      "find": "      echo \"usage: agent-bridge-ping [--engine codex|grok-acp|devin-acp|cline-acp|pi-sdk] [--role ROLE] [workspace]\" >&2",
+      "replace": "      echo \"usage: agent-bridge-ping [--engine codex|grok-acp|devin-acp|cline-acp|pi-sdk] [workspace]\" >&2",
+      "expect_failed": [
+        "tests/test_agent_bridge_ping.py::test_help_lists_role_flag"
+      ]
+    }
+  ]
+}

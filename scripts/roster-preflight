@@ -1,0 +1,360 @@
+#!/usr/bin/env python3
+"""roster-preflight — would a dispatch to this RUNNING seat survive, right now?
+
+Distinct from `scripts/seat-preflight`, which asks whether a seat's *config file*
+(plist / env-file) is correct before standup, from operator-supplied evidence.
+This asks whether a *live* seat is rosterable for dispatch at this instant, by
+reading the registry, the process table and the seat's own trust policy.
+
+Answers ONE question per seat: would a dispatch to it survive publish+enqueue AND
+produce a parseable vote? Every check cites the code that enforces it.
+
+Axis A — dispatch_authority.freeze_target(), the publish path's own refusals:
+  A1 registry record exists          dispatch_authority.py:181-183  "missing target"
+  A2 status startswith "alive:"      dispatch_authority.py:185-186  "stale target"
+  A3 worker_vantage non-blank        dispatch_authority.py:188-189  "blank/missing worker_vantage"
+  A4 registration_generation|owner_token
+                                     dispatch_authority.py:191-194  "missing registration_generation"
+
+Axis B — hydration. NOT in the refusal set; this is the gap that cost two rosters.
+  B1 registry advertises brief_hydrate=v1     bridge.py:983,1000
+     NECESSARY, NOT SUFFICIENT — asdk-bridge-dev-sonnet5 advertised v1 and still
+     returned brief_hydration_receipt_missing. prove_brief_hydrate_readiness()
+     (brief_hydrate_ready.py:156-172) proves the HOST can run the hydrate console
+     script; it does not prove the ENGINE will run it in-turn.
+  B2 the engine can execute that console script:
+       codex / agy-* / grok-acp : yes  (codex + agy-print demonstrated 2026-08-10)
+       asdk                     : only if the effective tool ceiling includes a shell
+                                  (bridge.py:455-458 argv > env > default).
+                                  Bash-less asdk demonstrated to FAIL.
+       pi-sdk                   : no   (demonstrated to FAIL)
+     bridge.py:3805-3808 refuses the whole turn when the receipt file is absent —
+     "a successful model reply cannot override missing/bad receipt".
+
+Axis C — trust. Not a publish refusal; the seat rejects the envelope instead.
+  C1 the seat's --sender-policy names the dispatching identity.
+
+Exit 0 means every named seat is rosterable, 1 means at least one is not, and 2
+means the command was misused.
+
+Usage:
+    scripts/roster-preflight --sender <agent-id> <seat-id> [<seat-id> ...]
+    scripts/roster-preflight --sender <agent-id> --roster <roster.json>
+    scripts/roster-preflight --sender <agent-id> --json <seat-id> ...
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+# Resolve THIS checkout's src, never a fixed path: a tracked script that imports
+# from somebody else's clone reports on a tree it is not part of. Same rule
+# tests/conftest.py enforces for the suite (import-provenance).
+_SRC = Path(__file__).resolve().parent.parent / "src"
+if str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
+
+DEFAULT_PREFIX = "agent_scratch:"
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = "6379"
+DEFAULT_DB = "12"
+
+SHELL_CAPABLE = frozenset({"codex", "agy-print", "agy-tmux", "grok-acp"})
+PROVEN_HYDRATORS = frozenset({"codex", "agy-print"})   # observed end-to-end 2026-08-10
+PROVEN_NON_HYDRATORS = frozenset({"pi-sdk"})           # observed to fail 2026-08-10
+BRIEF_HYDRATE_V1 = "v1"
+
+# Engine slugs the profile-script shape may carry, longest-prefix first so that
+# "agy-print" is not shadowed by a shorter sibling.
+KNOWN_ENGINES = ("pi-rpc", "pi-sdk", "grok-acp", "devin-acp", "agy-tmux", "agy-print", "codex")
+
+
+# --------------------------------------------------------------------------
+# Pure decision layer. No I/O — this is the part the mutation sidecar targets.
+# --------------------------------------------------------------------------
+
+
+def evaluate(
+    agent_id: str,
+    reg: dict[str, str],
+    status: str,
+    engine: str,
+    tool_ceiling: str,
+    sender_policy_text: str,
+    sender: str,
+    running: bool,
+) -> dict:
+    """Decide rosterability from already-gathered facts.
+
+    `reg` is the registry hash, `status` the agent status string, `running`
+    whether a live process was matched. Returns a row dict; `failures` empty
+    means rosterable.
+    """
+    failures: list[str] = []
+    note = ""
+
+    if not reg:
+        failures.append("A1 missing target: no registry record")
+    if not status.startswith("alive:"):
+        failures.append(f"A2 stale target: status={status or '<absent>'!r}")
+    if not (reg.get("worker_vantage") or "").strip():
+        failures.append("A3 blank/missing worker_vantage")
+    if not (reg.get("registration_generation") or reg.get("owner_token") or "").strip():
+        failures.append("A4 missing registration_generation")
+
+    if reg.get("brief_hydrate") != BRIEF_HYDRATE_V1:
+        failures.append(f"B1 brief_hydrate={reg.get('brief_hydrate')!r}, not {BRIEF_HYDRATE_V1}")
+
+    if running:
+        if engine in PROVEN_NON_HYDRATORS:
+            failures.append(f"B2 engine {engine} cannot execute the hydrate script (demonstrated)")
+        elif engine == "asdk":
+            if "Bash" not in [t.strip() for t in tool_ceiling.split(",")]:
+                failures.append(
+                    f"B2 asdk tool ceiling {tool_ceiling!r} has no shell -> cannot hydrate (demonstrated)"
+                )
+            else:
+                note = "B2 asdk WITH Bash: predicted-capable, NOT yet demonstrated"
+        elif engine not in SHELL_CAPABLE:
+            note = f"B2 engine {engine} hydration capability UNKNOWN"
+        elif engine not in PROVEN_HYDRATORS:
+            note = f"B2 engine {engine} shell-capable but not yet demonstrated"
+
+        if sender and not trusts_sender(sender_policy_text, sender):
+            failures.append(f"C1 does not trust sender {sender!r}")
+    else:
+        failures.append("A2/C1 not running: argv+trust unreadable")
+
+    return {
+        "agent": agent_id,
+        "engine": engine,
+        "rosterable": not failures,
+        "failures": failures,
+        "note": note,
+    }
+
+
+def trusts_sender(policy_text: str, sender: str) -> bool:
+    """The seat's --sender-policy must name this identity as trusted.
+
+    Substring match against the seat's argv+env because the policy is carried as
+    an opaque `<id>=trusted` pair list; we deliberately do not widen this to a
+    prefix or wildcard match, since widening a control to make your own canary
+    pass modifies the thing under test.
+    """
+    return f"{sender}=trusted" in (policy_text or "")
+
+
+# --------------------------------------------------------------------------
+# I/O layer
+# --------------------------------------------------------------------------
+
+
+def redis_args() -> list[str]:
+    """Honour the same AGENT_REDIS_* names the rest of the bridge reads."""
+    return [
+        "redis-cli",
+        "-h", os.environ.get("AGENT_REDIS_HOST", DEFAULT_HOST),
+        "-p", os.environ.get("AGENT_REDIS_PORT", DEFAULT_PORT),
+        "-n", os.environ.get("AGENT_REDIS_DB", DEFAULT_DB),
+    ]
+
+
+def prefix() -> str:
+    return os.environ.get("AGENT_REDIS_PREFIX", DEFAULT_PREFIX)
+
+
+def r(*argv: str) -> str:
+    return subprocess.run(
+        [*redis_args(), *argv], capture_output=True, text=True
+    ).stdout.strip()
+
+
+def registry(agent_id: str) -> dict[str, str]:
+    out = r("HGETALL", f"{prefix()}registry:{agent_id}").splitlines()
+    return dict(zip(out[::2], out[1::2]))
+
+
+def agent_status(agent_id: str) -> str:
+    return r("GET", f"{prefix()}agent:{agent_id}:status")
+
+
+def engine_of(argv: str, envs: str) -> str:
+    m = re.search(r"--engine (\S+)", argv or "")
+    if m:
+        return m.group(1)
+    m = re.search(r"AGENT_BRIDGE_ENGINE=(\S+)", envs or "")
+    return m.group(1) if m else "codex"
+
+
+def tool_ceiling_of(argv: str, envs: str) -> str:
+    m = re.search(r"--agent-sdk-tools (\S+)", argv or "")
+    if m:
+        return m.group(1)
+    m = re.search(r"BRIDGE_AGENT_SDK_TOOLS=(\S+)", envs or "")
+    return m.group(1) if m else ""
+
+
+def build_proc_map() -> dict[str, tuple[str, str, str]]:
+    """pid -> (agent_id, argv, envs).
+
+    agent_id from --agent-id when present; otherwise derived with the bridge's OWN
+    derive_agent_id() after emulating scripts/agent-redis-bridge-systemd, which is
+    how the validated launchd manifest resolved profile-invoked jobs.
+    """
+    from agent_redis_bridge.bridge import (
+        ENGINE_TO_TOOL, derive_agent_id, normalize_role, normalize_engine_name,
+        resolve_agent_sdk_model,
+    )
+
+    out: dict[str, tuple[str, str, str]] = {}
+    pids = subprocess.run(
+        ["pgrep", "-f", "[a]gent_redis_bridge"], capture_output=True, text=True
+    ).stdout.split()
+    for pid in pids:
+        argv = subprocess.run(
+            ["ps", "-o", "command=", "-p", pid], capture_output=True, text=True
+        ).stdout
+        envs = subprocess.run(
+            ["ps", "eww", "-o", "command=", "-p", pid], capture_output=True, text=True
+        ).stdout
+
+        explicit = re.search(r"--agent-id (\S+)", argv)
+        if explicit:
+            out[pid] = (explicit.group(1), argv, envs)
+            continue
+
+        inst = re.search(r"(?:agent-redis-bridge-systemd|arbseat-launcher) (\S+)", argv)
+        if inst:                                   # profile-script shape
+            spec = inst.group(1)
+            eng = re.search(r"AGENT_BRIDGE_ENGINE=(\S+)", envs)
+            engine, wsrole = (eng.group(1) if eng else "codex"), spec
+            for known in KNOWN_ENGINES:
+                if spec.startswith(known + "-"):
+                    engine, wsrole = known, spec[len(known) + 1:]
+                    break
+            if "-" in wsrole:
+                workspace, role_raw = wsrole.split("-", 1)
+            else:
+                workspace, role_raw = wsrole, None
+            proj = re.search(r"AGENT_PROJECT=(\S+)", envs)
+            project = proj.group(1) if proj else "project-c"
+        else:                                      # resolved-flags shape
+            def opt(name: str, default: str | None = None) -> str | None:
+                found = re.search(rf"{name} (\S+)", argv)
+                return found.group(1) if found else default
+
+            engine = opt("--engine", "codex")
+            ws_env = re.search(r"AGENT_WORKSPACE=(\S+)", envs)
+            workspace = opt("--workspace") or (ws_env.group(1) if ws_env else "dev")
+            proj_env = re.search(r"AGENT_PROJECT=(\S+)", envs)
+            project = opt("--project") or (proj_env.group(1) if proj_env else "project-c")
+            role_raw = opt("--role")
+
+        engine = normalize_engine_name(engine)
+        if engine == "agent-sdk" and not role_raw:
+            # bridge.py:501-502 — role comes from the MODEL, and --model is on argv
+            # for resolved-flag seats. Reading only the env yielded 'm3' for a
+            # sonnet-5 seat.
+            am = re.search(r"--model (\S+)", argv) or re.search(r"AGENT_MODEL=(\S+)", envs)
+            role_raw = resolve_agent_sdk_model(am.group(1) if am else "minimax-m3").slug
+
+        try:
+            aid = derive_agent_id(
+                tool=ENGINE_TO_TOOL[engine],
+                project=project,
+                workspace=workspace,
+                role=normalize_role(role_raw),
+            )
+        except Exception:
+            continue
+        out[pid] = (aid, argv, envs)
+    return out
+
+
+def check(agent_id: str, sender: str, proc_map: dict[str, tuple[str, str, str]]) -> dict:
+    """Gather facts for one seat, then hand them to the pure decision layer."""
+    pid, argv, envs = "-", "", ""
+    for candidate_pid, (aid, cargv, cenvs) in proc_map.items():
+        if aid == agent_id:
+            pid, argv, envs = candidate_pid, cargv, cenvs
+            break
+
+    running = pid != "-"
+    row = evaluate(
+        agent_id=agent_id,
+        reg=registry(agent_id),
+        status=agent_status(agent_id),
+        engine=engine_of(argv, envs) if running else "?",
+        tool_ceiling=tool_ceiling_of(argv, envs),
+        sender_policy_text=(argv or "") + (envs or ""),
+        sender=sender,
+        running=running,
+    )
+    row["pid"] = pid
+    return row
+
+
+def roster_ids(path: Path) -> list[str]:
+    """Read seat ids from a roster.json ({"panel": [{"targetId": ...}]})."""
+    data = json.loads(path.read_text())
+    return [
+        entry["targetId"]
+        for entry in data.get("panel", [])
+        if entry.get("targetId") and entry["targetId"] != "inline"
+    ]
+
+
+def render(rows: list[dict], sender: str) -> str:
+    lines = [f"    pre-flight vs sender {sender!r}", ""]
+    lines.append(f"    {'SEAT':<30}{'ENGINE':<11}{'PID':<8}{'ROSTERABLE'}")
+    for row in rows:
+        lines.append(
+            f"    {row['agent']:<30}{row['engine']:<11}{str(row['pid']):<8}"
+            f"{'YES' if row['rosterable'] else 'NO'}"
+        )
+        for failure in row["failures"]:
+            lines.append(f"        FAIL  {failure}")
+        if row["note"]:
+            lines.append(f"        note  {row['note']}")
+    ok = sum(1 for row in rows if row["rosterable"])
+    lines.append("")
+    lines.append(f"    rosterable: {ok}/{len(rows)}")
+    return "\n".join(lines)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="roster-preflight",
+        description="Would a dispatch to these running seats survive right now?",
+    )
+    parser.add_argument("--sender", required=True, help="the dispatching agent id")
+    parser.add_argument("--roster", type=Path, help="roster.json to read seat ids from")
+    parser.add_argument("--json", action="store_true", dest="as_json")
+    parser.add_argument("seats", nargs="*")
+    args = parser.parse_args(argv)
+
+    seats = list(args.seats)
+    if args.roster:
+        seats = roster_ids(args.roster) + seats
+    if not seats:
+        parser.error("no seats given: pass seat ids or --roster")
+
+    proc_map = build_proc_map()
+    rows = [check(seat, args.sender, proc_map) for seat in seats]
+
+    if args.as_json:
+        print(json.dumps({"sender": args.sender, "seats": rows}, indent=2))
+    else:
+        print(render(rows, args.sender))
+
+    return 0 if all(row["rosterable"] for row in rows) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

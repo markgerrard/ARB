@@ -1,0 +1,216 @@
+{
+  "type": "object",
+  "required": [
+    "trigger",
+    "extraction_scope",
+    "observables",
+    "seats",
+    "predicates",
+    "dispatch_log_ref",
+    "confidence"
+  ],
+  "properties": {
+    "trigger": {"type": "object"},
+    "extraction_scope": {
+      "type": "object",
+      "required": ["paths", "window"],
+      "properties": {
+        "paths": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
+        "window": {
+          "type": "object",
+          "required": ["start", "end"]
+        }
+      }
+    },
+    "observables": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "path"],
+        "properties": {
+          "id": {"type": "string"},
+          "path": {"type": "string"}
+        }
+      }
+    },
+    "seats": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["seat", "model", "role"],
+        "properties": {
+          "seat": {"type": "string"},
+          "model": {"type": "string"},
+          "role": {"enum": ["blind", "steelman", "alternative", "scribe"]}
+        }
+      }
+    },
+    "predicates": {
+      "type": "array",
+      "items": {"$ref": "#/definitions/predicate"}
+    },
+    "dispatch_log_ref": {"type": "string"},
+    "confidence": {"type": "object"},
+    "verified": {"type": "boolean"},
+    "repo_sha": {"type": "string"},
+    "recorded_traceback": {
+      "type": "object",
+      "required": ["reproduced", "window", "traceback_sha256"],
+      "properties": {
+        "reproduced": {"type": "boolean"},
+        "window": {
+          "type": "object",
+          "required": ["start", "end"],
+          "properties": {
+            "start": {"type": "integer"},
+            "end": {"type": "integer"}
+          }
+        },
+        "traceback_sha256": {"type": "string"}
+      }
+    },
+    "sealed_briefs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["role", "model", "seal", "brief"],
+        "properties": {
+          "role": {"type": "string"},
+          "model": {"type": "string"},
+          "seal": {"type": "string"},
+          "brief": {"type": "object"}
+        }
+      }
+    },
+    "submissions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["role", "seat", "seal", "bus_reply_ref", "bus_reply_sha256"],
+        "properties": {
+          "role": {"type": "string"},
+          "seat": {"type": "string"},
+          "seal": {"type": "string"},
+          "bus_reply_ref": {"type": "string"},
+          "bus_reply_sha256": {"type": "string"}
+        }
+      }
+    },
+    "post_briefs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["role", "seal", "brief"],
+        "properties": {
+          "role": {"type": "string"},
+          "seal": {"type": "string"},
+          "brief": {"type": "object"}
+        }
+      }
+    },
+    "assignment": {
+      "type": "object",
+      "properties": {
+        "orchestrator_chosen": {"type": "boolean"},
+        "orchestrator_hypothesis": {"type": "string"}
+      }
+    },
+    "scribe_context": {
+      "type": "object",
+      "properties": {
+        "orchestrator_context_visible": {"type": "boolean"}
+      }
+    },
+    "channel_routes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["from", "to", "phase"],
+        "properties": {
+          "from": {"type": "string"},
+          "to": {"type": "string"},
+          "phase": {"type": "string"}
+        }
+      }
+    },
+    "steer": {
+      "type": "object",
+      "properties": {
+        "reason": {
+          "type": "object",
+          "required": ["type"],
+          "properties": {
+            "type": {"enum": ["unreconstructable_context", "search_space_scale"]},
+            "cited_fact": {"type": "string"},
+            "space_size": {"type": "number"},
+            "budget": {"type": "number"}
+          }
+        },
+        "channel": {"type": "string"},
+        "pre_steer_state": {"type": "object"},
+        "post_steer_state": {"type": "object"}
+      }
+    }
+  },
+  "if": {
+    "properties": {
+      "verified": {"const": true}
+    },
+    "required": ["verified"]
+  },
+  "then": {
+    "required": [
+      "repo_sha",
+      "recorded_traceback",
+      "sealed_briefs",
+      "submissions",
+      "post_briefs"
+    ]
+  },
+  "definitions": {
+    "predicate": {
+      "type": "object",
+      "required": [
+        "predicate_id",
+        "author_seat",
+        "author_model",
+        "hypothesis_a",
+        "hypothesis_b",
+        "observable",
+        "under_a",
+        "under_b",
+        "certifier"
+      ],
+      "properties": {
+        "predicate_id": {"type": "string"},
+        "author_seat": {"type": "string"},
+        "author_model": {"type": "string"},
+        "hypothesis_a": {"type": "string"},
+        "hypothesis_b": {"type": "string"},
+        "observable": {"type": "string"},
+        "under_a": {
+          "type": "object",
+          "required": ["op", "value"]
+        },
+        "under_b": {
+          "type": "object",
+          "required": ["op", "not_value"]
+        },
+        "certifier": {
+          "type": "object",
+          "required": ["seat", "model", "evidence_ref", "derivation_ref", "evidence_category"],
+          "properties": {
+            "seat": {"type": "string"},
+            "model": {"type": "string"},
+            "evidence_ref": {"type": "string"},
+            "derivation_ref": {"type": "string"},
+            "evidence_category": {"enum": ["live_data", "file_line", "none"]}
+          }
+        }
+      }
+    }
+  }
+}

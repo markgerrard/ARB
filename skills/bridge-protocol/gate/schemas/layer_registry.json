@@ -1,0 +1,5 @@
+{
+  "name": "layer_registry",
+  "type": "object",
+  "required": ["excluded_roots", "rules"]
+}

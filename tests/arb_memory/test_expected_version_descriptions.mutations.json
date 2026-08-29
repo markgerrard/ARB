@@ -1,0 +1,27 @@
+{
+ "schema": 1,
+ "mutations": [
+  {
+   "id": "M1",
+   "kind": "defect",
+   "label": "remove the hash preimage from the LOCAL server's memory_get description (its pre-B19c state: no docstring at all)",
+   "file": "src/arb_memory/mcp/read_tools.py",
+   "find": "        `sha256(b\"arbmem:artefact:v1\\\\0\" + content_mime + b\"\\\\0\" + kind + b\"\\\\0\" + payload)` where `kind` is",
+   "replace": "        `sha256(REDACTED_PREIMAGE)` where `kind` is",
+   "expect_failed": [
+    "tests/arb_memory/test_expected_version_descriptions.py::test_local_server_memory_get_description_discloses_hash_preimage"
+   ]
+  },
+  {
+   "id": "M2",
+   "kind": "defect",
+   "label": "remove the hash preimage from the PUBLIC server's memory_get description",
+   "file": "src/arb_memory/mcp/server.py",
+   "find": "        `sha256(b\"arbmem:artefact:v1\\\\0\" + content_mime + b\"\\\\0\" + kind + b\"\\\\0\" + payload)` where `kind` is",
+   "replace": "        `sha256(REDACTED_PREIMAGE)` where `kind` is",
+   "expect_failed": [
+    "tests/arb_memory/test_expected_version_descriptions.py::test_public_server_descriptions_disclose_hash_preimage"
+   ]
+  }
+ ]
+}

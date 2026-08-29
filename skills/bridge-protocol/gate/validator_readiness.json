@@ -1,0 +1,26 @@
+{
+  "validators": [
+    {
+      "validator_id": "diagnose",
+      "mode": "blind",
+      "status": "absent",
+      "merge_sha": null,
+      "verified_sha": null,
+      "invalidated_sha_reason": null,
+      "source_gate_result_path": null,
+      "source_gate_result_sha256": null,
+      "effective_from_sha": null
+    },
+    {
+      "validator_id": "diagnose-steer",
+      "mode": "steered",
+      "status": "absent",
+      "merge_sha": null,
+      "verified_sha": null,
+      "invalidated_sha_reason": null,
+      "source_gate_result_path": null,
+      "source_gate_result_sha256": null,
+      "effective_from_sha": null
+    }
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "name": "pi-sdk-host",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Long-lived JSON-RPC stdio harness driving @earendil-works/pi-coding-agent via its SDK for AgentRedisBridge's pi-sdk engine.",
+  "main": "host.mjs",
+  "scripts": {
+    "install-symlinks": "./install.sh",
+    "smoke-sdk": "node smoke.mjs",
+    "smoke-protocol": "python3 smoke_protocol.py",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.20.0",
+    "typebox": "1.1.38"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

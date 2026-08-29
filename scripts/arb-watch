@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# arb-watch — one command to watch the fleet via arb-watch-go.
+#
+# The visibility gateway on arb-prod sits behind hostname-wide Cloudflare Access
+# (browser SSO), which a headless data-plane client cannot complete. Rather than
+# push the machine client through CF Access, this wrapper reaches the gateway
+# ORIGIN over the existing SSH connection to arb-prod (CF Access is a browser
+# layer only; the gateway's own `vis-` Bearer token still authorizes). It:
+#   1. resolves the current visibility container IP (survives `compose up` recreates)
+#   2. opens a background SSH tunnel via a control socket
+#   3. runs arb-watch-go against the tunnel
+#   4. tears the tunnel down on exit (trap)
+#
+# Usage:  scripts/arb-watch [extra arb-watch-go flags...]
+#   e.g.  scripts/arb-watch -orchestrator claude-bridge-dev
+# Env:
+#   ARB_WATCH_LOCAL_PORT  local port for the tunnel (default 18810)
+#   ARB_PROD_SSH          ssh host alias for the droplet (default arb-prod)
+set -euo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PORT="${ARB_WATCH_LOCAL_PORT:-18810}"
+SSH_HOST="${ARB_PROD_SSH:-arb-prod}"
+CLIENT="${REPO}/tools/arb-watch-go/arb-watch-go"
+TOKEN_ENV="${REPO}/envs/arb-visibility-token.env"
+
+[ -x "$CLIENT" ] || { echo "arb-watch: client not built at $CLIENT (run: cd tools/arb-watch-go && go build)" >&2; exit 1; }
+[ -f "$TOKEN_ENV" ] || { echo "arb-watch: token file missing: $TOKEN_ENV" >&2; exit 1; }
+
+# 1. current gateway container IP on the droplet
+CIP="$(ssh "$SSH_HOST" "docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' deploy-visibility-1" 2>/dev/null || true)"
+[ -n "$CIP" ] || { echo "arb-watch: could not resolve visibility container IP on $SSH_HOST" >&2; exit 1; }
+
+# 2. background tunnel via a control socket
+CTRL="$(mktemp -u "${TMPDIR:-/tmp}/arb-watch-ctrl.XXXXXX")"
+cleanup() { ssh -S "$CTRL" -O exit "$SSH_HOST" 2>/dev/null || true; }
+trap cleanup EXIT INT TERM
+ssh -f -N -M -S "$CTRL" -L "127.0.0.1:${PORT}:${CIP}:8810" "$SSH_HOST" \
+  || { echo "arb-watch: failed to open SSH tunnel to $SSH_HOST (port ${PORT} in use?)" >&2; exit 1; }
+
+# 3. token + run the client against the tunnel
+set -a; . "$TOKEN_ENV"; set +a
+[ -n "${ARB_VISIBILITY_TOKEN:-}" ] || { echo "arb-watch: ARB_VISIBILITY_TOKEN not set by $TOKEN_ENV" >&2; exit 1; }
+echo "arb-watch: gateway origin via $SSH_HOST (container $CIP) on http://127.0.0.1:${PORT}" >&2
+# NOT exec — the client must return so the EXIT trap tears the tunnel down.
+"$CLIENT" -base-url "http://127.0.0.1:${PORT}" -token "$ARB_VISIBILITY_TOKEN" "$@"

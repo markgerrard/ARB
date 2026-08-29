@@ -1,0 +1,20 @@
+# gitleaks config for the public mirror. Extends the default ruleset; the allowlist names the
+# known placeholder shapes that trip generic-api-key, each classified by hand (2026-08-30):
+# fixture keys in tests, sha256 fact hashes in the authorbench corpus, an empty .env.example
+# value, the memory store's directory-hash project key, and one prose false positive.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "classified placeholders — not credentials"
+regexTarget = "line"
+regexes = [
+  '''AKIA1234567890ABCDEF''',
+  '''AKIAIOSFODNN7EXAMPLE''',
+  '''sk-ant-SECRET123456789''',
+  '''eyJtoolname''',
+  '''mark-be695e9f393d''',
+  '''fact_key_yaml: [0-9a-f]{64}''',
+  '''BUZZ_S3_(ACCESS|SECRET)_KEY=$''',
+  '''ownership/JWT/pagination''',
+]

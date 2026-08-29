@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+"""Flag agent-owned buzz seats whose kind:0 profile the observer proxy would refuse.
+
+    scripts/buzz-seat-auth-tag-check                 # DSN from BUZZ_RELAY_DSN
+    scripts/buzz-seat-auth-tag-check --dsn "postgresql://..."
+    scripts/buzz-seat-auth-tag-check --json          # for a monitor
+
+On arb-buzz the relay's DSN is in the container environment:
+
+    export BUZZ_RELAY_DSN=$(docker inspect buzz-relay-1 \
+        --format '{{range .Config.Env}}{{println .}}{{end}}' | sed -n 's/^DATABASE_URL=//p')
+
+Exit codes:  0 = no seat blocked   1 = at least one blocked   2 = could not check
+
+The 2 is deliberate and load-bearing: a check that cannot reach the database
+must NOT exit 0. "No findings" and "no data" look identical in a dashboard, and
+this fleet has already been bitten by an accept signal that meant something
+narrower than it appeared to.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from buzz_ops.seat_auth_tag_check import check_rows, fetch_rows  # noqa: E402
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--dsn", default=os.environ.get("BUZZ_RELAY_DSN", ""),
+                        help="relay postgres DSN (default: $BUZZ_RELAY_DSN)")
+    parser.add_argument("--json", action="store_true", help="machine-readable output")
+    args = parser.parse_args()
+
+    if not args.dsn:
+        print("error: no DSN. Pass --dsn or set BUZZ_RELAY_DSN (see --help).", file=sys.stderr)
+        return 2
+
+    try:
+        rows = fetch_rows(args.dsn)
+    except Exception as exc:  # noqa: BLE001 - any failure to READ is a failure to CHECK
+        print(f"error: could not query the relay: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 2
+
+    report = check_rows(rows)
+
+    if args.json:
+        print(report.as_json())
+    else:
+        if not report.findings:
+            # Zero agent-owned seats is not a pass — it means the query matched
+            # nothing, and a lint that silently matches nothing always passes.
+            print("no agent-owned seats found — is this the right relay database?",
+                  file=sys.stderr)
+            return 2
+        for finding in report.findings:
+            mark = "ok  " if finding.ok else ("WARN" if not finding.blocking else "FAIL")
+            name = finding.display_name or "<no display_name>"
+            print(f"[{mark}] {name}  {finding.agent_pubkey[:16]}…")
+            if not finding.ok:
+                print(f"       {finding.status}: {finding.detail}")
+        print(f"\nchecked {len(report.findings)} agent-owned seat(s): "
+              f"{len(report.blocking)} blocked, {len(report.warnings)} warning(s)")
+        if report.blocking:
+            print("\nRepair: republish the seat's kind:0 WITH its auth tag, from the host "
+                  "holding that seat's key:\n"
+                  "  BUZZ_AUTH_TAG='<the tag>' buzz users set-profile --name ... --about ...\n"
+                  "A tag recovered from the seat's own event history is still valid — the "
+                  "NIP-OA preimage covers the agent pubkey and conditions, not the profile "
+                  "content. Pass --about too (set-profile replaces the whole profile), keep "
+                  "EXACTLY one auth tag, and reload the browser tab afterwards: owned_agents "
+                  "is resolved once when the /activity socket opens.")
+
+    return 1 if report.blocking else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

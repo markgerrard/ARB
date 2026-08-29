@@ -1,0 +1,1 @@
+{"id":"f7e083b8-77eb-4af9-98ba-52141b9a36ab","from":"claude-bridge-dev","branch":"dev","to":"codex-bridge-dev","kind":"request","sent_at":"2026-06-28T08:32:13+01:00","payload":{"operation":"worktree_release","worktree_lease":"lease-1","run_id":"round-1"},"run_id":"round-1"}

@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Legacy alias of agent-bridge-ping. Kept for back-compat with existing
+# call sites (cron jobs, status dashboards, muscle memory); will be
+# removed in a future release.
+SCRIPT_DIR="$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
+echo "[codex-bridge-ping] DEPRECATED: use ${SCRIPT_DIR}/agent-bridge-ping — this alias will be removed in a future release." >&2
+exec "${SCRIPT_DIR}/agent-bridge-ping" "$@"

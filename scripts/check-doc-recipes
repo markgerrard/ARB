@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+"""Check documented dispatch recipes for required labels and deprecated engines."""
+
+from __future__ import annotations
+
+import re
+import sys
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+# Per-area READMEs that carry dispatch recipes. The root README was split into
+# per-area front doors (docs/readme-split) and the recipes moved beside the code
+# they operate; without naming the new homes here the check would keep passing
+# over an empty root README while the real recipes went unchecked.
+AREA_READMES = [
+    ROOT / "src/agent_redis_bridge/README.md",
+    ROOT / "src/agent_redis_bridge/engines/README.md",
+    ROOT / "src/arb_memory/README.md",
+    ROOT / "skills/README.md",
+]
+SCAN_ROOTS = [ROOT / "README.md", *AREA_READMES, ROOT / "docs"]
+EXCLUDED_DOC_PARTS = {("docs", "archive"), ("docs", "superpowers")}
+DISPATCH_RE = re.compile(r"(?:\S*/)?(?:agent-dispatch|dispatch-dev)\b")
+ENV_PREFIX_RE = re.compile(r"(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*")
+FENCE_RE = re.compile(r"^( {0,3})(`{3,}|~{3,})")
+ALLOWED_FLAGS = ("--run-id", "--adhoc", "--check", "--dry-run-envelope")
+
+
+def is_excluded(path: Path) -> bool:
+    parts = path.relative_to(ROOT).parts
+    return any(parts[: len(prefix)] == prefix for prefix in EXCLUDED_DOC_PARTS)
+
+
+def markdown_files() -> list[Path]:
+    files = [ROOT / "README.md", *AREA_READMES]
+    files.extend(sorted((ROOT / "docs").glob("**/*.md")))
+    return [path for path in files if path.is_file() and not is_excluded(path)]
+
+
+def command_is_invocation(line: str, start: int) -> bool:
+    prefix = line[:start].strip()
+    if not prefix:
+        return True
+    if ENV_PREFIX_RE.fullmatch(line[:start]):
+        return True
+    return prefix.endswith(("&&", "||", ";", "|"))
+
+
+def command_extent(block_lines: list[str], offset: int, start: int) -> str:
+    command_lines = [block_lines[offset][start:]]
+    index = offset
+    while command_lines[-1].rstrip().endswith("\\") and index + 1 < len(block_lines):
+        index += 1
+        command_lines.append(block_lines[index])
+    command_text = "\n".join(command_lines)
+    next_command = re.search(r"\s(?:&&|\|\||;|\|)\s+", command_text)
+    if next_command:
+        command_text = command_text[: next_command.start()]
+    return command_text
+
+
+def find_invocations(block_lines: list[str]) -> list[tuple[int, str]]:
+    invocations: list[tuple[int, str]] = []
+    for offset, line in enumerate(block_lines):
+        if line.lstrip().startswith("#"):
+            continue
+        for match in DISPATCH_RE.finditer(line):
+            if command_is_invocation(line, match.start()):
+                invocations.append((offset, command_extent(block_lines, offset, match.start())))
+    return invocations
+
+
+def has_allowed_dispatch_label(invocation: str) -> bool:
+    command = invocation.split()[0]
+    if command.endswith("dispatch-dev"):
+        return True
+    return any(flag in invocation for flag in ALLOWED_FLAGS)
+
+
+def fence_token(line: str) -> str | None:
+    match = FENCE_RE.match(line)
+    if not match:
+        return None
+    return match.group(2)[0]
+
+
+def marker_allows_bare(lines: list[str], fence_index: int) -> bool:
+    return (
+        fence_index > 0
+        and lines[fence_index - 1].strip() == "<!-- doc-recipes: allow-bare -->"
+    )
+
+
+def deprecated_engine_is_marked(lines: list[str], start: int, end: int) -> bool:
+    lo = max(0, start - 3)
+    hi = min(len(lines), end + 4)
+    return "deprecat" in "\n".join(lines[lo:hi]).lower()
+
+
+def check_file(path: Path) -> list[str]:
+    rel = path.relative_to(ROOT)
+    lines = path.read_text().splitlines()
+    errors: list[str] = []
+    in_fence = False
+    fence_char = ""
+    fence_start = 0
+    block: list[str] = []
+
+    for index, line in enumerate(lines):
+        token = fence_token(line)
+        if token and (not in_fence or token == fence_char):
+            if not in_fence:
+                in_fence = True
+                fence_char = token
+                fence_start = index
+                block = []
+            else:
+                block_text = "\n".join(block)
+                for offset, command in find_invocations(block):
+                    if not (
+                        has_allowed_dispatch_label(command)
+                        or marker_allows_bare(lines, fence_start)
+                    ):
+                        errors.append(
+                            f"{rel}:{fence_start + offset + 2}: dispatch recipe lacks "
+                            "--run-id/--adhoc/--check/--dry-run-envelope"
+                        )
+                if "--engine gemini-acp" in block_text and not deprecated_engine_is_marked(
+                    lines, fence_start, index
+                ):
+                    errors.append(
+                        f"{rel}:{fence_start + 1}: deprecated --engine gemini-acp in "
+                        "fenced block without deprecation note"
+                    )
+                in_fence = False
+                fence_char = ""
+                block = []
+            continue
+        if in_fence:
+            block.append(line)
+    return errors
+
+
+def main() -> int:
+    errors: list[str] = []
+    for path in markdown_files():
+        errors.extend(check_file(path))
+    for error in errors:
+        print(error)
+    return 1 if errors else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

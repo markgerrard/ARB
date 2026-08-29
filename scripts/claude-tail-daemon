@@ -1,0 +1,37 @@
+#!/usr/bin/env python3
+"""Launch the Claude-layer transcript tail daemon.
+
+Loads the bridge env file (same dotenv-style parser the bridge itself uses,
+so values quote/escape identically) into the process environment, then runs
+the claude_tail service loop. Existing process env wins over the file, so a
+launchd plist (or an interactive override) can pin individual keys.
+
+The daemon tails registered Claude Code sessions (warm orchestrator + cold
+output mirrors), teeing roster events to ARB_LIVE_REDIS_URL ({AGENT_REDIS_PREFIX}
+events:live) and transcript trace to ARB_TRACE_REDIS_URL ({ARB_TRACE_PREFIX}
+arbmem:trace). Registry + read offsets live on the local AGENT_REDIS_* instance.
+
+Run under the repo venv so the `redis` dependency resolves:
+
+    .venv/bin/python scripts/claude-tail-daemon
+"""
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / "src"))
+
+from agent_redis_bridge.redis_io import read_env_file  # noqa: E402
+
+env_file = Path(
+    os.environ.get("AGENT_ENV_FILE", str(REPO / "envs" / "agent-redis-bridge-dev.env"))
+).expanduser()
+for key, value in read_env_file(env_file).items():
+    os.environ.setdefault(key, value)
+
+from agent_redis_bridge.claude_tail.__main__ import main  # noqa: E402
+
+raise SystemExit(main())

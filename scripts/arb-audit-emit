@@ -1,0 +1,61 @@
+#!/usr/bin/env python3
+"""Emit one ARB audit event (dispatch/verdict). verdict is gated by panel_audit.reconcile."""
+import argparse, json, os, sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+from arb_memory.audit import AuditRun, resolve_audit_env  # noqa: E402
+from arb_memory.panel_audit import reconcile    # noqa: E402
+
+
+def emit(r, *, run_id, source, kind, payload, prefix=""):
+    return AuditRun(r, run_id, prefix=prefix).emit(source, kind, payload)
+
+
+def main(argv=None, *, redis_factory=None, conn_factory=None):
+    p = argparse.ArgumentParser(prog="arb-audit-emit")
+    p.add_argument("--run-id", required=True)
+    p.add_argument("--kind", required=True, choices=("dispatch", "verdict"))
+    p.add_argument("--source", default="orchestrator")
+    p.add_argument("--actor")
+    p.add_argument("--payload", default="{}")
+    a = p.parse_args(argv)
+    payload = json.loads(a.payload)
+    payload.setdefault("kind", a.kind)
+    if a.actor:
+        payload["actor"] = a.actor
+
+    # ARB_AUDIT_* wins over ARB_MEMORY_*, matching bridge.resolve_audit_redis — otherwise a
+    # host with the two pointed at different buses splits its audit plane between daemon and
+    # CLI votes, and only finds out at verdict close.
+    url, prefix = resolve_audit_env()
+    if redis_factory is not None:
+        r = redis_factory()
+    else:
+        import redis as _redis
+        if not url:
+            print("ARB_AUDIT_REDIS_URL or ARB_MEMORY_REDIS_URL required", file=sys.stderr); return 2
+        r = _redis.from_url(url, decode_responses=True)
+
+    if a.kind == "verdict":
+        if conn_factory is not None:
+            conn = conn_factory()
+        else:
+            import psycopg
+            dsn = os.environ.get("ARB_MEMORY_DSN")
+            if not dsn:
+                print("ARB_MEMORY_DSN required for verdict reconcile", file=sys.stderr); return 2
+            conn = psycopg.connect(dsn, autocommit=True)
+        result = reconcile(conn, a.run_id, payload, redis=r)
+        if not result["ok"]:
+            print("arb-audit-emit: verdict REFUSED — roster did not reconcile:", file=sys.stderr)
+            for gap in result["gaps"]:
+                print(f"  - {gap}", file=sys.stderr)
+            return 4
+
+    AuditRun(r, a.run_id, prefix=prefix).emit(a.source, a.kind, payload)
+    print(f"emitted {a.kind} run_id={a.run_id}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

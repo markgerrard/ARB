@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+"""plan-fixture-smoke — execute a plan's `python fixture-smoke` blocks BEFORE dispatch.
+
+The coverage hole this closes (two specimens, both luna BLOCKEDs): a plan can encode a
+WRONG MODEL OF RUNTIME SEMANTICS at the fixture/real-code boundary — GROK-1's plan
+assumed pooled engines arrive started (reality: acquire() calls start()); ENG-1's plan
+asserted is_healthy() on process-less fakes (reality: is_healthy() ANDs subprocess
+liveness). Static plan panels reliably catch embedded-test CONTRADICTIONS but are
+structurally blind to this class, because falsifying it requires EXECUTING the
+predicate against the fake. Fixtures are executable — so their assumptions must not
+travel as prose claims. This runner converts them into a verified gate.
+
+Usage:
+    env -u ARB_MEMORY_LOCAL_MCP PYTHONPATH=<target-tree>/src \\
+        .venv/bin/python scripts/plan-fixture-smoke <plan.md>
+
+Convention: the plan embeds one or more fenced blocks marked `python fixture-smoke`
+that (a) define/instantiate every fake the plan's tests use, and (b) exercise the
+STRONGEST predicate form the tests will assert against each fake. Blocks run in one
+shared namespace, in order, against whatever tree PYTHONPATH points at. Exit 0 = all
+predicates hold; exit 1 = a fixture cannot satisfy a planned predicate (fix the plan
+BEFORE dispatching); exit 2 = the plan has no smoke blocks (add them — a plan with
+fake-based tests must carry a smoke).
+"""
+import os
+import pathlib
+import re
+import subprocess
+import sys
+import tempfile
+import traceback
+
+FENCE = re.compile(r"```python fixture-smoke(?: task=(\d+))?\n(.*?)```", re.S)
+
+
+def extract(text: str) -> list[str]:
+    return [code for _, code in extract_tagged(text)]
+
+
+def extract_tagged(text: str) -> list[tuple[int | None, str]]:
+    return [(int(task) if task else None, code) for task, code in FENCE.findall(text)]
+
+
+def select_blocks(tagged: list[tuple[int | None, str]], task: int | None) -> list[str]:
+    """No filter: everything. With --task N: untagged blocks plus task-N blocks —
+    run at each dispatch boundary against the tree AS IT STANDS before task N."""
+    if task is None:
+        return [code for _, code in tagged]
+    return [code for t, code in tagged if t is None or t == task]
+
+
+_RED_CLAIM_TALLY = {"calls": 0, "tests": 0}
+
+
+def red_claim(test_source: str, expect_fail: list[str]) -> None:
+    """Sub-species B gate (specimen 3, ENG-1 T3): every test the plan claims fails
+    pre-edit must ACTUALLY fail when run against the current tree. A pass is an
+    inert pin — coverage that covers nothing — and refuses the plan."""
+    _RED_CLAIM_TALLY["calls"] += 1
+    _RED_CLAIM_TALLY["tests"] += len(expect_fail)
+    with tempfile.TemporaryDirectory() as tmp:
+        test_file = pathlib.Path(tmp) / "test_red_claims.py"
+        test_file.write_text(test_source)
+        proc = subprocess.run(
+            [sys.executable, "-m", "pytest", "-q", "-rf", "-p", "no:cacheprovider", str(test_file)],
+            capture_output=True,
+            text=True,
+            env=os.environ.copy(),
+        )
+        output = proc.stdout + proc.stderr
+    failed = set(re.findall(r"^FAILED\s+\S*?::(\w+)", output, re.M))
+    inert = [name for name in expect_fail if name not in failed]
+    if inert:
+        raise AssertionError(
+            f"RED-CLAIM VIOLATION: expected-to-fail tests PASSED against the current tree "
+            f"(inert pins): {inert}\n--- pytest output ---\n{output}"
+        )
+
+
+def run_blocks(
+    blocks: list[str], extra_namespace: dict | None = None, tree: pathlib.Path | None = None
+) -> tuple[bool, str]:
+    """Execute blocks in one shared namespace. Returns (ok, error_text).
+
+    `TREE` (a pathlib.Path, default cwd) is exposed to blocks so plans can assert
+    ORCHESTRATOR world-claims — provisioning, dependency presence, resolvable report
+    paths — against the tree actually being dispatched into (specimen 4b, 2026-07-11:
+    a fresh worktree without node_modules cost a dispatch round-trip; the seat's
+    BLOCKED cannot distinguish false plan-claims from false world-claims, so both
+    polarities gate here)."""
+    namespace: dict = {"red_claim": red_claim, "TREE": (tree or pathlib.Path.cwd()).resolve()}
+    if extra_namespace:
+        namespace.update(extra_namespace)
+    for index, block in enumerate(blocks, 1):
+        try:
+            exec(compile(block, f"<fixture-smoke-{index}>", "exec"), namespace)
+        except Exception:
+            return False, traceback.format_exc()
+    return True, ""
+
+
+def main() -> int:
+    args = [a for a in sys.argv[1:] if not a.startswith("--task") and not a.startswith("--tree")]
+    task: int | None = None
+    tree: pathlib.Path | None = None
+    for a in sys.argv[1:]:
+        if a.startswith("--task="):
+            task = int(a.split("=", 1)[1])
+        if a.startswith("--tree="):
+            tree = pathlib.Path(a.split("=", 1)[1])
+    if len(args) != 1:
+        print(__doc__, file=sys.stderr)
+        return 2
+    plan_path = pathlib.Path(args[0])
+    blocks = select_blocks(extract_tagged(plan_path.read_text()), task)
+    if not blocks:
+        print(
+            f"plan-fixture-smoke: NO `python fixture-smoke` blocks in {plan_path.name} — "
+            "a plan with fake-based tests must carry one "
+            "(docs/pipeline-operating-manual.md § plan-stage pre-flight)",
+            file=sys.stderr,
+        )
+        return 2
+    total = len(extract_tagged(plan_path.read_text()))
+    print(f"[fixture-smoke] {plan_path.name}: {len(blocks)}/{total} block(s) selected"
+          + (f" (--task={task})" if task is not None else ""))
+    _RED_CLAIM_TALLY["calls"] = 0
+    _RED_CLAIM_TALLY["tests"] = 0
+    ok, err = run_blocks(blocks, tree=tree)
+    if not ok:
+        print(err, file=sys.stderr)
+        print(
+            "[fixture-smoke] RED — a fixture cannot satisfy a planned predicate. "
+            "Fix the PLAN before dispatching (this is the GROK-1/ENG-1 BLOCKED class).",
+            file=sys.stderr,
+        )
+        return 1
+    # Count-bearing OK: a gate that can pass on empty input eventually will, quietly
+    # (the T3 disease reincarnated inside the tool built to prevent it). Zero-block
+    # selection already exits 2 above; this line makes PARTIAL emptiness legible —
+    # a boundary run with no red-claims says so to the operator's face.
+    print(
+        f"[fixture-smoke] OK — {len(blocks)} fixture block(s) executed; "
+        f"{_RED_CLAIM_TALLY['calls']} red-claim call(s) verified "
+        f"{_RED_CLAIM_TALLY['tests']} expected-red test(s)"
+        + (" [WARNING: zero red-claims at this boundary — sub-species B unchecked here]"
+           if _RED_CLAIM_TALLY["calls"] == 0 else "")
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

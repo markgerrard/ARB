@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ -z "${ARB_MEMORY_LOCAL_DSN:-}" ]]; then
+  echo "ARB_MEMORY_LOCAL_DSN is required and must use the read-only arbmem_local_reader role" >&2
+  exit 2
+fi
+
+cat >&2 <<'MSG'
+Registering arb-memory-local without --env so DSN/key secrets are not written to Claude config.
+Launch the claude process itself from a shell that exports ARB_MEMORY_LOCAL_DSN and OPENAI_API_KEY.
+If ARB_MEMORY_LOCAL_DSN uses libpq key/value syntax with spaces, export it as one quoted value.
+MSG
+
+claude mcp add --transport stdio arb-memory-local -- arb-memory-local-mcp

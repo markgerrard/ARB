@@ -1,0 +1,80 @@
+#!/bin/sh
+# pre-push — run scripts/suite-gate before anything lands on dev or main.
+#
+# WHY THIS EXISTS. GitHub Actions has been off since 295b97aa (2026-07-10,
+# "solo tool; re-enable later"). With no host-independent check, a stale test
+# double went unnoticed for weeks and landed as 683eac5b: five auth tests raised
+# TypeError at app construction, before reaching a single assertion, on every
+# host. This hook was chosen over re-enabling CI on 2026-08-17 — it costs no
+# runner minutes, and its honest limit is that it protects THIS host only.
+# Seats pushing from other machines are not covered by it.
+#
+# SCOPE IS dev AND main, DELIBERATELY. Worktrees share the common .git
+# directory, so a hook here fires for every worktree on the host — including the
+# dispatched-seat worktrees, which push feature branches unattended. Gating
+# those on an eight-minute suite would break dispatch for no gain. What needs
+# protecting is what merges.
+#
+# THE ONLY BYPASS IS `git push --no-verify`. suite-gate's own docstring rejects
+# env overrides as "an evasion channel"; adding a quieter hatch here would undo
+# that reasoning one layer up. --no-verify at least leaves the choice visible in
+# the shell history of whoever made it.
+#
+# INSTALL (opt-in, per clone):  git config core.hooksPath .githooks
+# Prerequisites: src/agent_redis_bridge/README.md § "Local host setup beyond the venv".
+
+set -eu
+
+# stdin: <local ref> <local sha> <remote ref> <remote sha>, one line per ref.
+protected=0
+while read -r _local_ref local_sha remote_ref _remote_sha; do
+	case "$remote_ref" in
+	refs/heads/dev | refs/heads/main) ;;
+	*) continue ;;
+	esac
+	# An all-zero local sha is a branch deletion — there is no tree to test.
+	case "$local_sha" in
+	*[!0]*) protected=1 ;;
+	esac
+done
+
+[ "$protected" -eq 1 ] || exit 0
+
+# The DSN check lives HERE rather than in suite-gate, on purpose, and the
+# reason is measured rather than assumed. Same tree, 2026-08-17:
+#
+#   with the DSNs set:  4936 passed,  62 skipped
+#   without them:       4345 passed, 653 skipped
+#
+# All 591 tests that stop running are already on suite-gate's skip allowlist,
+# and 4345 still clears its floor — so NEITHER of the gate's assertions can
+# detect a host with no database. That is not a defect in the gate: its floor is
+# pinned to a "no DSNs exported" baseline deliberately, so it stays runnable on
+# hosts that legitimately have none (dispatched seats among them). Requiring the
+# DSNs here strengthens the push path without redefining what suite-gate
+# promises those callers.
+missing=
+for var in ARB_MEMORY_DSN ARB_MEMORY_MCP_DSN; do
+	eval "value=\${$var-}"
+	[ -n "$value" ] || missing="$missing $var"
+done
+
+if [ -n "$missing" ]; then
+	echo "pre-push: refusing to gate a half-configured host." >&2
+	echo "  unset:$missing" >&2
+	echo "  Without these, the database-backed tests SKIP and suite-gate still" >&2
+	echo "  reports PASS — a green that proves nothing about the half of the" >&2
+	echo "  suite most likely to break." >&2
+	echo "  Recipe: src/agent_redis_bridge/README.md § 'Local host setup beyond the venv'." >&2
+	exit 1
+fi
+
+root=$(git rev-parse --show-toplevel)
+
+echo "pre-push: dev/main push detected — running scripts/suite-gate (whole suite, ~8 min)."
+echo "pre-push: bypass with 'git push --no-verify' if you mean to."
+
+if ! "$root/scripts/suite-gate"; then
+	echo "pre-push: suite-gate FAILED — push blocked." >&2
+	exit 1
+fi

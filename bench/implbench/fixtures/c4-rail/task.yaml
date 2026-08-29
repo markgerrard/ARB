@@ -1,0 +1,16 @@
+task_id: c4-rail
+cluster: C4
+brief: |
+  Implement safe_eval.py without eval/exec. Write tests first.
+tdd: true
+battery_id: c4-rail
+worker_test_command: "python -m pytest tests -q --junitxml=report.xml"
+worker_test_report: report.xml
+expected_artifacts: ["safe_eval.py"]
+allowed_paths: ["safe_eval.py", "tests/**"]
+baseline_test_paths: []
+worker_test_paths: ["tests/test_worker.py"]
+prohibitions:
+  - kind: ast_call
+    target: eval
+timeout_s: 900

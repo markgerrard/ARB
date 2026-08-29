@@ -1,0 +1,84 @@
+# Seat-host compose — runs bridge seats from the baked image.
+#
+# Per-host config is ONLY the REPO_ROOT bind mount + the SEAT_* overrides; the image,
+# bridge wrapper, and AGENT_WORKDIR convention are byte-identical everywhere.
+#
+#   REPO_ROOT=/Users/<user>  AGENT_UID=$(id -u) \
+#     docker compose -f deploy/seat-host/docker-compose.seat-host.yml up -d codex
+#
+# The repo is a BIND MOUNT (not baked) — worktree-per-dispatch makes the working tree
+# mutable shared state. Engine auth dirs are NAMED VOLUMES (device-code login once).
+# Run as the host UID so the mounted tree's ownership matches (git/edits need it).
+#
+# NOTE: the operator-facing overrides are deliberately SEAT_-prefixed (SEAT_AGENT_WORKDIR,
+# SEAT_AGENT_ENV_FILE, …) so an ambient host `AGENT_WORKDIR` / `AGENT_ENV_FILE` (which the
+# launchd bridge seats DO export, host-absolute) cannot bleed into the container config and
+# defeat the /repos convention. The container's own env keys stay AGENT_* (what the bridge reads).
+
+x-seat-common: &seat-common
+  image: arb-seat-host:dev
+  build:
+    context: ../..
+    dockerfile: deploy/seat-host/Dockerfile
+  restart: unless-stopped
+  # Host UID so the bind-mounted working tree's ownership matches (default 1000).
+  user: "${AGENT_UID:-1000}"
+  volumes:
+    # REPO bind mount: host REPO_ROOT -> /repos. AGENT_WORKDIR points at /repos/<project>.
+    - "${REPO_ROOT:?set REPO_ROOT, e.g. /Users/<user>}:/repos"
+    # Engine auth/config named volumes (survive restarts -> device-code login once per host).
+    - codex-auth:/home/seat/.codex
+    - gemini-auth:/home/seat/.gemini
+    - pi-auth:/home/seat/.pi
+
+# Shared env, declared as a YAML anchor so each service can splice it in. (A service's own
+# `environment:` REPLACES — does not deep-merge — an anchored one, so we splice this list
+# explicitly per service rather than rely on `<<` for the env map.)
+x-seat-env: &seat-env
+  SEAT_HOME: /home/seat
+  HOME: /home/seat
+  # AGENT_WORKDIR MUST be a container path under /repos (entrypoint warns otherwise).
+  AGENT_WORKDIR: "${SEAT_AGENT_WORKDIR:-/repos/<workspace>}"
+  AGENT_PROJECT: "${SEAT_AGENT_PROJECT:-bridge}"
+  AGENT_ENV_FILE: "${SEAT_AGENT_ENV_FILE:-/repos/<workspace>/envs/agent-redis-bridge-dev.env}"
+  AGENT_TRUSTED_SENDERS: "${SEAT_AGENT_TRUSTED_SENDERS:-claude-bridge-dev=trusted}"
+  BRIDGE_NOTIFY_INBOX: "0"
+
+services:
+  codex:
+    <<: *seat-common
+    environment:
+      <<: *seat-env
+      SEAT_INSTANCE: codex-dev
+      AGENT_BRIDGE_CODEX_BYPASS: "1"
+      BRIDGE_MAX_PARALLEL: "4"
+
+  gemini:
+    <<: *seat-common
+    environment:
+      <<: *seat-env
+      SEAT_INSTANCE: gemini-acp-dev
+
+  # pi-sdk seat (GLM). MiniMax-M3 is the same image with AGENT_MODEL=minimax/MiniMax-M3.
+  pi-glm:
+    <<: *seat-common
+    environment:
+      <<: *seat-env
+      SEAT_INSTANCE: pi-sdk-dev-glm
+      AGENT_MODEL: "zai/glm-5.2"
+
+  # agy (Antigravity CLI) — NOT installed in the image (no clean in-repo install one-liner).
+  # Install agy into the gemini-auth volume's .gemini tree at first run, then enable this seat.
+  # Note: re-uses the *seat-env anchor (so the env keys are not dropped by the YAML merge).
+  # agy:
+  #   <<: *seat-common
+  #   environment:
+  #     <<: *seat-env
+  #     SEAT_INSTANCE: agy-print-dev
+  #     AGENT_TURN_TIMEOUT: "600"
+  #     BRIDGE_MAX_PARALLEL: "1"
+
+volumes:
+  codex-auth:
+  gemini-auth:
+  pi-auth:

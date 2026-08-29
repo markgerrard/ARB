@@ -1,0 +1,312 @@
+#!/usr/bin/env python3
+"""Live Redis/Postgres e2e for fetch-by-id and stale-prior refusal."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+from pathlib import Path
+
+CONSUMER_LOG = "/tmp/arb-memory-fetch-e2e-consumer.log"
+PRIOR = (
+    "# Design — fetch e2e\n\n**Change summary:** first draft.\n\n"
+    + "prior body paragraph with enough substance to clear the stub floor. " * 8
+    + "\n"
+)
+OUT_OF_BAND = PRIOR.replace("first draft", "out-of-band second draft")
+CANDIDATE = PRIOR.replace("first draft", "candidate folded revision").replace(
+    "prior body", "candidate body", 1
+)
+
+
+def _connect(dsn):
+    import psycopg
+
+    return psycopg.connect(dsn, autocommit=True)
+
+
+def clean_redis_prefix(redis_url, prefix):
+    import redis
+
+    client = redis.from_url(redis_url, decode_responses=True)
+    try:
+        cursor = 0
+        keys = []
+        while True:
+            cursor, batch = client.scan(cursor=cursor, match=f"{prefix}*", count=1000)
+            keys.extend(batch)
+            if cursor == 0:
+                break
+        if keys:
+            client.delete(*keys)
+    finally:
+        client.close()
+
+
+def wait_until(fn, timeout_s, what):
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if fn():
+            return
+        time.sleep(0.25)
+    raise TimeoutError(f"timed out waiting for {what}")
+
+
+def stop(proc):
+    if proc is None or proc.poll() is not None:
+        return
+    proc.send_signal(signal.SIGTERM)
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=10)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--repo-root", default=str(Path(__file__).resolve().parents[1]))
+    parser.add_argument("--python", default=sys.executable)
+    parser.add_argument("--dsn", default=os.environ.get("ARB_MEMORY_DSN"))
+    parser.add_argument(
+        "--redis-url",
+        default=os.environ.get("ARB_MEMORY_REDIS_URL", "redis://127.0.0.1:6379/15"),
+    )
+    args = parser.parse_args(argv)
+    if not args.dsn:
+        raise SystemExit("ARB_MEMORY_DSN or --dsn required")
+
+    repo_root = Path(args.repo_root).resolve()
+    run_tag = f"arb-memory-fetch-e2e-{uuid.uuid4().hex}"
+    artefact_id = f"{run_tag}-artefact"
+    driver_artefact_id = f"{run_tag}-driver-artefact"
+    artefact_ids = [artefact_id, driver_artefact_id]
+    prefix = f"{run_tag}:"
+    env = dict(os.environ)
+    env.update(
+        {
+            "ARB_MEMORY_DSN": args.dsn,
+            "ARB_MEMORY_REDIS_URL": args.redis_url,
+            "ARB_MEMORY_PREFIX": prefix,
+        }
+    )
+    os.environ.update(
+        {"ARB_MEMORY_REDIS_URL": args.redis_url, "ARB_MEMORY_PREFIX": prefix}
+    )
+    for path in (repo_root / "src", repo_root / "tools" / "faba"):
+        if str(path) not in sys.path:
+            sys.path.insert(0, str(path))
+
+    import redis
+
+    from arb_memory import bus
+    from arb_memory.fetch import GROUP as FETCH_GROUP
+    from arb_memory.fetch import fetch_request_stream, memory_fetch_by_id
+    from faba_launch import publish_artefact_and_gate
+    from faba_record import poll_receipt
+    from faba_schema import validate_authored_artefact
+    from subagent.run_author_round import materialise_author_workspace
+
+    client = redis.from_url(args.redis_url, decode_responses=True)
+    conn = _connect(args.dsn)
+    request_ids = []
+    consumer = None
+    try:
+        conn.execute("DELETE FROM artefacts WHERE artefact_id = ANY(%s)", (artefact_ids,))
+        clean_redis_prefix(args.redis_url, prefix)
+        log = open(CONSUMER_LOG, "w")
+        consumer = subprocess.Popen(
+            [args.python, "-m", "arb_memory", "memory"],
+            cwd=repo_root,
+            env=env,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        log.close()
+
+        def groups_ready():
+            try:
+                write_groups = {row["name"] for row in client.xinfo_groups(bus.writes_stream(prefix))}
+                fetch_groups = {
+                    row["name"] for row in client.xinfo_groups(fetch_request_stream(prefix))
+                }
+                return bus.GROUP in write_groups and FETCH_GROUP in fetch_groups
+            except redis.RedisError:
+                return False
+
+        wait_until(groups_ready, 30, "memory write and fetch consumer groups")
+
+        def publish(target_artefact_id, body, label):
+            request_id = f"{run_tag}-{label}"
+            request_ids.append(request_id)
+            bus.memory_write(
+                client,
+                artefact={
+                    "artefact_id": target_artefact_id,
+                    "content": body,
+                    "mime": "text/markdown",
+                    "source": run_tag,
+                    "author": run_tag,
+                },
+                hints=[],
+                request_id=request_id,
+                ulid=request_id,
+                prefix=prefix,
+            )
+            receipt = poll_receipt(request_id, 30, client=client, prefix=prefix)
+            if not receipt or receipt.get("artefact_outcome") not in {"stored", "deduped"}:
+                raise RuntimeError(f"{label} publish failed: {receipt!r}")
+            return receipt
+
+        v1 = publish(artefact_id, PRIOR, "v1")
+        fetched_v1 = memory_fetch_by_id(client, artefact_id, timeout=30, prefix=prefix)
+        if not fetched_v1 or fetched_v1.get("outcome") != "ok" or fetched_v1.get("content") != PRIOR:
+            raise RuntimeError(f"v1 fetch failed fidelity check: {fetched_v1!r}")
+
+        v2 = publish(artefact_id, OUT_OF_BAND, "v2-out-of-band")
+        with tempfile.TemporaryDirectory(prefix="arb-memory-fetch-e2e-") as workspace_raw:
+            workspace = Path(workspace_raw)
+            (workspace / "prior-record.md").write_text(PRIOR, encoding="utf-8")
+            (workspace / "artefact.md").write_text(CANDIDATE, encoding="utf-8")
+            result = publish_artefact_and_gate(
+                args.redis_url,
+                workspace=workspace,
+                artefact_id=artefact_id,
+                request_id=f"{run_tag}-candidate-v3",
+                author=run_tag,
+                receipt_timeout=30,
+                revision=True,
+            )
+        if result[0] or "stale prior" not in result[1] or "store_version=2" not in result[1]:
+            raise RuntimeError(f"stale prior was not refused correctly: {result!r}")
+        version_count, max_version = conn.execute(
+            "SELECT count(*), max(version) FROM artefacts WHERE artefact_id = %s",
+            (artefact_id,),
+        ).fetchone()
+        if (version_count, max_version) != (2, 2):
+            raise RuntimeError(
+                f"refused revision changed store: count={version_count} max_version={max_version}"
+            )
+
+        driver_v1 = publish(driver_artefact_id, PRIOR, "driver-v1")
+        fetched_driver_v1 = memory_fetch_by_id(
+            client, driver_artefact_id, timeout=30, prefix=prefix
+        )
+        if not isinstance(fetched_driver_v1, dict) or fetched_driver_v1.get("outcome") != "ok":
+            raise RuntimeError(f"driver arm-time fetch failed: {fetched_driver_v1!r}")
+        driver_content = fetched_driver_v1.get("content")
+        driver_version = fetched_driver_v1.get("version")
+        fetch_request_id = fetched_driver_v1.get("request_id")
+        if (
+            not isinstance(driver_content, str)
+            or driver_content != PRIOR
+            or not isinstance(driver_version, int)
+            or driver_version != 1
+            or not isinstance(fetch_request_id, str)
+            or not fetch_request_id
+        ):
+            raise RuntimeError(f"driver arm-time fetch was malformed: {fetched_driver_v1!r}")
+        prior_check = validate_authored_artefact(driver_content, allow_trailing_markup=True)
+        if not prior_check.ok:
+            raise RuntimeError(f"driver arm-time prior validation failed: {prior_check.problems!r}")
+        driver_prior_bytes = driver_content.encode("utf-8")
+        driver_provenance = {
+            "prior_source": "store-fetch",
+            "store_version": driver_version,
+            "fetch_request_id": fetch_request_id,
+            "prior_sha256": hashlib.sha256(driver_prior_bytes).hexdigest(),
+        }
+        with tempfile.TemporaryDirectory(prefix="arb-memory-fetch-e2e-driver-") as workspace_raw:
+            workspace = Path(workspace_raw)
+            materialise_author_workspace(
+                workspace,
+                stage="design",
+                subject_summary="live driver arm-time staging",
+                artefact_id=driver_artefact_id,
+                prior_artefact_id="none",
+                prior_record_id="none",
+                task="fold the staged v1 into a revision",
+                prior_record_bytes=driver_prior_bytes,
+                prior_provenance=driver_provenance,
+            )
+            if (workspace / "prior-record.md").read_bytes() != PRIOR.encode("utf-8"):
+                raise RuntimeError("driver-staged prior-record.md was not byte-exact")
+            author_input = json.loads((workspace / "author-input.json").read_text(encoding="utf-8"))
+            for key, expected in driver_provenance.items():
+                if author_input.get(key) != expected:
+                    raise RuntimeError(
+                        f"driver provenance mismatch for {key}: {author_input.get(key)!r} != {expected!r}"
+                    )
+
+            driver_v2 = publish(driver_artefact_id, OUT_OF_BAND, "driver-v2-out-of-band")
+            (workspace / "artefact.md").write_text(CANDIDATE, encoding="utf-8")
+            driver_result = publish_artefact_and_gate(
+                args.redis_url,
+                workspace=workspace,
+                artefact_id=driver_artefact_id,
+                request_id=f"{run_tag}-driver-candidate-v3",
+                author=run_tag,
+                receipt_timeout=30,
+                revision=True,
+            )
+        if (
+            driver_result[0]
+            or "stale prior" not in driver_result[1]
+            or "store_version=2" not in driver_result[1]
+        ):
+            raise RuntimeError(f"driver-staged stale prior was not refused: {driver_result!r}")
+        driver_version_count, driver_max_version = conn.execute(
+            "SELECT count(*), max(version) FROM artefacts WHERE artefact_id = %s",
+            (driver_artefact_id,),
+        ).fetchone()
+        if (driver_version_count, driver_max_version) != (2, 2):
+            raise RuntimeError(
+                "driver-staged refusal changed store: "
+                f"count={driver_version_count} max_version={driver_max_version}"
+            )
+
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "run_tag": run_tag,
+                    "v1": v1["version"],
+                    "v2_out_of_band": v2["version"],
+                    "fetch_head_fidelity": True,
+                    "stale_prior_refused": True,
+                    "store_remained_at_version": max_version,
+                    "driver_v1": driver_v1["version"],
+                    "driver_v2_out_of_band": driver_v2["version"],
+                    "driver_staged_prior_fidelity": True,
+                    "driver_provenance_complete": True,
+                    "driver_stale_prior_refused": True,
+                    "driver_store_remained_at_version": driver_max_version,
+                }
+            )
+        )
+        return 0
+    finally:
+        stop(consumer)
+        try:
+            conn.execute("DELETE FROM artefacts WHERE artefact_id = ANY(%s)", (artefact_ids,))
+            if request_ids:
+                conn.execute(
+                    "DELETE FROM idempotency_keys WHERE key = ANY(%s)", (request_ids,)
+                )
+            clean_redis_prefix(args.redis_url, prefix)
+        finally:
+            client.close()
+            conn.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

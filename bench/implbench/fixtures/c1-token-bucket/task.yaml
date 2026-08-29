@@ -1,0 +1,16 @@
+task_id: c1-token-bucket
+cluster: C1
+brief: |
+  Implement a stdlib-only token bucket in bucket.py. Write tests first in tests/test_worker.py.
+tdd: true
+battery_id: c1-token-bucket
+worker_test_command: "python -m pytest tests -q --junitxml=report.xml"
+worker_test_report: report.xml
+expected_artifacts: ["bucket.py"]
+allowed_paths: ["bucket.py", "tests/**"]
+baseline_test_paths: []
+worker_test_paths: ["tests/test_worker.py"]
+prohibitions:
+  - kind: regex
+    pattern: "import requests"
+timeout_s: 900

@@ -1,0 +1,207 @@
+services:
+  memory:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: arb-memory:phase3
+    command: ["memory"]
+    restart: unless-stopped
+    environment:
+      ARB_MEMORY_DSN: ${ARB_MEMORY_DSN}
+      ARB_MEMORY_REDIS_URL: ${ARB_MEMORY_REDIS_URL}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      ARB_JOURNEY_SNAPSHOT_DIR: /journey-snapshot
+    volumes:
+      # Vault read-model export persistence: the nightly cron runs the exporter via
+      # `docker compose exec memory` with ARB_VAULT_EXPORT_ROOT pointing INSIDE this mount,
+      # so the markdown vault survives container recreates. Host dir is per-host config
+      # (deploy/.env, gitignored); the default keeps hosts without it harmless.
+      - ${ARB_VAULT_EXPORT_HOST_DIR:-/tmp/arb-memory-vault}:/home/claude/arb-memory-vault
+      - arb_journey:/journey-snapshot:rw
+
+  audit:
+    image: arb-memory:phase3
+    command: ["audit"]
+    restart: unless-stopped
+    depends_on:
+      - memory
+    environment:
+      ARB_MEMORY_DSN: ${ARB_MEMORY_DSN}
+      ARB_MEMORY_REDIS_URL: ${ARB_MEMORY_REDIS_URL}
+
+  audit-close-consumer:
+    image: arb-memory:phase3
+    command: ["audit-close-consumer"]
+    restart: unless-stopped
+    depends_on:
+      - memory
+    environment:
+      ARB_MEMORY_DSN: ${ARB_MEMORY_DSN}
+      ARB_MEMORY_REDIS_URL: ${ARB_MEMORY_REDIS_URL}
+
+  eval:
+    image: arb-memory:phase3
+    command: ["eval"]
+    restart: unless-stopped
+    depends_on:
+      - memory
+    environment:
+      # Least-privilege: the eval consumer holds a WRITE-role DSN (SELECT/INSERT on eval tables only,
+      # via apply_eval_grants), NOT the owner. Fail-loud if ARB_EVAL_DSN is unset — no owner fallback.
+      ARB_MEMORY_DSN: ${ARB_EVAL_DSN}
+      ARB_EVAL_REDIS_URL: ${ARB_EVAL_REDIS_URL}
+      ARB_EVAL_REDIS_DB: "6"
+      ARB_EVAL_PREFIX: ${ARB_EVAL_PREFIX:-}
+
+  transcript:
+    image: arb-memory:phase3
+    command: ["transcript"]
+    restart: unless-stopped
+    depends_on:
+      - memory
+    environment:
+      # Least-privilege: WRITE-role DSN (SELECT/INSERT on transcript_io + deadletter only, via
+      # apply_transcript_grants), NOT the owner. Fail-loud if ARB_TRANSCRIPT_DSN is unset.
+      ARB_MEMORY_DSN: ${ARB_TRANSCRIPT_DSN}
+      ARB_TRACE_REDIS_URL: ${ARB_TRACE_REDIS_URL}
+      ARB_TRACE_PREFIX: ${ARB_TRACE_PREFIX:-}
+
+  hint-reads:
+    image: arb-memory:phase3
+    command: ["hint-reads"]
+    restart: unless-stopped
+    depends_on:
+      - memory
+    environment:
+      # Least-privilege: shares the eval consumer identity BY DESIGN (grants.py:
+      # "HintReadConsumer and EvalConsumer share the bus-consumer identity") —
+      # SELECT/INSERT on hint_read* only, never the owner DSN. The stream it
+      # drains lives on the memory bus (record-intents are XADD'd by the memory
+      # service at reply-build), hence ARB_MEMORY_REDIS_URL, not the eval bus.
+      ARB_MEMORY_DSN: ${ARB_EVAL_DSN}
+      ARB_MEMORY_REDIS_URL: ${ARB_MEMORY_REDIS_URL}
+
+  writer:
+    image: arb-memory:phase3
+    command: ["writer"]
+    environment:
+      ARB_MEMORY_REDIS_URL: ${ARB_MEMORY_REDIS_URL}
+      ARB_MEMORY_WRITER_TOKEN: ${ARB_MEMORY_WRITER_TOKEN}
+      ARB_MEMORY_WRITER_HOST: 0.0.0.0
+      ARB_MEMORY_WRITER_PORT: "8800"
+    restart: unless-stopped
+
+  visibility:
+    image: arb-memory:phase3
+    command: ["visibility"]
+    restart: unless-stopped
+    environment:
+      # cross-plane: the bridge bus (db-12, events:live live source) is distinct from ARB_MEMORY_REDIS_URL
+      ARB_BRIDGE_BUS_URL: ${ARB_BRIDGE_BUS_URL}
+      ARB_BRIDGE_BUS_PREFIX: ${ARB_BRIDGE_BUS_PREFIX:-}
+      # Live transcript tail: the gateway reads the same trace stream (db-7 arbmem:trace) the
+      # transcript consumer durably persists, so the seat view streams tool calls in realtime
+      # alongside the PG backfill. Without this, read_trace_live is dormant and transcript only
+      # appears via PG backfill (lands all-at-once, seconds behind).
+      ARB_TRACE_REDIS_URL: ${ARB_TRACE_REDIS_URL}
+      ARB_TRACE_PREFIX: ${ARB_TRACE_PREFIX:-}
+      # Least-privilege: the gateway holds a READ-role DSN (SELECT-only on the read surface incl.
+      # audit_events, via apply_visibility_grants — deny-proven), NEVER the owner. Fail-loud if unset.
+      ARB_MEMORY_DSN: ${ARB_VISIBILITY_DSN}
+      ARB_MEMORY_MCP_PUBLIC_BASE_URL: ${ARB_MEMORY_MCP_PUBLIC_BASE_URL}
+      ARB_VISIBILITY_HOST: 0.0.0.0
+      ARB_VISIBILITY_PORT: "8810"
+      ARB_JOURNEY_SNAPSHOT_DIR: /journey-snapshot
+      # Passphrase+TOTP login gate: reuse the door's login/TOTP secrets so the visibility login is
+      # the SAME credential as arb-memory. If either is unset the gate is off (bearer-token only).
+      # The visibility role additionally holds SELECT/INSERT/UPDATE/DELETE on mcp_auth.login_sessions
+      # + login_attempts only (via apply_visibility_grants); oauth_clients/refresh_tokens stay denied.
+      ARB_MEMORY_MCP_LOGIN_SECRET: ${ARB_MEMORY_MCP_LOGIN_SECRET}
+      ARB_MEMORY_MCP_TOTP_SECRET: ${ARB_MEMORY_MCP_TOTP_SECRET}
+    volumes:
+      - arb_journey:/journey-snapshot:ro
+
+  mcp:
+    image: arb-memory:phase3
+    command: ["mcp"]
+    restart: unless-stopped
+    depends_on:
+      - writer
+    # No host port published: cloudflared is the SOLE ingress and reaches the door at mcp:8000 over
+    # the compose network. Publishing 8000 on the host would expose the door directly, bypassing the
+    # Cloudflare edge (BIC / rate-limit). For local debugging, `docker compose exec mcp` or
+    # temporarily add `ports: ["127.0.0.1:8000:8000"]` (loopback-only).
+    expose:
+      - "8000"
+    environment:
+      ARB_MEMORY_MCP_PUBLIC_BASE_URL: ${ARB_MEMORY_MCP_PUBLIC_BASE_URL}
+      ARB_MEMORY_MCP_DSN: ${ARB_MEMORY_MCP_DSN}
+      ARB_MEMORY_MCP_LOGIN_SECRET: ${ARB_MEMORY_MCP_LOGIN_SECRET}
+      ARB_MEMORY_MCP_TOTP_SECRET: ${ARB_MEMORY_MCP_TOTP_SECRET}
+      ARB_MEMORY_MCP_WRITER_URL: http://writer:8800
+      ARB_MEMORY_WRITER_TOKEN: ${ARB_MEMORY_WRITER_TOKEN}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      # Connector-canary request tracing (presence-only, never logs token values). Set to "" / remove
+      # once the claude.ai connector handshake is diagnosed.
+      ARB_MEMORY_MCP_TRACE: ${ARB_MEMORY_MCP_TRACE:-}
+      # ARB Files: when ARB_FILES_BUCKET is set, register_file_tools attaches the file_* tools +
+      # files.read/files.write scopes to this door (fail-soft: a config/back-end error logs + skips,
+      # leaving the memory door unaffected). Secrets live in deploy/.env (gitignored).
+      ARB_FILES_ENDPOINT: ${ARB_FILES_ENDPOINT:-}
+      ARB_FILES_REGION: ${ARB_FILES_REGION:-}
+      ARB_FILES_BUCKET: ${ARB_FILES_BUCKET:-}
+      ARB_FILES_ACCESS_KEY: ${ARB_FILES_ACCESS_KEY:-}
+      ARB_FILES_SECRET_KEY: ${ARB_FILES_SECRET_KEY:-}
+      ARB_FILES_PREFIX: ${ARB_FILES_PREFIX:-agent-files/}
+      # ARB Email: register_email_tool attaches email_send + the email.send scope when
+      # ARB_EMAIL_POSTMARK_TOKEN is set AND ARB_EMAIL_SEND_ENABLED == "1" (the kill switch — default
+      # off; fail-soft like ARB Files). From-fixed + explicit-address allowlist contain abuse.
+      # Secrets in deploy/.env (gitignored).
+      ARB_EMAIL_POSTMARK_TOKEN: ${ARB_EMAIL_POSTMARK_TOKEN:-}
+      ARB_EMAIL_SEND_ENABLED: ${ARB_EMAIL_SEND_ENABLED:-0}
+      ARB_EMAIL_FROM: ${ARB_EMAIL_FROM:-arb@example.com}
+      ARB_EMAIL_STREAM: ${ARB_EMAIL_STREAM:-arb}
+      ARB_EMAIL_DEFAULT_TO: ${ARB_EMAIL_DEFAULT_TO:-arb@example.com}
+      ARB_EMAIL_TO_ALLOWLIST: ${ARB_EMAIL_TO_ALLOWLIST:-}
+      # ARB Messages: register_messages_tools/register_fulfillment_tools attach the generic
+      # request/fulfillment relay tools + messages.request scope (messages.fulfill is
+      # deliberately NOT auto-grantable -- see ArbMemoryOAuthProvider._OPERATOR_ONLY_SCOPES)
+      # when both DSN and allowlists are set (fail-soft, same pattern as Files/Email). Reuses
+      # the same arbmemory-mcp role/DSN as the door itself -- both run in this same process.
+      ARB_MESSAGES_POSTGRES_DSN: ${ARB_MESSAGES_POSTGRES_DSN:-}
+      ARB_MESSAGES_ALLOWED_AGENTS: ${ARB_MESSAGES_ALLOWED_AGENTS:-}
+      ARB_MESSAGES_ALLOWED_PROVIDERS: ${ARB_MESSAGES_ALLOWED_PROVIDERS:-}
+      ARB_MESSAGES_ENABLED: ${ARB_MESSAGES_ENABLED:-1}
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "from arb_memory.mcp.health import readiness; raise SystemExit(0 if readiness()['ready'] else 1)"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # Token-model Cloudflare tunnel (Option A). Egress-only — no ports. The public hostname route
+  # (dev-arb-memory.example.com -> http://mcp:8000) is configured dashboard-side (remote_config),
+  # so no config.yml / credentials-file is mounted here. cloudflared reaches `mcp` over the compose
+  # network. Token is supplied via deploy/.env (gitignored).
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    command: tunnel --no-autoupdate run
+    restart: unless-stopped
+    depends_on:
+      - mcp
+    environment:
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN}
+
+  arb-tools-static:
+    image: nginx:alpine
+    restart: unless-stopped
+    volumes:
+      - /home/claude/arb-tools/www:/usr/share/nginx/html:ro
+      - /home/claude/arb-tools/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+
+volumes:
+  arb_journey:

@@ -1,0 +1,5 @@
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"[scrubbed assistant text]"}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"[scrubbed thinking text]","signature":"[scrubbed signature]"}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_scrubbed","name":"Write","input":{"file_path":"[scrubbed path]","content":"[scrubbed content]"}}]}}
+{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_scrubbed","type":"tool_result","content":"[scrubbed tool result]"}]}}
+{"type":"file-history-snapshot","messageId":"scrubbed","snapshot":{"messageId":"scrubbed","trackedFileBackups":{}}}

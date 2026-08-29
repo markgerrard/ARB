@@ -1,0 +1,42 @@
+#!/usr/bin/env python3
+"""The only model-visible Git entrypoint: fixed stdio RPC, no shell or raw Git argv."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+from implbench.harness.git_service import FrameReader, GitRPCError, GitService, encode_frame
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--repo", required=True)
+    parser.add_argument("--fixture-root-oid", required=True)
+    parser.add_argument("--allowed-path", action="append", default=[])
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    service = GitService(Path(args.repo), fixture_root_oid=args.fixture_root_oid, allowed_paths=tuple(args.allowed_path))
+    reader = FrameReader(sys.stdin.buffer)
+    while True:
+        try:
+            request = reader.read()
+        except GitRPCError as exc:
+            if "truncated" in str(exc):
+                return 0
+            sys.stdout.buffer.write(encode_frame({"error": str(exc)})); sys.stdout.buffer.flush()
+            return 1
+        try:
+            response = service.handle(request)
+        except GitRPCError as exc:
+            response = {"error": str(exc)}
+        sys.stdout.buffer.write(encode_frame(response))
+        sys.stdout.buffer.flush()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

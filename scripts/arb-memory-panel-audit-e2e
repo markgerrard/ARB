@@ -1,0 +1,77 @@
+#!/usr/bin/env python3
+# scripts/arb-memory-panel-audit-e2e
+"""Live close-condition for the panel-audit wiring. Drives one synthetic panel on a run-isolated prefix:
+emit manifest(seq1)+votes+verdict, run the AuditConsumer, then assert reconcile() PASSES — and prove the
+guard bites by deleting/mutating rows and asserting it REFUSES (deny-proofs, both directions)."""
+import os, sys, time, uuid
+import psycopg
+import redis as _redis
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+from arb_memory.audit import AuditConsumer, AuditRun   # noqa: E402
+from arb_memory.panel_audit import reconcile           # noqa: E402
+
+
+def _connect(dsn): return psycopg.connect(dsn, autocommit=True)
+
+def wait_until(fn, timeout_s, what):
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if fn(): return
+        time.sleep(0.1)
+    raise RuntimeError(f"timeout waiting for {what}")
+
+
+def main():
+    dsn = os.environ["ARB_MEMORY_DSN"]
+    audit_url = os.environ["ARB_MEMORY_REDIS_URL"]
+    run_tag = f"arb-panel-e2e-{uuid.uuid4().hex}"
+    prefix = f"{run_tag}:"
+    roster = [f"seat:{run_tag}-codex", f"seat:{run_tag}-coldopus"]
+    verdict = {"kind": "verdict", "roster": roster,
+               "stances": {roster[0]: "approve", roster[1]: "needs-changes"}, "rationale": "ok"}
+
+    ar = _redis.from_url(audit_url, decode_responses=True)
+    conn = _connect(dsn)
+    audit = AuditConsumer(ar, lambda: _connect(dsn), prefix=prefix)
+
+    def n_rows():
+        return conn.execute("SELECT count(*) FROM audit_events WHERE run_id=%s", (run_tag,)).fetchone()[0]
+    def cleanup():
+        conn.execute("DELETE FROM audit_events WHERE run_id=%s", (run_tag,))
+
+    try:
+        cleanup()
+        audit.start()
+        run = AuditRun(ar, run_tag, prefix=prefix)
+        run.emit("orchestrator", "dispatch", {"kind": "dispatch", "roster": roster, "task": "t", "branch": "dev"})
+        run.emit("orchestrator", "vote", {"kind": "vote", "actor": roster[0], "stance": "approve", "severity": "none"})
+        run.emit("orchestrator", "vote", {"kind": "vote", "actor": roster[1], "stance": "needs-changes", "severity": "P2"})
+        wait_until(lambda: n_rows() == 3, 30, "3 audit rows drained to PG")
+
+        ok = reconcile(conn, run_tag, verdict, redis=ar)
+        assert ok["ok"] is True, f"clean panel should reconcile: {ok}"
+
+        # deny-proof A: delete a vote -> refuse
+        conn.execute("DELETE FROM audit_events WHERE run_id=%s AND kind='vote' AND payload->>'actor'=%s",
+                     (run_tag, roster[1]))
+        bad = reconcile(conn, run_tag, verdict, redis=ar)
+        assert bad["ok"] is False and any("never voted" in g for g in bad["gaps"]), bad
+
+        # deny-proof B: re-add but with the WRONG seq so the manifest no longer precedes -> refuse
+        # (re-insert vote at seq 0 < manifest seq 1)
+        conn.execute("INSERT INTO audit_events (run_id, seq, source, kind, payload) "
+                     "VALUES (%s, 0, 'orchestrator', 'vote', %s)",
+                     (run_tag, psycopg.types.json.Jsonb({"kind":"vote","actor":roster[1],"stance":"needs-changes"})))
+        bad2 = reconcile(conn, run_tag, verdict, redis=ar)
+        assert bad2["ok"] is False and any("precede" in g for g in bad2["gaps"]), bad2
+
+        print(f"PANEL-AUDIT E2E GREEN run_tag={run_tag}: clean reconcile + 2 deny-proofs bit")
+    finally:
+        audit.stop() if hasattr(audit, "stop") else None
+        cleanup()
+        conn.close()
+
+
+if __name__ == "__main__":
+    main()

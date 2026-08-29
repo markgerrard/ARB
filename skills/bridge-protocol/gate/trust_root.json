@@ -1,0 +1,12 @@
+{
+  "certified_object_sha": "3e031c5d26f2d8dcecca215f62ddc0b31418b29b3d186b9016bad4e77d5143c5",
+  "certifying_seats": [
+    "codex-bridge-dev-example",
+    "grok-bridge-dev",
+    "cline-bridge-dev"
+  ],
+  "human_approver": "mark",
+  "judged_not_verified": true,
+  "change_author": "claude-warm-seat",
+  "note": "Certified 2026-08-14 by panel-gaterotate-r6-20260814T064209Z-261b8b (logic-set rotation fbe7d3ea5c3d->3e031c5d26f2). Human approver: mark, co-signed 2026-08-14."
+}

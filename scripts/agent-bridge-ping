@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+# Health-check a registered bridge agent (engine-agnostic).
+# Usage: agent-bridge-ping [--engine codex|grok-acp|devin-acp|cline-acp|pi-sdk] [--role ROLE] [workspace]   (gemini-acp DEPRECATED 2026-07-03)
+# Defaults are env-driven; falls back to legacy project-c paths so the
+# existing host setup keeps working without an .env update.
+#
+# `codex-bridge-ping` is a thin deprecation wrapper kept for back-compat;
+# new callers should target `agent-bridge-ping` directly.
+set -euo pipefail
+
+ENGINE=codex
+ROLE=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --engine) ENGINE=${2:?--engine requires a value}; shift 2 ;;
+    --role) ROLE=${2:?--role requires a value}; shift 2 ;;
+    -h|--help)
+      echo "usage: agent-bridge-ping [--engine codex|grok-acp|devin-acp|cline-acp|pi-sdk] [--role ROLE] [workspace]" >&2
+      exit 0
+      ;;
+    *) break ;;
+  esac
+done
+
+case "$ENGINE" in
+  codex) TOOL=codex ;;
+  gemini-acp) echo "[agent-bridge-ping] gemini-acp is DEPRECATED (2026-07-03): the gemini CLI was deprecated by Google and no longer runs." >&2; exit 2 ;;
+  agy-print) TOOL=agy ;;
+  grok-acp) TOOL=grok ;;
+  devin-acp) TOOL=devin ;;
+  cline-acp) TOOL=cline ;;
+  dsh-acp) TOOL=dsh ;;
+  pi-sdk) TOOL=pi-sdk ;;
+  *) echo "unknown engine: $ENGINE" >&2; exit 2 ;;
+esac
+
+WORKSPACE=${1:-${AGENT_WORKSPACE:-dev}}
+ENV_FILE=${AGENT_ENV_FILE:-${AGENT_WORKDIR:+$AGENT_WORKDIR/.env}}
+ENV_FILE=${ENV_FILE:-/srv/projects/project-c-${WORKSPACE}/.env}
+
+get_env() {
+  # A missing env file is NOT fatal: every value it supplies can also come from the
+  # environment. But awk exits 2 on a file it cannot open, its stderr is discarded here, and
+  # under `set -euo pipefail` that killed the whole script inside the command substitutions
+  # below — exit 2 with ZERO output. A health check that dies silently reads as a dead seat
+  # rather than a misconfigured path, which is the opposite of what it exists to tell you.
+  # (Found live by panel round art-faba-sa-guide-v4-certify-20260727T014554Z; the trigger is
+  # an ambient AGENT_WORKDIR pointing at a directory with no .env.)
+  [ -r "$ENV_FILE" ] || return 0
+  awk -F= -v key="$1" '$1 == key { sub(/^[^=]*=/, ""); gsub(/^"|"$/, ""); print; exit }' "$ENV_FILE" 2>/dev/null
+}
+
+PROJECT=${AGENT_PROJECT:-$(get_env AGENT_PROJECT)}
+PROJECT=${PROJECT:-project-c}
+# Flag wins. AGENT_ROLE is the process-env analogue of AGENT_WORKSPACE. Not
+# read from the env file: that file is shared across seats, and a leftover
+# AGENT_ROLE would silently ping the wrong id.
+if [ -z "$ROLE" ]; then
+  ROLE=${AGENT_ROLE:-}
+fi
+AGENT_ID=${AGENT_ID:-${TOOL}-${PROJECT}-${WORKSPACE}${ROLE:+-$ROLE}}
+
+HOST=${AGENT_REDIS_HOST:-$(get_env AGENT_REDIS_HOST)}
+PORT=${AGENT_REDIS_PORT:-$(get_env AGENT_REDIS_PORT)}
+DB=${AGENT_REDIS_DB:-$(get_env AGENT_REDIS_DB)}
+PREFIX=${AGENT_REDIS_PREFIX:-$(get_env AGENT_REDIS_PREFIX)}
+REDIS_USER=${AGENT_REDIS_USER:-$(get_env AGENT_REDIS_USER)}
+REDIS_TLS=${AGENT_REDIS_TLS:-$(get_env AGENT_REDIS_TLS)}
+REDIS_PASSWORD=${AGENT_REDIS_PASSWORD:-$(get_env AGENT_REDIS_PASSWORD)}
+
+# Fail LOUDLY and specifically if the connection cannot be resolved. Without this the script
+# would carry empty -h/-p/-n into redis-cli and report the seat as `registry=missing` — a
+# misconfigured caller misdiagnosed as a dead agent, which is worse than an error.
+missing=""
+[ -n "$HOST" ] || missing="$missing AGENT_REDIS_HOST"
+[ -n "$PORT" ] || missing="$missing AGENT_REDIS_PORT"
+[ -n "$DB" ]   || missing="$missing AGENT_REDIS_DB"
+if [ -n "$missing" ]; then
+  if [ -r "$ENV_FILE" ]; then
+    where="$ENV_FILE (readable, but those keys are absent from it)"
+  else
+    where="$ENV_FILE (NOT READABLE — this is the usual cause)"
+  fi
+  echo "[agent-bridge-ping] cannot resolve the Redis connection; missing:$missing" >&2
+  echo "[agent-bridge-ping] looked in the environment, then env file: $where" >&2
+  echo "[agent-bridge-ping] fix: export AGENT_ENV_FILE=<path to a real env file>, or set those vars directly" >&2
+  echo "[agent-bridge-ping] NOTE: this is a caller/config error, NOT evidence about the seat's health" >&2
+  exit 2
+fi
+
+REDIS_FLAGS=(-h "$HOST" -p "$PORT" -n "$DB" --no-auth-warning)
+case "${REDIS_TLS:-0}" in 1|true|True|yes) REDIS_FLAGS+=(--tls) ;; esac
+[ -n "$REDIS_USER" ] && REDIS_FLAGS+=(--user "$REDIS_USER")
+[ -n "$REDIS_PASSWORD" ] && export REDISCLI_AUTH="$REDIS_PASSWORD"
+
+REGISTRY="${PREFIX}registry:${AGENT_ID}"
+STATUS="${PREFIX}agent:${AGENT_ID}:status"
+CONSUMER="${PREFIX}agent:${AGENT_ID}:consumer"
+
+registered_at=$(redis-cli "${REDIS_FLAGS[@]}" HGET "$REGISTRY" registered_at)
+if [ -z "$registered_at" ]; then
+  echo "agent_id=$AGENT_ID registry=missing"
+  exit 2
+fi
+
+ttl=$(redis-cli "${REDIS_FLAGS[@]}" TTL "$STATUS")
+if [ "$ttl" -le 0 ]; then
+  echo "agent_id=$AGENT_ID registry=$registered_at heartbeat=dead ttl=$ttl"
+  exit 1
+fi
+
+pid=$(redis-cli "${REDIS_FLAGS[@]}" HGET "$REGISTRY" pid)
+owner_token=$(redis-cli "${REDIS_FLAGS[@]}" HGET "$REGISTRY" owner_token)
+if [ -z "$owner_token" ]; then
+  # Pre-token daemon: its heartbeat is "alive:<pid>" and it never writes the
+  # consumer key, so requiring one would fail every healthy not-yet-upgraded
+  # seat during a rolling upgrade. Check the pid-shaped lease and stop there.
+  owner=$(redis-cli "${REDIS_FLAGS[@]}" GET "$STATUS")
+  if [ "$owner" != "alive:$pid" ]; then
+    echo "agent_id=$AGENT_ID registry=$registered_at heartbeat=owner-mismatch owner=${owner:-missing} pid=$pid"
+    exit 1
+  fi
+  echo "agent_id=$AGENT_ID registry=$registered_at heartbeat=alive ttl=$ttl consumer=legacy"
+  exit 0
+fi
+owner=$(redis-cli "${REDIS_FLAGS[@]}" GET "$STATUS")
+if [ "$owner" != "alive:$owner_token" ]; then
+  echo "agent_id=$AGENT_ID registry=$registered_at heartbeat=owner-mismatch owner=${owner:-missing} pid=$pid"
+  exit 1
+fi
+
+consumer_ttl=$(redis-cli "${REDIS_FLAGS[@]}" TTL "$CONSUMER")
+consumer=$(redis-cli "${REDIS_FLAGS[@]}" GET "$CONSUMER")
+if [ "$consumer_ttl" -le 0 ] || [ "$consumer" != "consuming:$owner_token" ]; then
+  echo "agent_id=$AGENT_ID registry=$registered_at heartbeat=alive ttl=$ttl consumer=dead consumer_ttl=$consumer_ttl"
+  exit 1
+fi
+
+echo "agent_id=$AGENT_ID registry=$registered_at heartbeat=alive ttl=$ttl consumer=alive consumer_ttl=$consumer_ttl"
+exit 0

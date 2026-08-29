@@ -1,0 +1,5 @@
+{
+  "name": "trust_root",
+  "type": "object",
+  "required": ["certified_object_sha", "certifying_seats", "human_approver", "judged_not_verified"]
+}

@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# Launch a dsh-acp bridge seat with its model-gateway credentials sourced from a
+# host-local env file rather than inlined into the launchd plist.
+#
+# Why a wrapper at all: launchd's EnvironmentVariables cannot read a file, so the
+# only way to keep DEEPSEEK_API_KEY out of the plist is to source it here. A plist
+# is a plain file that gets backed up and synced; an 0600 env file under
+# ~/.config/arb is the narrower home, and rotating the key then costs one edit
+# instead of a plist rewrite plus a launchd reload.
+#
+# Usage (from the plist's ProgramArguments):
+#   scripts/dsh-seat-launch --engine dsh-acp --project bridge --workspace dev ...
+#
+# Every argument is passed through to `python -m agent_redis_bridge` untouched.
+set -euo pipefail
+
+SEAT_ENV="${DSH_SEAT_ENV:-$HOME/.config/arb/dsh-bridge-dev.env}"
+if [[ ! -f "$SEAT_ENV" ]]; then
+  echo "dsh-seat-launch: $SEAT_ENV not found. It must define DEEPSEEK_API_KEY," \
+       "DEEPSEEK_BASE_URL, DSH_ACP_BIN, DSH_ACP_CORDIS and DSH_ACP_MODEL." >&2
+  exit 78 # EX_CONFIG
+fi
+
+# shellcheck disable=SC1090
+set -a
+source "$SEAT_ENV"
+set +a
+
+# Fail before launchd starts a seat that would only die on its first prompt:
+# neither `initialize` nor `session/new` contacts the gateway, so a missing
+# credential otherwise stays invisible until a dispatch is already in flight.
+missing=()
+for var in DEEPSEEK_API_KEY DEEPSEEK_BASE_URL DSH_ACP_BIN DSH_ACP_CORDIS DSH_ACP_MODEL; do
+  [[ -n "${!var:-}" ]] || missing+=("$var")
+done
+
+# A persistence root is REQUIRED, not merely recommended. Unset, the composition
+# falls back to './.sessions' inside the seat's working tree and every turn is
+# bounced dirty_after_commit by the completion gate -- a turn that succeeded
+# reports ok=false. The first live gate run hit exactly this. Fixing it by
+# setting the variable on one host left the contract unchanged, so the next
+# conforming deployment would hit it again; the panel filed that on all three
+# seats. Note the ACP composition reads DSH_SNAPSHOT_SESSIONS_ROOT while the
+# jsonrpc one reads DSH_SESSION_ROOT, so either satisfies this check.
+if [[ -z "${DSH_SESSION_ROOT:-}" && -z "${DSH_SNAPSHOT_SESSIONS_ROOT:-}" ]]; then
+  missing+=("DSH_SESSION_ROOT (or DSH_SNAPSHOT_SESSIONS_ROOT)")
+fi
+
+if [[ ${#missing[@]} -gt 0 ]]; then
+  echo "dsh-seat-launch: $SEAT_ENV is missing: ${missing[*]}" >&2
+  exit 78
+fi
+
+PYTHON="${BRIDGE_SEAT_PYTHON:-$(dirname "$0")/../.venv/bin/python3}"
+if [[ ! -x "$PYTHON" ]]; then
+  echo "dsh-seat-launch: interpreter $PYTHON is not executable" >&2
+  exit 78
+fi
+
+exec "$PYTHON" -m agent_redis_bridge "$@"

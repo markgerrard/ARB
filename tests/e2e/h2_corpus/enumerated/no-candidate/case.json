@@ -1,0 +1,27 @@
+{
+  "files": {
+    "pkg/noop.py": "VALUE = 1\n"
+  },
+  "diff": "diff --git a/pkg/noop.py b/pkg/noop.py\n--- a/pkg/noop.py\n+++ b/pkg/noop.py\n@@ -0,0 +1 @@\n+VALUE = 1\n",
+  "changed_paths": [
+    "pkg/noop.py"
+  ],
+  "phase_input": {},
+  "expected": {
+    "derived": [],
+    "status": "enforced",
+    "record": {
+      "complete": false,
+      "dispositions": []
+    },
+    "graduation": {
+      "counted": false,
+      "disposition_counts": {
+        "answered": 0,
+        "not_load_bearing": 0,
+        "flag": 0
+      }
+    }
+  },
+  "notes": "Enumerated no-candidate path for R11; broader trigger matrix deferred."
+}
